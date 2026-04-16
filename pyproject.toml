@@ -1,10 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "orange-copy-paste-clipboard-backend"
+name = "orange-clipboard-backend"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.14"
+description = "Smart Clipboard backend — cloud sync, realtime sharing, E2E encryption"
+requires-python = ">=3.12"
 dependencies = [
-    "fastapi[standard]>=0.135.3",
-    "sqlalchemy>=2.0.49",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "redis[hiredis]>=5.0",
+    "celery[redis]>=5.4",
+    "boto3>=1.34",
+    "python-jose[cryptography]>=3.3",
+    "passlib[bcrypt]>=1.7",
+    "python-multipart>=0.0.9",
+    "cryptography>=42",
+    "httpx>=0.27",
+    "slowapi>=0.1.9",
+    "email-validator>=2.1",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "anyio>=4.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
