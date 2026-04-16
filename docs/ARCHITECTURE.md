@@ -66,6 +66,7 @@ The desktop app remains **fully functional offline**. The sync client runs as a 
 **Owns:** Users, Devices, Sessions, refresh tokens, password hashing.
 
 **Responsibilities:**
+
 - User registration and login
 - Device registration (each install = a device with its own token pair)
 - JWT access token issuance (15-minute expiry)
@@ -77,6 +78,7 @@ The desktop app remains **fully functional offline**. The sync client runs as a 
 **Owns:** SyncEntries (clipboard + notes), SyncCursor per device, conflict resolution.
 
 **Responsibilities:**
+
 - Receiving delta uploads from devices (POST batches of new/mutated entries)
 - Serving delta downloads to devices (GET since a cursor position)
 - Conflict resolution (last-write-wins with server timestamp as tiebreaker)
@@ -88,6 +90,7 @@ The desktop app remains **fully functional offline**. The sync client runs as a 
 **Owns:** Pre-signed upload/download URL generation, blob metadata records.
 
 **Responsibilities:**
+
 - Generating S3 pre-signed PUT URLs for image/binary uploads (client uploads directly to S3)
 - Generating S3 pre-signed GET URLs for downloads
 - Recording blob metadata (size, mime type, checksum, owning entry id)
@@ -99,17 +102,19 @@ The desktop app remains **fully functional offline**. The sync client runs as a 
 **Owns:** UserGroups (team groups), GroupMemberships, group-scoped shared clipboard pools.
 
 **Responsibilities:**
+
 - Creating and naming groups
 - Inviting members by email (generates a time-limited invite token)
 - Accepting/declining invites
 - Shared clipboard: a group has a shared sync namespace; group members see each other's pushes in real-time
-- E2E group key distribution (see §7.4)
+- E2E group key distribution (see 7.4)
 
 ### 2.5 Realtime Hub (`src/realtime/`)
 
 **Owns:** WebSocket connection lifecycle, Redis pub/sub bridge, device presence tracking.
 
 **Responsibilities:**
+
 - Accepting WebSocket upgrades at `/ws`
 - Authenticating the WS connection (JWT in query param)
 - Subscribing each connection to its user's Redis channel and any group channels
@@ -124,21 +129,22 @@ The desktop app remains **fully functional offline**. The sync client runs as a 
 
 ## 3. Tech Stack Decisions
 
-| Concern | Choice | Reason |
-|---|---|---|
-| API framework | FastAPI + uvicorn | Async, Pydantic v2, native WebSocket, auto OpenAPI |
-| Database | PostgreSQL 16 | Multi-process safe, JSONB, row-level security path, asyncpg |
-| ORM/query | SQLAlchemy 2 async core | No ORM overhead on hot paths, typed queries |
-| Cache + pub/sub | Redis 7 | Celery broker, fan-out bus, JWT deny-list, presence TTL |
-| Blob storage | S3-compatible (MinIO dev / R2 prod) | Client uploads direct via pre-signed PUT; API never buffers blobs |
-| Task queue | Celery 5 + Redis | Email delivery, blob cleanup, large batch offload |
-| JWT signing | RS256 (asymmetric) | Public key exposable at `/.well-known/jwks.json` |
-| Password hashing | bcrypt (passlib) | Industry standard, tunable cost |
-| KDF (E2E) | Argon2id | Memory-hard, OWASP recommended for password-derived keys |
-| Content encryption | AES-256-GCM | AEAD, hardware-accelerated, widely supported |
-| Key exchange | X25519 (ECDH) | Fast, secure, used for multi-device UMK wrapping + group keys |
+| Concern            | Choice                            | Reason                                                            |
+| ------------------ | --------------------------------- | ----------------------------------------------------------------- |
+| API framework      | FastAPI + uvicorn                 | Async, Pydantic v2, native WebSocket, auto OpenAPI                |
+| Database           | PostgreSQL 16                     | Multi-process safe, JSONB, row-level security path, asyncpg       |
+| ORM/query          | SQLAlchemy 2 async core           | No ORM overhead on hot paths, typed queries                       |
+| Cache + pub/sub    | Redis 7                           | Celery broker, fan-out bus, JWT deny-list, presence TTL           |
+| Blob storage       | Cloudflare R2 (S3-compatible API) | Client uploads direct via pre-signed PUT; API never buffers blobs |
+| Task queue         | Celery 5 + Redis                  | Email delivery, blob cleanup, large batch offload                 |
+| JWT signing        | RS256 (asymmetric)                | Public key exposable at `/.well-known/jwks.json`                  |
+| Password hashing   | bcrypt (passlib)                  | Industry standard, tunable cost                                   |
+| KDF (E2E)          | Argon2id                          | Memory-hard, OWASP recommended for password-derived keys          |
+| Content encryption | AES-256-GCM                       | AEAD, hardware-accelerated, widely supported                      |
+| Key exchange       | X25519 (ECDH)                     | Fast, secure, used for multi-device UMK wrapping + group keys     |
 
 **Core Python dependencies:**
+
 ```
 fastapi>=0.115
 uvicorn[standard]>=0.30
@@ -163,6 +169,7 @@ cryptography>=42
 All IDs are UUID v4 (server-generated). Timestamps are `BIGINT` milliseconds since Unix epoch to match the Tauri app's `u64` convention. `client_id` preserves the Tauri app's local sequential IDs for dedup.
 
 ### 4.1 `users`
+
 ```sql
 CREATE TABLE users (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -180,6 +187,7 @@ CREATE TABLE users (
 ```
 
 ### 4.2 `devices`
+
 ```sql
 CREATE TABLE devices (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -198,6 +206,7 @@ CREATE INDEX idx_devices_user_id ON devices(user_id);
 ```
 
 ### 4.3 `sync_entries`
+
 ```sql
 CREATE TABLE sync_entries (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -233,6 +242,7 @@ CREATE INDEX idx_sync_entries_groups  ON sync_entries USING GIN(group_ids);
 ```
 
 ### 4.4 `sync_cursors`
+
 ```sql
 CREATE TABLE sync_cursors (
     device_id      UUID PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
@@ -242,6 +252,7 @@ CREATE TABLE sync_cursors (
 ```
 
 ### 4.5 `groups`
+
 ```sql
 CREATE TABLE groups (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -254,12 +265,13 @@ CREATE TABLE groups (
 ```
 
 ### 4.6 `group_memberships`
+
 ```sql
 CREATE TABLE group_memberships (
     group_id          UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
     user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role              TEXT NOT NULL DEFAULT 'member',  -- 'owner' | 'admin' | 'member'
-    wrapped_group_key TEXT,     -- per-member AES-wrapped group key (see §7.4)
+    wrapped_group_key TEXT,     -- per-member AES-wrapped group key (see 7.4)
     joined_at         BIGINT NOT NULL,
     PRIMARY KEY (group_id, user_id)
 );
@@ -267,6 +279,7 @@ CREATE INDEX idx_gm_user ON group_memberships(user_id);
 ```
 
 ### 4.7 `blobs`
+
 ```sql
 CREATE TABLE blobs (
     key         TEXT PRIMARY KEY,
@@ -285,12 +298,14 @@ CREATE TABLE blobs (
 ## 5. API Design
 
 ### Conventions
+
 - Base URL: `/api/v1`
 - Auth: `Authorization: Bearer <access_token>` on all protected routes
 - Errors: `{"detail": "...", "code": "ERROR_CODE"}` + HTTP status
 - Pagination: cursor-based — `?after_ts=<server_ts>&limit=200`
 
 ### 5.1 Auth Routes
+
 ```
 POST   /api/v1/auth/register
        Body: { email, password, display_name }
@@ -326,6 +341,7 @@ POST   /api/v1/auth/devices/{device_id}/key-wrap
 ```
 
 ### 5.2 Sync Routes
+
 ```
 POST   /api/v1/sync/push
        Body: { entries: [{ client_id, entry_type, kind?, note_title?,
@@ -346,6 +362,7 @@ GET    /api/v1/sync/status
 ```
 
 ### 5.3 Blob Routes
+
 ```
 POST   /api/v1/blobs/request-upload
        Body: { mime_type, size_bytes, checksum, entry_client_id }
@@ -362,6 +379,7 @@ GET    /api/v1/blobs/quota
 ```
 
 ### 5.4 Groups Routes
+
 ```
 POST   /api/v1/groups
        Body: { name }
@@ -392,6 +410,7 @@ POST   /api/v1/groups/{group_id}/keys
 Server subscribes the connection to `user:<user_id>` and all `group:<group_id>` channels.
 
 **Server → Client events:**
+
 ```jsonc
 { "event": "sync:entry",   "payload": { ...sync_entry } }
 { "event": "sync:delete",  "payload": { "server_id": "...", "deleted_at": 1234567 } }
@@ -403,6 +422,7 @@ Server subscribes the connection to `user:<user_id>` and all `group:<group_id>` 
 ```
 
 **Client → Server:**
+
 ```jsonc
 { "event": "ack",  "payload": { "server_ts": 1234567 } }
 { "event": "pong" }
@@ -421,6 +441,7 @@ Most clipboard entries are append-only (new captures). Mutation conflicts (pin/g
 - Tombstone wins: if one side deletes and another updates, deletion propagates
 
 ### 6.2 Delta Push Flow
+
 ```
 Client → POST /sync/push [batch of entries]
 Server → upsert each (client_id dedup), assign server_ts, publish to Redis
@@ -429,6 +450,7 @@ Client stores client_id → server_id mapping for cross-device reference
 ```
 
 ### 6.3 Delta Pull Flow
+
 ```
 On startup / reconnect:
   Client → GET /sync/pull?after_ts={last_server_ts}&limit=200
@@ -440,6 +462,7 @@ On startup / reconnect:
 ### 6.4 Offline Operation
 
 The Tauri app uses its local `history.bin` / `notes.bin` as the source of truth. The sync module:
+
 1. On startup: authenticate + pull delta
 2. On new entry: encrypt + push; if offline, queue to `sync_pending.json`
 3. On reconnect: flush pending queue, then pull delta
@@ -447,12 +470,12 @@ The Tauri app uses its local `history.bin` / `notes.bin` as the source of truth.
 
 ### 6.5 Conflict Resolution Table
 
-| Scenario | Resolution |
-|---|---|
-| Same `client_id`, newer `updated_at` | Accept, new `server_ts` |
-| Same `client_id`, simultaneous push | Last HTTP request wins |
-| Deleted locally, updated remotely | Tombstone wins |
-| `pinned` diverges across devices | Last write by `server_ts` |
+| Scenario                             | Resolution                |
+| ------------------------------------ | ------------------------- |
+| Same `client_id`, newer `updated_at` | Accept, new `server_ts`   |
+| Same `client_id`, simultaneous push  | Last HTTP request wins    |
+| Deleted locally, updated remotely    | Tombstone wins            |
+| `pinned` diverges across devices     | Last write by `server_ts` |
 
 ---
 
@@ -463,9 +486,11 @@ The Tauri app uses its local `history.bin` / `notes.bin` as the source of truth.
 ### 7.1 User Master Key (UMK)
 
 Derived on the device from the user's password:
+
 ```
 UMK = Argon2id(password, kdf_salt, m=65536, t=3, p=4) → 32 bytes
 ```
+
 `kdf_salt` is a random 16-byte value stored in `users.kdf_salt` (returned at login). The UMK lives in memory only — never persisted to disk.
 
 ### 7.2 Content Encryption
@@ -482,6 +507,7 @@ AAD (additional authenticated data) = `client_id` binds ciphertext to the entry,
 ### 7.3 Multi-Device UMK Sharing (X25519 Key Handshake)
 
 When a new device registers:
+
 1. New device generates X25519 keypair; sends `device_pubkey` to server at login
 2. User approves on an existing device (prompted via WS event or next app open)
 3. Existing device:
@@ -505,15 +531,15 @@ Device private keys are stored in the OS keychain via `tauri-plugin-stronghold` 
 
 ### 7.5 Server Visibility Summary
 
-| Field | Server sees |
-|---|---|
-| Entry type / kind | Yes (routing, quota) |
-| Timestamps | Yes |
-| Blob key | Yes (pre-signed URL generation) |
-| Group membership (user_id ↔ group_id) | Yes |
-| Group name | Yes |
-| `encrypted_content` | Ciphertext only |
-| `encrypted_metadata` (groups, label, note_title, pinned) | Ciphertext only |
+| Field                                                    | Server sees                     |
+| -------------------------------------------------------- | ------------------------------- |
+| Entry type / kind                                        | Yes (routing, quota)            |
+| Timestamps                                               | Yes                             |
+| Blob key                                                 | Yes (pre-signed URL generation) |
+| Group membership (user_id ↔ group_id)                    | Yes                             |
+| Group name                                               | Yes                             |
+| `encrypted_content`                                      | Ciphertext only                 |
+| `encrypted_metadata` (groups, label, note_title, pinned) | Ciphertext only                 |
 
 ---
 
@@ -522,6 +548,7 @@ Device private keys are stored in the OS keychain via `tauri-plugin-stronghold` 
 ### 8.1 WebSocket Hub
 
 `src/realtime/hub.py` maintains a process-global registry:
+
 ```python
 # channel_name → set of active WebSocket connections
 connections: dict[str, set[WebSocket]]
@@ -532,6 +559,7 @@ Each connection is authenticated on connect (JWT in query param). The hub subscr
 ### 8.2 Redis Pub/Sub Fan-Out
 
 After sync service writes an entry:
+
 ```python
 await redis.publish(f"user:{user_id}", json.dumps(event))
 for gid in entry.group_ids:
@@ -543,10 +571,12 @@ Hub's async subscriber receives the message and forwards to all local WebSocket 
 ### 8.3 Device Presence
 
 On WebSocket connect:
+
 ```
 SADD user:{user_id}:devices {device_id}
 EXPIRE user:{user_id}:devices 300
 ```
+
 Refreshed on each client `pong`. TTL expiry triggers `device:offline` event via a Celery periodic task.
 
 ### 8.4 Multi-Process Scaling
@@ -558,6 +588,7 @@ At scale, multiple uvicorn workers run independently. Each worker subscribes to 
 ## 9. Auth Flow
 
 ### 9.1 Registration
+
 ```
 Client → POST /auth/register { email, password, display_name }
 Server → hash password (bcrypt), generate kdf_salt, insert user, queue verification email
@@ -565,6 +596,7 @@ Client ← 201 { user_id }
 ```
 
 ### 9.2 Login + Device Registration
+
 ```
 Client → POST /auth/login { email, password, device_name, platform, app_version, device_pubkey }
 Server → verify bcrypt, upsert device, issue JWT (RS256, 15 min), issue refresh token
@@ -575,6 +607,7 @@ Client → if first device: sets own wrapped_umk = AES-GCM(self_shared_secret, U
 ```
 
 ### 9.3 Token Refresh
+
 ```
 Client intercepts 401 → POST /auth/refresh { refresh_token, device_id }
 Server → verify bcrypt(refresh_token, stored_hash), rotate both tokens
@@ -582,6 +615,7 @@ Client ← { access_token, refresh_token }  (new refresh_token replaces old)
 ```
 
 ### 9.4 JWT Claims
+
 ```json
 {
   "sub": "<user_uuid>",
@@ -592,6 +626,7 @@ Client ← { access_token, refresh_token }  (new refresh_token replaces old)
   "iss": "orange-clipboard-api"
 }
 ```
+
 Signed RS256. Revocation: Redis SET `revoked:{jti}` with TTL = remaining token lifetime.
 
 ---
@@ -599,16 +634,18 @@ Signed RS256. Revocation: Redis SET `revoked:{jti}` with TTL = remaining token l
 ## 10. Deployment Model
 
 ### 10.1 Development (Docker Compose)
+
 ```yaml
 services:
   api:     FastAPI uvicorn --reload, port 8000
   worker:  Celery worker -c 4
   db:      postgres:16-alpine
   redis:   redis:7-alpine
-  minio:   minio/minio (S3-compatible, ports 9000/9001)
+       r2:      external Cloudflare R2 (configured via env)
 ```
 
 ### 10.2 Production (~100–1000 users, single VPS)
+
 - 4 vCPU / 8 GB RAM VPS
 - Nginx: TLS termination, `/ws` upgrade, static asset serving
 - `uvicorn --workers 4` (one per core)
@@ -618,6 +655,7 @@ services:
 - Cloudflare R2 for blobs (zero egress cost)
 
 **nginx `/ws` config:**
+
 ```nginx
 location /ws {
     proxy_pass http://127.0.0.1:8000;
@@ -629,10 +667,11 @@ location /ws {
 ```
 
 ### 10.3 Scale to 10k+ Users
+
 1. Separate API + worker into independent deployable units (stateless API scales horizontally)
 2. Move PostgreSQL to managed service (Supabase / Neon / RDS)
 3. Move Redis to managed (Upstash / ElastiCache)
-4. S3 already external — no change needed
+4. R2 already external — no change needed
 5. No application code changes required for API tier scale-out
 
 ---
@@ -640,6 +679,7 @@ location /ws {
 ## 11. Desktop App Integration
 
 ### 11.1 New Tauri Module: `src-tauri/src/sync/`
+
 ```
 src-tauri/src/sync/
   mod.rs            -- exports SyncClient, init
@@ -652,6 +692,7 @@ src-tauri/src/sync/
 ```
 
 **New Cargo dependencies:**
+
 ```toml
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
@@ -664,6 +705,7 @@ keyring = "2"
 ### 11.2 ID Strategy
 
 The Tauri app uses sequential integer IDs locally. With sync:
+
 - Local IDs remain as-is (unchanged persistence)
 - A sidecar `id_map.json` maps `client_id → server_id` after successful push
 - Incoming pull entries that don't match a known `client_id` are inserted with a new local ID; their `client_id` recorded for future dedup
@@ -675,6 +717,7 @@ The Tauri app uses sequential integer IDs locally. With sync:
 - The capture pipeline (`clipboard_watcher.rs`) is untouched; sync module intercepts after entry is stored
 
 ### 11.4 New Tauri Commands
+
 ```rust
 sync_login(email, password, device_name) → Result<SyncUser>
 sync_logout()                            → ()
@@ -772,15 +815,15 @@ orange-copy-paste-clipboard-backend/
 
 ## 13. Implementation Sequencing
 
-| Phase | Scope | Done When |
-|---|---|---|
-| **1 — Auth + Infra** | `config`, `database`, `redis_client`, `auth/`, `admin/`, migrations, docker-compose | `docker compose up` → `POST /auth/login` returns JWT; `/internal/healthz` → 200 |
-| **2 — Sync Core** | `sync/` router + service + models, cursor table | Push 5 entries device A, pull from device B token → all 5 received |
-| **3 — Realtime** | `realtime/` hub + Redis pub/sub, sync service publishes after write | Push from device A while device B has WS open → device B gets `sync:entry` within 200ms |
-| **4 — Blobs** | `blobs/` service + s3.py, MinIO in docker-compose | Upload image entry, retrieve download URL, fetch via pre-signed GET |
-| **5 — Groups** | `groups/` CRUD + invite + join + key distribution API | Create group, invite user, join, push group-scoped entry, second member pulls it |
-| **6 — Desktop** | `src-tauri/src/sync/` module: client, crypto, WS listener, offline queue, commands, settings UI | Tauri app logs in, copies text, second running instance receives it within 2s; works fully offline |
-| **7 — Hardening** | Rate limiting (slowapi), Celery tasks, security headers, load test | Login rate-limited at 5/15min; email delivery works; pull endpoint handles 1k entries |
+| Phase                | Scope                                                                                           | Done When                                                                                          |
+| -------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| **1 — Auth + Infra** | `config`, `database`, `redis_client`, `auth/`, `admin/`, migrations, docker-compose             | `docker compose up` → `POST /auth/login` returns JWT; `/internal/healthz` → 200                    |
+| **2 — Sync Core**    | `sync/` router + service + models, cursor table                                                 | Push 5 entries device A, pull from device B token → all 5 received                                 |
+| **3 — Realtime**     | `realtime/` hub + Redis pub/sub, sync service publishes after write                             | Push from device A while device B has WS open → device B gets `sync:entry` within 200ms            |
+| **4 — Blobs**        | `blobs/` service + s3.py, Cloudflare R2 wiring                                                  | Upload image entry, retrieve download URL, fetch via pre-signed GET                                |
+| **5 — Groups**       | `groups/` CRUD + invite + join + key distribution API                                           | Create group, invite user, join, push group-scoped entry, second member pulls it                   |
+| **6 — Desktop**      | `src-tauri/src/sync/` module: client, crypto, WS listener, offline queue, commands, settings UI | Tauri app logs in, copies text, second running instance receives it within 2s; works fully offline |
+| **7 — Hardening**    | Rate limiting (slowapi), Celery tasks, security headers, load test                              | Login rate-limited at 5/15min; email delivery works; pull endpoint handles 1k entries              |
 
 ---
 
@@ -791,7 +834,7 @@ orange-copy-paste-clipboard-backend/
 - [ ] Login rate-limited: 5 attempts / 15 min per IP (`slowapi`)
 - [ ] Device private keys never transmitted to or stored by server
 - [ ] Server never stores or logs plaintext content
-- [ ] Pre-signed S3 PUT URLs expire in 5 minutes; GET URLs in 1 hour
+- [ ] Pre-signed R2 (S3-compatible) PUT URLs expire in 5 minutes; GET URLs in 1 hour
 - [ ] Group key rotation triggered on member removal
 - [ ] CORS restricted to `tauri://localhost`
 - [ ] All SQL via SQLAlchemy parameterized queries (no string interpolation)
