@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "orange-clipboard-backend"
 version = "0.1.0"
 description = "Smart Clipboard backend — cloud sync, realtime sharing, E2E encryption"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
