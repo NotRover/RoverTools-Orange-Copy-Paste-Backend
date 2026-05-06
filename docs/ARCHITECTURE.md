@@ -21,7 +21,7 @@
 11. [Desktop App Integration](#11-desktop-app-integration)
 12. [Directory Layout](#12-directory-layout)
 13. [Implementation Sequencing](#13-implementation-sequencing)
-14. [Keyboard Sharing Design](#14-keyboard-sharing-design)
+14. [Live Share Design](#14-live-share-design)
 
 ---
 
@@ -110,7 +110,7 @@ The desktop app remains **fully functional offline**. The sync client runs as a 
 - Accepting/declining invites
 - Shared clipboard: a group has a shared sync namespace; group members see each other's pushes in real-time
 - E2E group key distribution (see 7.4)
-- Enforcing membership caps (`max_members` column; sharing pairs are capped at 2)
+- Enforcing membership caps (`max_members` column; Live Share groups capped at 5 members)
 
 ### 2.5 Realtime Hub (`src/realtime/`)
 
@@ -130,34 +130,38 @@ The desktop app remains **fully functional offline**. The sync client runs as a 
 
 ### 2.7 Sharing Service (`src/sharing/`)
 
-**Owns:** User-to-user keyboard sharing sessions (a specialised 2-member group), scope negotiation, sharing invites.
+**Owns:** Live Share sessions (specialised `group_type: 'live_share'` groups of up to 5 users), scope negotiation, sharing invites.
 
 **Responsibilities:**
 
-- Creating a **sharing pair**: a `group_type: 'pair'` group between exactly 2 users
+- Creating a **Live Share group**: a `group_type: 'live_share'` group with `max_members = 5`
 - Sending and accepting sharing invites (by email or shareable link)
 - Storing each member's `share_scope` preference: `'clipboard'` | `'notes'` | `'both'`
-- On accept: distributing the pair's Group Key via the same X25519 mechanism as team groups (see 7.4)
-- Ending a sharing session (either party can terminate; triggers group deletion + rekey tombstone)
-- Publishing `sharing:invite` and `sharing:ended` WS events
+- On accept: distributing the group's Group Key via the same X25519 mechanism as team groups (see §7.4)
+- Ending a session — two cases:
+  - **Owner dissolves**: `DELETE /sharing/sessions/{share_group_id}` — deletes the group entirely for all members
+  - **Member leaves**: `DELETE /sharing/sessions/{share_group_id}/leave` — removes only that member; group continues
+- Publishing `sharing:invite`, `sharing:accepted`, `sharing:ended`, `sharing:scope_changed` WS events
 
-**How sharing works end-to-end:**
+**How Live Share works end-to-end:**
 
-1. User A sends a sharing invite to User B's email.
-2. B accepts → server creates a `group_type: 'pair'` group, records both members with their individual `share_scope` preferences.
-3. On each new local clipboard/note entry, the sync client checks active sharing pairs. If the entry type matches the user's `share_scope`, the pair's group UUID is appended to `entry.group_ids` before encryption and push.
-4. The server stores the entry and fans it out to the pair group channel. User B's device receives it via WebSocket and inserts it into the local store (clipboard history or notes, depending on `entry_type`).
-5. Entries shared this way are indistinguishable from group-pool entries at the server; all existing realtime and sync infrastructure is reused.
+1. User A sends a sharing invite to User B (and optionally C, D, E) by email.
+2. B accepts → server adds B to the `group_type: 'live_share'` group, records B's `share_scope`.
+3. On each new local clipboard/note entry, the sync client checks active Live Share sessions. If the entry type matches the user's `share_scope`, the group UUID is appended to `entry.group_ids` before encryption and push.
+4. The server stores the entry and fans it out to the Live Share group channel. All connected members receive it via WebSocket and insert it into their local store (clipboard history or notes, depending on `entry_type`).
+5. Entries shared this way are indistinguishable from pool-group entries at the server; all existing realtime and sync infrastructure is reused.
 
 **Scope semantics:**
 
-| User A `share_scope` | User B `share_scope` | What flows A → B  | What flows B → A  |
-| -------------------- | -------------------- | ----------------- | ----------------- |
-| `'clipboard'`        | `'clipboard'`        | clipboard only    | clipboard only    |
-| `'both'`             | `'clipboard'`        | clipboard + notes | clipboard only    |
-| `'both'`             | `'both'`             | clipboard + notes | clipboard + notes |
+Each member independently controls what _they contribute_ to the group. Receipt is determined solely by the sender's `share_scope` — not the receiver's.
 
-Each user controls what _they contribute_, not what they receive. Receipt is determined by the sender's scope.
+| Sender `share_scope` | What they push to the group     |
+| -------------------- | ------------------------------- |
+| `'clipboard'`        | Clipboard entries only          |
+| `'notes'`            | Note entries only               |
+| `'both'`             | Clipboard entries + note entries |
+
+All other members who have joined the group receive whatever the sender contributes.
 
 ---
 
@@ -275,7 +279,19 @@ CREATE INDEX idx_sync_entries_device  ON sync_entries(device_id);
 CREATE INDEX idx_sync_entries_groups  ON sync_entries USING GIN(group_ids);
 ```
 
-### 4.4 `sync_cursors`
+### 4.4 `user_settings`
+
+```sql
+CREATE TABLE user_settings (
+    user_id        UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    encrypted_blob TEXT NOT NULL,  -- AES-256-GCM(UMK, JSON of all synced user preferences)
+    updated_at     BIGINT NOT NULL -- client-originated ms timestamp; used for LWW conflict
+);
+```
+
+The server stores and returns the blob opaquely — it never decrypts it. Conflict resolution is last-write-wins by `updated_at`: if the server's `updated_at` is newer than the client's, the server blob wins.
+
+### 4.5 `sync_cursors`
 
 ```sql
 CREATE TABLE sync_cursors (
@@ -292,10 +308,10 @@ CREATE TABLE groups (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     owner_id         UUID NOT NULL REFERENCES users(id),
     name             TEXT NOT NULL,
-    group_type       TEXT NOT NULL DEFAULT 'pool',   -- 'pool' (team) | 'pair' (2-user keyboard share)
+    group_type       TEXT NOT NULL DEFAULT 'pool',   -- 'pool' (team shared clipboard) | 'live_share' (real-time, up to 5 users)
     invite_code      TEXT UNIQUE,
     invite_expires_at BIGINT,
-    max_members      INT NOT NULL DEFAULT 0,         -- 0 = unlimited; 2 for pair groups
+    max_members      INT NOT NULL DEFAULT 0,         -- 0 = unlimited; 5 for live_share groups
     created_at       BIGINT NOT NULL
 );
 ```
@@ -308,7 +324,7 @@ CREATE TABLE group_memberships (
     user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role              TEXT NOT NULL DEFAULT 'member',    -- 'owner' | 'admin' | 'member'
     wrapped_group_key TEXT,     -- per-member AES-wrapped group key (see 7.4)
-    share_scope       TEXT NOT NULL DEFAULT 'clipboard', -- 'clipboard' | 'notes' | 'both'; pair groups only
+    share_scope       TEXT NOT NULL DEFAULT 'clipboard', -- 'clipboard' | 'notes' | 'both'; live_share groups only
     joined_at         BIGINT NOT NULL,
     PRIMARY KEY (group_id, user_id)
 );
@@ -398,7 +414,21 @@ GET    /api/v1/sync/status
        Returns: { device_id, last_server_ts }
 ```
 
-### 5.3 Blob Routes
+### 5.3 Settings Routes
+
+```
+GET    /api/v1/settings
+       Returns: { encrypted_blob, updated_at }
+       Note: returns 404 if no settings have been pushed yet (client uses local defaults)
+
+PUT    /api/v1/settings
+       Body: { encrypted_blob, updated_at }
+       Returns: { updated_at }
+       Note: last-write-wins — if server updated_at > body updated_at, server blob is returned
+             and client should apply it; response includes winner: 'server' | 'client'
+```
+
+### 5.4 Blob Routes
 
 ```
 POST   /api/v1/blobs/request-upload
@@ -415,7 +445,7 @@ GET    /api/v1/blobs/quota
        Returns: { used_bytes, quota_bytes }
 ```
 
-### 5.4 Groups Routes
+### 5.5 Groups Routes
 
 ```
 POST   /api/v1/groups
@@ -440,27 +470,30 @@ POST   /api/v1/groups/{group_id}/keys
        Body: { wrapped_keys: [{ user_id, wrapped_group_key }] }
 ```
 
-### 5.5 Sharing Routes
+### 5.6 Sharing Routes
 
 ```
 POST   /api/v1/sharing/invite
        Body: { email, share_scope: 'clipboard'|'notes'|'both' }
-       Returns: { pair_group_id, invite_code, expires_at }
-       Note: creates a group_type:'pair' group; invite is single-use
+       Returns: { share_group_id, invite_code, expires_at }
+       Note: creates a group_type:'live_share' group (max 5 members); invite is single-use
 
 GET    /api/v1/sharing/sessions
-       Returns: [{ pair_group_id, peer_user: { id, display_name },
-                   my_scope, peer_scope, active_since }]
+       Returns: [{ share_group_id, members: [{ user_id, display_name, scope, online }],
+                   my_scope, active_since }]
 
-PATCH  /api/v1/sharing/sessions/{pair_group_id}/scope
+PATCH  /api/v1/sharing/sessions/{share_group_id}/scope
        Body: { share_scope: 'clipboard'|'notes'|'both' }
        Note: updates only the authenticated user's share_scope in group_memberships
 
-DELETE /api/v1/sharing/sessions/{pair_group_id}
-       Note: ends the session for both parties; deletes the pair group
+DELETE /api/v1/sharing/sessions/{share_group_id}
+       Note: owner only — dissolves the session for all members; deletes the live_share group
+
+DELETE /api/v1/sharing/sessions/{share_group_id}/leave
+       Note: non-owner — removes only the requesting user; group continues for remaining members
 ```
 
-### 5.5 WebSocket Event Protocol
+### 5.7 WebSocket Event Protocol
 
 **Connection:** `GET /ws?token=<access_token>`
 
@@ -475,10 +508,11 @@ Server subscribes the connection to `user:<user_id>` and all `group:<group_id>` 
 { "event": "device:offline", "payload": { "device_id": "..." } }
 { "event": "group:membership_changed", "payload": { "group_id": "...", "action": "joined|left", "user_id": "..." } }
 { "event": "group:rekey",  "payload": { "group_id": "...", "wrapped_group_key": "..." } }
-{ "event": "sharing:invite",  "payload": { "pair_group_id": "...", "from_user": { "id": "...", "display_name": "..." }, "invite_code": "...", "expires_at": 1234567 } }
-{ "event": "sharing:accepted","payload": { "pair_group_id": "...", "peer_user": { "id": "...", "display_name": "..." }, "wrapped_group_key": "..." } }
-{ "event": "sharing:ended",   "payload": { "pair_group_id": "...", "ended_by": "..." } }
-{ "event": "sharing:scope_changed", "payload": { "pair_group_id": "...", "user_id": "...", "share_scope": "clipboard|notes|both" } }
+{ "event": "sharing:invite",       "payload": { "share_group_id": "...", "from_user": { "id": "...", "display_name": "..." }, "invite_code": "...", "expires_at": 1234567 } }
+{ "event": "sharing:accepted",     "payload": { "share_group_id": "...", "new_member": { "id": "...", "display_name": "..." }, "wrapped_group_key": "..." } }
+{ "event": "sharing:ended",        "payload": { "share_group_id": "...", "ended_by": "..." } }
+{ "event": "sharing:scope_changed","payload": { "share_group_id": "...", "user_id": "...", "share_scope": "clipboard|notes|both" } }
+{ "event": "settings:updated",    "payload": { "updated_at": 1234567 } }  // another device pushed settings; client should pull
 { "event": "ping",         "payload": { "server_ts": 1234567 } }
 ```
 
@@ -601,6 +635,7 @@ Device private keys are stored in the OS keychain via `tauri-plugin-stronghold` 
 | Group name                                               | Yes                             |
 | `encrypted_content`                                      | Ciphertext only                 |
 | `encrypted_metadata` (groups, label, note_title, pinned) | Ciphertext only                 |
+| `user_settings.encrypted_blob` (theme, groups, prefs)    | Ciphertext only                 |
 
 ---
 
@@ -930,27 +965,27 @@ orange-copy-paste-clipboard-backend/
 | **3 — Realtime**     | `realtime/` hub + Redis pub/sub, sync service publishes after write                                                     | Push from device A while device B has WS open → device B gets `sync:entry` within 200ms                                                                  |
 | **4 — Blobs**        | `blobs/` service + s3.py, Cloudflare R2 wiring                                                                          | Upload image entry, retrieve download URL, fetch via pre-signed GET                                                                                      |
 | **5 — Groups**       | `groups/` CRUD + invite + join + key distribution API                                                                   | Create group, invite user, join, push group-scoped entry, second member pulls it                                                                         |
-| **6 — Desktop**      | `src-tauri/src/sync/` module: client, crypto, WS listener, offline queue, commands, settings UI                         | Tauri app logs in, copies text, second running instance receives it within 2s; works fully offline                                                       |
+| **6 — Desktop**      | `src-tauri/src/sync/` module: client, crypto, WS listener, offline queue, commands, settings UI; settings sync (`user_settings` table, `PUT/GET /settings`, `settings:updated` WS event) | Tauri app logs in, copies text, second device receives it within 2s; theme changed on device A appears on device B after next launch; works fully offline |
 | **7 — Hardening**    | Rate limiting (slowapi), Celery tasks, security headers, load test                                                      | Login rate-limited at 5/15min; email delivery works; pull endpoint handles 1k entries                                                                    |
-| **8 — Sharing**      | `sharing/` service, pair group enforcement, scope-aware fan-out, sharing WS events, file/video blob sync with 5 MB gate | User A invites B, B accepts, A copies text → appears in B's clipboard within 2s; files ≤ 5 MB synced; files > 5 MB silently skipped with UI notification |
+| **8 — Sharing**      | `sharing/` service, Live Share group cap enforcement (max 5 members), scope-aware fan-out, leave vs. dissolve endpoints, sharing WS events, file/video blob sync with 5 MB gate | User A invites B, B accepts, A copies text → appears in B's clipboard within 2s; files ≤ 5 MB synced; files > 5 MB silently skipped with UI notification |
 
 ---
 
-## 14. Keyboard Sharing Design
+## 14. Live Share Design
 
-Keyboard sharing lets two users mirror each other's clipboard (and optionally notes) in real-time. It is built entirely on the existing group + sync + realtime infrastructure, with no new transport layer.
+Live Share lets up to 5 users share clipboard entries and/or notes in real-time. It is built entirely on the existing group + sync + realtime infrastructure, with no new transport layer.
 
 ### 14.1 Establishing a Share
 
 ```
 User A → POST /sharing/invite { email: "b@example.com", share_scope: "both" }
-Server → creates group_type:'pair' group (max_members=2), generates invite_code, queues invite email
+Server → creates group_type:'live_share' group (max_members=5), generates invite_code, queues invite email
 Server → publishes sharing:invite event to user B's WS channel if B is online
-User A ← { pair_group_id, invite_code, expires_at }
+User A ← { share_group_id, invite_code, expires_at }
 
 User B → POST /groups/join { invite_code, wrapped_group_key }
          (wrapped_group_key = AES-GCM(X25519(B_privkey, A_identity_pubkey), GroupKey))
-Server → adds B to pair group, sets B's share_scope = 'clipboard' (default; B can change it)
+Server → adds B to Live Share group, sets B's share_scope = 'clipboard' (default; B can change it)
 Server → publishes sharing:accepted to A's WS channel with wrapped_group_key for A
 User A ← sharing:accepted event → A's client decrypts GroupKey, stores it
 ```
@@ -962,13 +997,13 @@ Once both users have the Group Key:
 ```
 User A copies "hello world"
 A's sync client checks: active sharing sessions whose share_scope includes 'clipboard'
-A's sync client: entry.group_ids += [pair_group_id]
+A's sync client: entry.group_ids += [share_group_id]
 A's sync client: encrypts content with GroupKey (not UMK) for this group-scoped entry
-A → POST /sync/push { entries: [{ ..., group_ids: [pair_group_id], encrypted_content: <GK-ciphertext> }] }
-Server → stores entry, publishes to Redis channel group:{pair_group_id}
-Realtime hub → forwards sync:entry event to all of B's connected devices
-B's sync client → decrypts with GroupKey → inserts into local clipboard history
-B's UI updates instantly
+A → POST /sync/push { entries: [{ ..., group_ids: [share_group_id], encrypted_content: <GK-ciphertext> }] }
+Server → stores entry, publishes to Redis channel group:{share_group_id}
+Realtime hub → forwards sync:entry event to all connected devices of every group member
+Each member's sync client → decrypts with GroupKey → inserts into local clipboard history
+Members' UIs update instantly
 ```
 
 Notes entries flow identically when `share_scope` includes `'notes'`.
@@ -978,9 +1013,9 @@ Notes entries flow identically when `share_scope` includes `'notes'`.
 Either user can update their contribution scope at any time:
 
 ```
-PATCH /sharing/sessions/{pair_group_id}/scope { share_scope: "notes" }
+PATCH /sharing/sessions/{share_group_id}/scope { share_scope: "notes" }
 Server → updates group_memberships.share_scope for the authenticated user
-Server → publishes sharing:scope_changed to both users via group channel
+Server → publishes sharing:scope_changed to all group members via group channel
 ```
 
 The change is effective immediately. Entries already synced are not recalled.
@@ -988,21 +1023,27 @@ The change is effective immediately. Entries already synced are not recalled.
 ### 14.4 Ending a Session
 
 ```
-DELETE /sharing/sessions/{pair_group_id}
-Server → deletes the pair group (CASCADE removes memberships)
+# Owner dissolves the session entirely
+DELETE /sharing/sessions/{share_group_id}
+Server → deletes the Live Share group (CASCADE removes all memberships)
 Server → publishes sharing:ended to the group channel before deletion
-Both clients → remove the pair_group_id from id_map.json groups section
-             → stop tagging new entries with this group_id
-             → existing shared entries remain in each user's local history
+All clients → remove share_group_id from id_map.json groups section
+            → stop tagging new entries with this group_id
+            → existing shared entries remain in each member's local history
+
+# Non-owner leaves without dissolving
+DELETE /sharing/sessions/{share_group_id}/leave
+Server → removes only the requesting user from group_memberships
+Server → publishes sharing:scope_changed event so remaining members refresh their session view
 ```
 
-Existing entries are not deleted from either user's local store when sharing ends.
+Existing entries are not deleted from any member's local store when sharing ends or a member leaves.
 
 ### 14.5 Security Properties
 
-- The server never sees plaintext content — all shared entries are encrypted with the GroupKey, which the server cannot derive (it holds neither private key).
-- If a share is ended, the GroupKey is abandoned. No re-encryption of historical entries is performed (they remain readable locally by both parties, as intended — they chose to share them).
-- The pair group's GroupKey is separate from any team group keys, so revoking a share has no impact on team group access.
+- The server never sees plaintext content — all shared entries are encrypted with the GroupKey, which the server cannot derive (it holds no member private keys).
+- If a session is ended or a member leaves, the GroupKey is abandoned. No re-encryption of historical entries is performed (they remain readable locally by all former members — they chose to share them).
+- The Live Share group's GroupKey is separate from any pool group keys, so ending a Live Share session has no impact on team pool group access.
 
 ---
 
