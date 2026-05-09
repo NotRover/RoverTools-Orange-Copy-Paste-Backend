@@ -1,6 +1,5 @@
 """Auth endpoint tests: register, verify, login, refresh, password reset, JWKS."""
 
-import pytest
 from httpx import AsyncClient
 
 

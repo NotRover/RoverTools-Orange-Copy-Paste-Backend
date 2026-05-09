@@ -15,7 +15,6 @@ from src.groups.schemas import (
     JoinRequest,
     JoinResponse,
     MemberOut,
-    WrappedKeyEntry,
 )
 
 _INVITE_TTL_HOURS = 72
@@ -111,10 +110,12 @@ async def refresh_invite(db: AsyncSession, group_id: uuid.UUID, user_id: str) ->
     if g.owner_id != uid:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
 
-    g.invite_code = _new_invite_code()
-    g.invite_expires_at = int((datetime.now(UTC) + timedelta(hours=_INVITE_TTL_HOURS)).timestamp() * 1000)
+    new_code: str = _new_invite_code()
+    new_expires: int = int((datetime.now(UTC) + timedelta(hours=_INVITE_TTL_HOURS)).timestamp() * 1000)
+    g.invite_code = new_code
+    g.invite_expires_at = new_expires
     await db.commit()
-    return InviteResponse(invite_code=g.invite_code, expires_at=g.invite_expires_at)
+    return InviteResponse(invite_code=new_code, expires_at=new_expires)
 
 
 async def join_group(db: AsyncSession, user_id: str, req: JoinRequest) -> tuple[JoinResponse, Group]:
