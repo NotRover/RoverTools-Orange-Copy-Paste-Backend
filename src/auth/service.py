@@ -1,15 +1,18 @@
 import base64
 import os
+import secrets
 import uuid
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
 from passlib.context import CryptContext
+from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.models import Device, User
 from src.auth.schemas import LoginRequest, RegisterRequest
+from src.config import settings
 
 _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -30,6 +33,8 @@ def generate_kdf_salt() -> str:
     return base64.b64encode(os.urandom(16)).decode()
 
 
+# ── Registration ──────────────────────────────────────────────────────────────
+
 async def register_user(db: AsyncSession, req: RegisterRequest) -> User:
     existing = await db.scalar(select(User).where(User.email == req.email))
     if existing:
@@ -49,6 +54,8 @@ async def register_user(db: AsyncSession, req: RegisterRequest) -> User:
     await db.refresh(user)
     return user
 
+
+# ── Login ─────────────────────────────────────────────────────────────────────
 
 async def login_user(db: AsyncSession, req: LoginRequest) -> tuple[User, Device]:
     user = await db.scalar(select(User).where(User.email == req.email))
@@ -74,6 +81,8 @@ async def login_user(db: AsyncSession, req: LoginRequest) -> tuple[User, Device]
     return user, device
 
 
+# ── Token rotation ────────────────────────────────────────────────────────────
+
 async def store_refresh_token(db: AsyncSession, device: Device, raw_token: str) -> None:
     device.refresh_token_hash = _pwd_ctx.hash(raw_token)
     device.last_seen_at = _now_ms()
@@ -90,7 +99,6 @@ async def rotate_refresh_token(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Device not found or revoked")
 
     if not device.refresh_token_hash or not _pwd_ctx.verify(raw_token, device.refresh_token_hash):
-        # Token mismatch — potential token theft; revoke device
         device.revoked = True
         await db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
@@ -101,6 +109,8 @@ async def rotate_refresh_token(
 
     return user, device
 
+
+# ── Device management ─────────────────────────────────────────────────────────
 
 async def revoke_device(db: AsyncSession, device_id: uuid.UUID, requesting_user_id: str) -> None:
     device = await db.scalar(select(Device).where(Device.id == device_id))
@@ -131,6 +141,8 @@ async def get_user_devices(db: AsyncSession, user_id: str, current_device_id: st
     ]
 
 
+# ── Public key management ─────────────────────────────────────────────────────
+
 async def store_public_keys(
     db: AsyncSession,
     user_id: str,
@@ -160,3 +172,80 @@ async def store_wrapped_umk(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your device")
     target_device.wrapped_umk = wrapped_umk
     await db.commit()
+
+
+# ── Email verification ────────────────────────────────────────────────────────
+
+_VERIFY_PREFIX = "email_verify:"
+
+
+async def generate_verification_token(redis: Redis, user_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    await redis.setex(
+        f"{_VERIFY_PREFIX}{token}",
+        settings.email_verify_token_ttl,
+        user_id,
+    )
+    return token
+
+
+async def verify_email(db: AsyncSession, redis: Redis, token: str) -> User:
+    key = f"{_VERIFY_PREFIX}{token}"
+    user_id = await redis.get(key)
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification token",
+        )
+
+    user = await db.scalar(select(User).where(User.id == uuid.UUID(user_id)))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    user.email_verified = True
+    await db.commit()
+    await redis.delete(key)
+    return user
+
+
+# ── Password reset ────────────────────────────────────────────────────────────
+
+_RESET_PREFIX = "pwd_reset:"
+
+
+async def request_password_reset(
+    db: AsyncSession, redis: Redis, email: str
+) -> tuple[User, str] | None:
+    """Returns (user, token) if found, None if not (caller should not reveal whether email exists)."""
+    user = await db.scalar(select(User).where(User.email == email))
+    if not user:
+        return None
+
+    token = secrets.token_urlsafe(32)
+    await redis.setex(
+        f"{_RESET_PREFIX}{token}",
+        settings.password_reset_token_ttl,
+        str(user.id),
+    )
+    return user, token
+
+
+async def confirm_password_reset(
+    db: AsyncSession, redis: Redis, token: str, new_password: str
+) -> None:
+    key = f"{_RESET_PREFIX}{token}"
+    user_id = await redis.get(key)
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset token",
+        )
+
+    user = await db.scalar(select(User).where(User.id == uuid.UUID(user_id)))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    user.password_hash = hash_password(new_password)
+    user.updated_at = _now_ms()
+    await db.commit()
+    await redis.delete(key)

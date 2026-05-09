@@ -81,3 +81,15 @@ class RefreshResponse(BaseModel):
 class RegisterResponse(BaseModel):
     user_id: uuid.UUID
     message: str = "Registration successful. Please verify your email."
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
+class MessageResponse(BaseModel):
+    message: str

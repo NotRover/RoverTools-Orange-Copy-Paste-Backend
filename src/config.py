@@ -31,12 +31,25 @@ class Settings(BaseSettings):
     app_cors_origins: str = "tauri://localhost,http://localhost:1420"
     default_blob_quota_bytes: int = 524_288_000  # 500 MB
 
-    # Email
+    # Email — provider selection
+    email_provider: str = "brevo"          # "brevo" | "smtp"
+
+    # Brevo (primary)
+    brevo_api_key: str = ""
+
+    # SMTP (fallback / self-hosted)
     smtp_host: str = "localhost"
     smtp_port: int = 587
     smtp_user: str = ""
     smtp_password: str = ""
     email_from: str = "Orange Clipboard <noreply@example.com>"
+
+    # App — used to build links inside emails
+    app_base_url: str = "http://localhost:1420"
+
+    # Token TTLs (seconds)
+    email_verify_token_ttl: int = 86_400    # 24 h
+    password_reset_token_ttl: int = 3_600   # 1 h
 
     @property
     def cors_origins(self) -> list[str]:
