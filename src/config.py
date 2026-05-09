@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     app_cors_origins: str = "tauri://localhost,http://localhost:1420"
     default_blob_quota_bytes: int = 524_288_000  # 500 MB
 
+    # Admin
+    admin_api_key: str = ""  # Required to access /internal/* admin endpoints; leave empty to disable
+
     # Email — provider selection
     email_provider: str = "brevo"          # "brevo" | "smtp"
 

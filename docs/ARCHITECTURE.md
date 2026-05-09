@@ -126,7 +126,44 @@ The desktop app remains **fully functional offline**. The sync client runs as a 
 
 ### 2.6 Admin Service (`src/admin/`)
 
-**Owns:** Health endpoint, internal metrics endpoint (Prometheus-format).
+**Owns:** Health endpoint, Prometheus metrics, aggregate system stats, and user management operations.
+
+**Authentication:** All admin endpoints except `/internal/healthz` require an `X-Admin-Key: <key>` header matching `ADMIN_API_KEY` in the environment. If `ADMIN_API_KEY` is unset or empty, all admin/metrics/stats endpoints return `503 Service Unavailable`. The key should be a high-entropy random string (≥ 32 chars).
+
+**Endpoints:**
+
+```
+GET  /internal/healthz                      — public, no auth; used by load balancers
+GET  /internal/metrics                      — Prometheus text/plain; X-Admin-Key
+GET  /internal/stats                        — JSON aggregate stats; X-Admin-Key
+GET  /internal/admin/users                  — paginated user list; X-Admin-Key
+     Query: ?offset=0&limit=50&search=<email or name>
+GET  /internal/admin/users/{user_id}        — full user detail; X-Admin-Key
+PATCH /internal/admin/users/{user_id}/quota — update blob_bytes_quota; X-Admin-Key
+     Body: { blob_bytes_quota: int }
+POST  /internal/admin/users/{user_id}/suspend — suspend / unsuspend; X-Admin-Key
+     Body: { suspend: true | false }
+DELETE /internal/admin/users/{user_id}      — hard delete user + all data; X-Admin-Key
+```
+
+**Prometheus metrics exposed at `/internal/metrics`:**
+
+```
+orange_users_total               — total registered users
+orange_users_verified_total      — email-verified users
+orange_users_suspended_total     — suspended users
+orange_devices_total             — total devices (all time)
+orange_devices_active_total      — active (non-revoked) devices
+orange_sync_entries_total        — total sync entries
+orange_sync_entries_deleted_total — tombstoned entries
+orange_blobs_total               — total blob records
+orange_blobs_confirmed_total     — confirmed (uploaded) blobs
+orange_storage_bytes_used        — sum of blob_bytes_used across all users
+orange_ws_connections_active     — current WebSocket connections (per process)
+orange_redis_memory_bytes        — Redis used_memory (when available)
+```
+
+**User suspension:** Setting `suspended_at` to the current timestamp prevents the user from logging in (returns `403 Account suspended`). Existing valid JWTs continue to work until they expire (15-minute lifetime). To immediately revoke access, call the suspend endpoint then revoke all devices in the user's device list.
 
 ### 2.7 Sharing Service (`src/sharing/`)
 
