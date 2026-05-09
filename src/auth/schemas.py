@@ -5,6 +5,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 # ── Request bodies ─────────────────────────────────────────────────────────────
 
+
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
@@ -35,15 +36,16 @@ class PasswordResetConfirmBody(BaseModel):
 
 
 class RegisterPublicKeysRequest(BaseModel):
-    identity_pubkey: str   # base64 X25519
-    device_pubkey: str     # base64 X25519
+    identity_pubkey: str  # base64 X25519
+    device_pubkey: str  # base64 X25519
 
 
 class WrapUmkRequest(BaseModel):
-    wrapped_umk: str       # base64 AES-256-GCM(shared_secret, UMK)
+    wrapped_umk: str  # base64 AES-256-GCM(shared_secret, UMK)
 
 
 # ── Response bodies ────────────────────────────────────────────────────────────
+
 
 class UserOut(BaseModel):
     id: uuid.UUID

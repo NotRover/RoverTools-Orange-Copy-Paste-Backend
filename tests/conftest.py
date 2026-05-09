@@ -52,10 +52,14 @@ def _rsa_pem() -> tuple[str, str]:
         serialization.PrivateFormat.TraditionalOpenSSL,
         serialization.NoEncryption(),
     ).decode()
-    pub = key.public_key().public_bytes(
-        serialization.Encoding.PEM,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode()
+    pub = (
+        key.public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
     return priv, pub
 
 
@@ -121,9 +125,7 @@ async def fake_redis() -> AsyncGenerator[FakeRedis, None]:
 
 # ── FastAPI test client with dependency overrides ─────────────────────────────
 @pytest_asyncio.fixture
-async def client(
-    db: AsyncSession, fake_redis: FakeRedis
-) -> AsyncGenerator[AsyncClient, None]:
+async def client(db: AsyncSession, fake_redis: FakeRedis) -> AsyncGenerator[AsyncClient, None]:
     async def _get_db():
         yield db
 
@@ -131,9 +133,7 @@ async def client(
     app.dependency_overrides[get_redis] = lambda: fake_redis
     app.dependency_overrides[get_redis_pool] = lambda: fake_redis
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
 
     app.dependency_overrides.clear()
@@ -148,6 +148,7 @@ def _no_celery(monkeypatch):
         ("src.worker.tasks.email", "send_sharing_invite_email"),
     ]:
         import importlib
+
         mod = importlib.import_module(attr[0])
         task = getattr(mod, attr[1])
         monkeypatch.setattr(task, "delay", MagicMock())
@@ -172,9 +173,7 @@ async def auth_headers(client: AsyncClient, fake_redis: FakeRedis) -> dict:
         stored = await fake_redis.get(raw_key)
         if stored == user_id:
             token = raw_key.split("email_verify:")[1]
-            resp = await client.post(
-                "/api/v1/auth/verify-email", json={"token": token}
-            )
+            resp = await client.post("/api/v1/auth/verify-email", json={"token": token})
             assert resp.status_code == 200, resp.text
             break
 

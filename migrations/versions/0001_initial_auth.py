@@ -4,6 +4,7 @@ Revision ID: 0001
 Revises:
 Create Date: 2026-04-16
 """
+
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -52,4 +53,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("idx_devices_user_id", table_name="devices")
     op.drop_table("devices")
-    op.drop_table("users")
+    op.drop_table("users ")

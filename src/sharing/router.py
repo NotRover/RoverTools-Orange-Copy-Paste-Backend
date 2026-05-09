@@ -49,6 +49,7 @@ async def create_invite(
         )
         # Queue invite email
         from src.worker.tasks.email import send_sharing_invite_email
+
         send_sharing_invite_email.delay(
             invitee.email,
             invitee.display_name,
@@ -103,6 +104,4 @@ async def leave_session(
 ):
     user_id, _ = current
     leaving_scope = await service.leave_session(db, share_group_id, user_id)
-    await rt.publish_sharing_scope_changed(
-        redis, str(share_group_id), user_id, leaving_scope
-    )
+    await rt.publish_sharing_scope_changed(redis, str(share_group_id), user_id, leaving_scope)

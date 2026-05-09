@@ -15,8 +15,8 @@ class SyncEntry(Base):
     client_id: Mapped[str] = mapped_column(Text, nullable=False)
     user_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
     device_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
-    entry_type: Mapped[str] = mapped_column(String(16), nullable=False)   # 'clipboard' | 'note'
-    kind: Mapped[str | None] = mapped_column(String(16), nullable=True)   # 'text'|'image'|'html'|'file'
+    entry_type: Mapped[str] = mapped_column(String(16), nullable=False)  # 'clipboard' | 'note'
+    kind: Mapped[str | None] = mapped_column(String(16), nullable=True)  # 'text'|'image'|'html'|'file'
 
     # E2E encrypted payloads — server stores ciphertext only
     encrypted_content: Mapped[str] = mapped_column(Text, nullable=False)
@@ -30,9 +30,7 @@ class SyncEntry(Base):
     pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Group membership — server-visible for routing; names are inside encrypted_metadata
-    group_ids: Mapped[list[uuid.UUID]] = mapped_column(
-        ARRAY(PGUUID(as_uuid=True)), nullable=False, server_default="{}"
-    )
+    group_ids: Mapped[list[uuid.UUID]] = mapped_column(ARRAY(PGUUID(as_uuid=True)), nullable=False, server_default="{}")
 
     # Blob-backed content (images / files)
     blob_key: Mapped[str | None] = mapped_column(Text, nullable=True)

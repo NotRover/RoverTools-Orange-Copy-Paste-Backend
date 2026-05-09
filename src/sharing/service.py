@@ -64,26 +64,18 @@ async def create_invite(
 
 async def list_sessions(db: AsyncSession, user_id: str) -> list[SessionOut]:
     uid = uuid.UUID(user_id)
-    memberships = await db.scalars(
-        select(GroupMembership).where(GroupMembership.user_id == uid)
-    )
+    memberships = await db.scalars(select(GroupMembership).where(GroupMembership.user_id == uid))
     sessions = []
     for m in memberships.all():
-        g = await db.scalar(
-            select(Group).where(Group.id == m.group_id, Group.group_type == "live_share")
-        )
+        g = await db.scalar(select(Group).where(Group.id == m.group_id, Group.group_type == "live_share"))
         if not g:
             continue
         sessions.append(await _session_to_out(db, g, uid, m.share_scope))
     return sessions
 
 
-async def _session_to_out(
-    db: AsyncSession, g: Group, requesting_uid: uuid.UUID, my_scope: str
-) -> SessionOut:
-    members_rows = await db.scalars(
-        select(GroupMembership).where(GroupMembership.group_id == g.id)
-    )
+async def _session_to_out(db: AsyncSession, g: Group, requesting_uid: uuid.UUID, my_scope: str) -> SessionOut:
+    members_rows = await db.scalars(select(GroupMembership).where(GroupMembership.group_id == g.id))
     members = []
     for m in members_rows.all():
         user = await db.scalar(select(User).where(User.id == m.user_id))
@@ -103,20 +95,14 @@ async def _session_to_out(
     )
 
 
-async def update_scope(
-    db: AsyncSession, share_group_id: uuid.UUID, user_id: str, req: ScopeUpdateRequest
-) -> None:
+async def update_scope(db: AsyncSession, share_group_id: uuid.UUID, user_id: str, req: ScopeUpdateRequest) -> None:
     uid = uuid.UUID(user_id)
-    g = await db.scalar(
-        select(Group).where(Group.id == share_group_id, Group.group_type == "live_share")
-    )
+    g = await db.scalar(select(Group).where(Group.id == share_group_id, Group.group_type == "live_share"))
     if not g:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
     m = await db.scalar(
-        select(GroupMembership).where(
-            GroupMembership.group_id == share_group_id, GroupMembership.user_id == uid
-        )
+        select(GroupMembership).where(GroupMembership.group_id == share_group_id, GroupMembership.user_id == uid)
     )
     if not m:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member")
@@ -127,9 +113,7 @@ async def update_scope(
 
 async def end_session(db: AsyncSession, share_group_id: uuid.UUID, user_id: str) -> None:
     uid = uuid.UUID(user_id)
-    g = await db.scalar(
-        select(Group).where(Group.id == share_group_id, Group.group_type == "live_share")
-    )
+    g = await db.scalar(select(Group).where(Group.id == share_group_id, Group.group_type == "live_share"))
     if not g:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     if g.owner_id != uid:
@@ -142,9 +126,7 @@ async def end_session(db: AsyncSession, share_group_id: uuid.UUID, user_id: str)
 async def leave_session(db: AsyncSession, share_group_id: uuid.UUID, user_id: str) -> str:
     """Returns the leaving member's share_scope for the scope_changed broadcast."""
     uid = uuid.UUID(user_id)
-    g = await db.scalar(
-        select(Group).where(Group.id == share_group_id, Group.group_type == "live_share")
-    )
+    g = await db.scalar(select(Group).where(Group.id == share_group_id, Group.group_type == "live_share"))
     if not g:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     if g.owner_id == uid:
@@ -154,9 +136,7 @@ async def leave_session(db: AsyncSession, share_group_id: uuid.UUID, user_id: st
         )
 
     m = await db.scalar(
-        select(GroupMembership).where(
-            GroupMembership.group_id == share_group_id, GroupMembership.user_id == uid
-        )
+        select(GroupMembership).where(GroupMembership.group_id == share_group_id, GroupMembership.user_id == uid)
     )
     leaving_scope = m.share_scope if m else "none"
     if m:

@@ -16,6 +16,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 # ── Registration ──────────────────────────────────────────────────────────────
 
+
 @router.post("/register", response_model=schemas.RegisterResponse, status_code=201)
 async def register(
     body: schemas.RegisterRequest,
@@ -28,12 +29,14 @@ async def register(
     verify_url = f"{settings.app_base_url}/verify-email?token={token}"
 
     from src.worker.tasks.email import send_verification_email
+
     send_verification_email.delay(user.email, user.display_name, verify_url)
 
     return schemas.RegisterResponse(user_id=user.id)
 
 
 # ── Email verification ────────────────────────────────────────────────────────
+
 
 @router.post("/verify-email", response_model=schemas.MessageResponse)
 async def verify_email(
@@ -61,6 +64,7 @@ async def resend_verification(
         token = await service.generate_verification_token(redis, str(user.id))
         verify_url = f"{settings.app_base_url}/verify-email?token={token}"
         from src.worker.tasks.email import send_verification_email
+
         send_verification_email.delay(user.email, user.display_name, verify_url)
 
     # Always return 202 — don't reveal whether email exists
@@ -68,6 +72,7 @@ async def resend_verification(
 
 
 # ── Login ─────────────────────────────────────────────────────────────────────
+
 
 @router.post("/login", response_model=schemas.LoginResponse)
 @limiter.limit("10/minute;30/hour")
@@ -93,6 +98,7 @@ async def login(
 
 # ── Token refresh ─────────────────────────────────────────────────────────────
 
+
 @router.post("/refresh", response_model=schemas.RefreshResponse)
 async def refresh(body: schemas.RefreshRequest, db: AsyncSession = Depends(get_db)):
     user, device = await service.rotate_refresh_token(db, body.device_id, body.refresh_token)
@@ -105,6 +111,7 @@ async def refresh(body: schemas.RefreshRequest, db: AsyncSession = Depends(get_d
 
 
 # ── Logout ────────────────────────────────────────────────────────────────────
+
 
 @router.post("/logout", status_code=204)
 async def logout(
@@ -119,6 +126,7 @@ async def logout(
 
 
 # ── Device management ─────────────────────────────────────────────────────────
+
 
 @router.delete("/devices/{device_id}", status_code=204)
 async def revoke_device(
@@ -141,6 +149,7 @@ async def list_devices(
 
 
 # ── Public key management ─────────────────────────────────────────────────────
+
 
 @router.post("/keys/register", status_code=204)
 async def register_keys(
@@ -165,6 +174,7 @@ async def wrap_device_umk(
 
 # ── Password reset ────────────────────────────────────────────────────────────
 
+
 @router.post("/password-reset/request", response_model=schemas.MessageResponse, status_code=202)
 @limiter.limit("5/15minutes")
 async def password_reset_request(
@@ -178,12 +188,11 @@ async def password_reset_request(
         user, token = result
         reset_url = f"{settings.app_base_url}/reset-password?token={token}"
         from src.worker.tasks.email import send_password_reset_email
+
         send_password_reset_email.delay(user.email, user.display_name, reset_url)
 
     # Always return the same message — don't reveal whether email is registered
-    return schemas.MessageResponse(
-        message="If that email address is registered, you'll receive a reset link shortly."
-    )
+    return schemas.MessageResponse(message="If that email address is registered, you'll receive a reset link shortly.")
 
 
 @router.post("/password-reset/confirm", response_model=schemas.MessageResponse)

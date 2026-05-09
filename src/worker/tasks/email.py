@@ -25,9 +25,7 @@ def send_verification_email(user_email: str, display_name: str, verify_url: str)
     max_retries=3,
     retry_backoff=True,
 )
-def send_sharing_invite_email(
-    invitee_email: str, invitee_name: str, from_name: str, invite_code: str
-) -> None:
+def send_sharing_invite_email(invitee_email: str, invitee_name: str, from_name: str, invite_code: str) -> None:
     subject, html, text = sharing_invite_email(invitee_name, from_name, invite_code)
     get_provider().send(invitee_email, subject, html, text)
     logger.info("Sharing invite email sent to %s", invitee_email)

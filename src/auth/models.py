@@ -35,7 +35,7 @@ class Device(Base):
     platform: Mapped[str] = mapped_column(String(32), nullable=False)  # windows | linux | macos
     app_version: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     device_pubkey: Mapped[str | None] = mapped_column(Text, nullable=True)  # base64 X25519
-    wrapped_umk: Mapped[str | None] = mapped_column(Text, nullable=True)   # AES-GCM(shared_secret, UMK)
+    wrapped_umk: Mapped[str | None] = mapped_column(Text, nullable=True)  # AES-GCM(shared_secret, UMK)
     refresh_token_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

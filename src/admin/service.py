@@ -25,41 +25,24 @@ def _now_ms() -> int:
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
+
 async def get_stats(db: AsyncSession, redis: Redis, ws_connections: int) -> StatsResponse:
     users_total = (await db.scalar(select(func.count()).select_from(User))) or 0
-    users_verified = (
-        await db.scalar(select(func.count()).select_from(User).where(User.email_verified.is_(True)))
-    ) or 0
-    users_suspended = (
-        await db.scalar(
-            select(func.count()).select_from(User).where(User.suspended_at.isnot(None))
-        )
-    ) or 0
+    users_verified = (await db.scalar(select(func.count()).select_from(User).where(User.email_verified.is_(True)))) or 0
+    users_suspended = (await db.scalar(select(func.count()).select_from(User).where(User.suspended_at.isnot(None)))) or 0
 
     devices_total = (await db.scalar(select(func.count()).select_from(Device))) or 0
-    devices_active = (
-        await db.scalar(
-            select(func.count()).select_from(Device).where(Device.revoked.is_(False))
-        )
-    ) or 0
+    devices_active = (await db.scalar(select(func.count()).select_from(Device).where(Device.revoked.is_(False)))) or 0
 
     entries_total = (await db.scalar(select(func.count()).select_from(SyncEntry))) or 0
     entries_deleted = (
-        await db.scalar(
-            select(func.count()).select_from(SyncEntry).where(SyncEntry.deleted_at.isnot(None))
-        )
+        await db.scalar(select(func.count()).select_from(SyncEntry).where(SyncEntry.deleted_at.isnot(None)))
     ) or 0
 
     blobs_total = (await db.scalar(select(func.count()).select_from(Blob))) or 0
-    blobs_confirmed = (
-        await db.scalar(
-            select(func.count()).select_from(Blob).where(Blob.confirmed.is_(True))
-        )
-    ) or 0
+    blobs_confirmed = (await db.scalar(select(func.count()).select_from(Blob).where(Blob.confirmed.is_(True)))) or 0
 
-    storage_bytes = (
-        await db.scalar(select(func.coalesce(func.sum(User.blob_bytes_used), 0)))
-    ) or 0
+    storage_bytes = (await db.scalar(select(func.coalesce(func.sum(User.blob_bytes_used), 0)))) or 0
 
     # Redis memory usage (best-effort)
     redis_memory: int | None = None
@@ -87,6 +70,7 @@ async def get_stats(db: AsyncSession, redis: Redis, ws_connections: int) -> Stat
 
 # ── User management ───────────────────────────────────────────────────────────
 
+
 async def list_users(
     db: AsyncSession,
     offset: int = 0,
@@ -98,28 +82,14 @@ async def list_users(
         pattern = f"%{search}%"
         base = base.where(User.email.ilike(pattern) | User.display_name.ilike(pattern))
 
-    total = (
-        await db.scalar(
-            select(func.count()).select_from(base.subquery())
-        )
-    ) or 0
+    total = (await db.scalar(select(func.count()).select_from(base.subquery()))) or 0
 
-    users = (
-        await db.scalars(base.order_by(User.created_at.desc()).offset(offset).limit(limit))
-    ).all()
+    users = (await db.scalars(base.order_by(User.created_at.desc()).offset(offset).limit(limit))).all()
 
     summaries = []
     for u in users:
-        device_count = (
-            await db.scalar(
-                select(func.count()).select_from(Device).where(Device.user_id == u.id)
-            )
-        ) or 0
-        entry_count = (
-            await db.scalar(
-                select(func.count()).select_from(SyncEntry).where(SyncEntry.user_id == u.id)
-            )
-        ) or 0
+        device_count = (await db.scalar(select(func.count()).select_from(Device).where(Device.user_id == u.id))) or 0
+        entry_count = (await db.scalar(select(func.count()).select_from(SyncEntry).where(SyncEntry.user_id == u.id))) or 0
         summaries.append(
             UserAdminSummary(
                 id=u.id,
@@ -143,16 +113,8 @@ async def get_user(db: AsyncSession, user_id: uuid.UUID) -> UserAdminDetail:
     if not u:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    device_count = (
-        await db.scalar(
-            select(func.count()).select_from(Device).where(Device.user_id == u.id)
-        )
-    ) or 0
-    entry_count = (
-        await db.scalar(
-            select(func.count()).select_from(SyncEntry).where(SyncEntry.user_id == u.id)
-        )
-    ) or 0
+    device_count = (await db.scalar(select(func.count()).select_from(Device).where(Device.user_id == u.id))) or 0
+    entry_count = (await db.scalar(select(func.count()).select_from(SyncEntry).where(SyncEntry.user_id == u.id))) or 0
 
     return UserAdminDetail(
         id=u.id,

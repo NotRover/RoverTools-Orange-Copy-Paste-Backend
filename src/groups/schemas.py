@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 # ── Group ─────────────────────────────────────────────────────────────────────
 
+
 class CreateGroupRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     group_type: Literal["pool"] = "pool"
@@ -38,6 +39,7 @@ class GroupOut(BaseModel):
 
 # ── Invite / Join ─────────────────────────────────────────────────────────────
 
+
 class InviteRequest(BaseModel):
     email: str | None = None
 
@@ -59,6 +61,7 @@ class JoinResponse(BaseModel):
 
 
 # ── Key distribution ──────────────────────────────────────────────────────────
+
 
 class WrappedKeyEntry(BaseModel):
     user_id: uuid.UUID
