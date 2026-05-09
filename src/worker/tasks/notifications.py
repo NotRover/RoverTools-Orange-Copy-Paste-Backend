@@ -64,8 +64,10 @@ def detect_offline_devices() -> None:
 
 def _publish_device_offline(r: sync_redis.Redis, user_id: str, device_id: str) -> None:
     channel = f"user:{user_id}"
-    payload = json.dumps({
-        "event": "device:offline",
-        "payload": {"user_id": user_id, "device_id": device_id},
-    })
+    payload = json.dumps(
+        {
+            "event": "device:offline",
+            "payload": {"user_id": user_id, "device_id": device_id},
+        }
+    )
     r.publish(channel, payload)

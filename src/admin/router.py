@@ -37,6 +37,7 @@ router = APIRouter(prefix="/internal", tags=["admin"])
 
 # ── Admin key dependency ───────────────────────────────────────────────────────
 
+
 def require_admin_key(
     x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None,
 ) -> None:
@@ -53,6 +54,7 @@ def require_admin_key(
 
 
 # ── Health (public — no admin key required) ────────────────────────────────────
+
 
 @router.get("/healthz", include_in_schema=True)
 async def healthz(
@@ -83,6 +85,7 @@ async def healthz(
 
 
 # ── Prometheus metrics ─────────────────────────────────────────────────────────
+
 
 @router.get(
     "/metrics",
@@ -122,6 +125,7 @@ async def metrics(
 
 # ── JSON stats ─────────────────────────────────────────────────────────────────
 
+
 @router.get(
     "/stats",
     response_model=StatsResponse,
@@ -135,6 +139,7 @@ async def stats(
 
 
 # ── User management ────────────────────────────────────────────────────────────
+
 
 @router.get(
     "/admin/users",

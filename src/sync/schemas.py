@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 # ── Push ──────────────────────────────────────────────────────────────────────
 
+
 class PushEntry(BaseModel):
     client_id: str
     entry_type: Literal["clipboard", "note"]
@@ -43,6 +44,7 @@ class PushResponse(BaseModel):
 
 # ── Pull ──────────────────────────────────────────────────────────────────────
 
+
 class SyncEntryOut(BaseModel):
     id: uuid.UUID
     client_id: str
@@ -70,6 +72,7 @@ class PullResponse(BaseModel):
 
 
 # ── Cursor / Status ───────────────────────────────────────────────────────────
+
 
 class CursorUpdateRequest(BaseModel):
     last_server_ts: int

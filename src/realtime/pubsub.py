@@ -48,6 +48,7 @@ async def start_listener(redis_url: str) -> None:
 
 # ── Publish helpers ───────────────────────────────────────────────────────────
 
+
 async def publish(redis: Redis, channel: str, event: str, payload: dict, origin_device: str | None = None) -> None:
     data: dict = {"event": event, "payload": payload}
     if origin_device:
@@ -55,24 +56,18 @@ async def publish(redis: Redis, channel: str, event: str, payload: dict, origin_
     await redis.publish(channel, json.dumps(data))
 
 
-async def publish_sync_entry(
-    redis: Redis, user_id: str, device_id: str, entry_payload: dict, group_ids: list[str]
-) -> None:
+async def publish_sync_entry(redis: Redis, user_id: str, device_id: str, entry_payload: dict, group_ids: list[str]) -> None:
     await publish(redis, f"user:{user_id}", "sync:entry", entry_payload, origin_device=device_id)
     for gid in group_ids:
         await publish(redis, f"group:{gid}", "sync:entry", entry_payload, origin_device=device_id)
 
 
-async def publish_sync_delete(
-    redis: Redis, user_id: str, device_id: str, server_id: str, deleted_at: int
-) -> None:
+async def publish_sync_delete(redis: Redis, user_id: str, device_id: str, server_id: str, deleted_at: int) -> None:
     payload = {"server_id": server_id, "deleted_at": deleted_at}
     await publish(redis, f"user:{user_id}", "sync:delete", payload, origin_device=device_id)
 
 
-async def publish_group_membership_changed(
-    redis: Redis, group_id: str, action: str, affected_user_id: str
-) -> None:
+async def publish_group_membership_changed(redis: Redis, group_id: str, action: str, affected_user_id: str) -> None:
     payload = {"group_id": group_id, "action": action, "user_id": affected_user_id}
     await publish(redis, f"group:{group_id}", "group:membership_changed", payload)
 
@@ -83,8 +78,7 @@ async def publish_group_rekey(redis: Redis, group_id: str, user_id: str, wrapped
 
 
 async def publish_sharing_invite(
-    redis: Redis, invitee_user_id: str, share_group_id: str,
-    from_user: dict, invite_code: str, expires_at: int
+    redis: Redis, invitee_user_id: str, share_group_id: str, from_user: dict, invite_code: str, expires_at: int
 ) -> None:
     payload = {
         "share_group_id": share_group_id,
@@ -114,9 +108,7 @@ async def publish_sharing_ended(redis: Redis, group_id: str, ended_by: str) -> N
     await publish(redis, f"group:{group_id}", "sharing:ended", {"share_group_id": group_id, "ended_by": ended_by})
 
 
-async def publish_sharing_scope_changed(
-    redis: Redis, group_id: str, user_id: str, share_scope: str
-) -> None:
+async def publish_sharing_scope_changed(redis: Redis, group_id: str, user_id: str, share_scope: str) -> None:
     payload = {"share_group_id": group_id, "user_id": user_id, "share_scope": share_scope}
     await publish(redis, f"group:{group_id}", "sharing:scope_changed", payload)
 

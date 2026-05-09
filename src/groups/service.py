@@ -61,16 +61,12 @@ async def create_group(db: AsyncSession, user_id: str, req: CreateGroupRequest) 
 
 async def list_groups(db: AsyncSession, user_id: str) -> list[GroupOut]:
     uid = uuid.UUID(user_id)
-    memberships = await db.scalars(
-        select(GroupMembership).where(GroupMembership.user_id == uid)
-    )
+    memberships = await db.scalars(select(GroupMembership).where(GroupMembership.user_id == uid))
     group_ids = [m.group_id for m in memberships.all()]
 
     groups_out = []
     for gid in group_ids:
-        g = await db.scalar(
-            select(Group).where(Group.id == gid, Group.group_type == "pool")
-        )
+        g = await db.scalar(select(Group).where(Group.id == gid, Group.group_type == "pool"))
         if g:
             groups_out.append(await _group_to_out(db, g, uid))
     return groups_out
@@ -83,9 +79,7 @@ async def get_group(db: AsyncSession, group_id: uuid.UUID, user_id: str) -> Grou
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
 
     member = await db.scalar(
-        select(GroupMembership).where(
-            GroupMembership.group_id == group_id, GroupMembership.user_id == uid
-        )
+        select(GroupMembership).where(GroupMembership.group_id == group_id, GroupMembership.user_id == uid)
     )
     if not member:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member")
@@ -94,13 +88,8 @@ async def get_group(db: AsyncSession, group_id: uuid.UUID, user_id: str) -> Grou
 
 
 async def _group_to_out(db: AsyncSession, g: Group, requesting_user_id: uuid.UUID) -> GroupOut:
-    members_rows = await db.scalars(
-        select(GroupMembership).where(GroupMembership.group_id == g.id)
-    )
-    members = [
-        MemberOut(user_id=m.user_id, role=m.role, joined_at=m.joined_at)
-        for m in members_rows.all()
-    ]
+    members_rows = await db.scalars(select(GroupMembership).where(GroupMembership.group_id == g.id))
+    members = [MemberOut(user_id=m.user_id, role=m.role, joined_at=m.joined_at) for m in members_rows.all()]
     return GroupOut(
         id=g.id,
         owner_id=g.owner_id,
@@ -123,9 +112,7 @@ async def refresh_invite(db: AsyncSession, group_id: uuid.UUID, user_id: str) ->
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
 
     g.invite_code = _new_invite_code()
-    g.invite_expires_at = int(
-        (datetime.now(UTC) + timedelta(hours=_INVITE_TTL_HOURS)).timestamp() * 1000
-    )
+    g.invite_expires_at = int((datetime.now(UTC) + timedelta(hours=_INVITE_TTL_HOURS)).timestamp() * 1000)
     await db.commit()
     return InviteResponse(invite_code=g.invite_code, expires_at=g.invite_expires_at)
 
@@ -142,19 +129,13 @@ async def join_group(db: AsyncSession, user_id: str, req: JoinRequest) -> tuple[
 
     # Check membership cap
     if g.max_members > 0:
-        count_result = await db.scalars(
-            select(GroupMembership).where(GroupMembership.group_id == g.id)
-        )
+        count_result = await db.scalars(select(GroupMembership).where(GroupMembership.group_id == g.id))
         count = len(list(count_result.all()))
         if count >= g.max_members:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Group is full")
 
     # Idempotent — already a member
-    existing = await db.scalar(
-        select(GroupMembership).where(
-            GroupMembership.group_id == g.id, GroupMembership.user_id == uid
-        )
-    )
+    existing = await db.scalar(select(GroupMembership).where(GroupMembership.group_id == g.id, GroupMembership.user_id == uid))
     if not existing:
         membership = GroupMembership(
             group_id=g.id,
@@ -169,9 +150,7 @@ async def join_group(db: AsyncSession, user_id: str, req: JoinRequest) -> tuple[
     return JoinResponse(group_id=g.id, name=g.name, group_type=g.group_type), g
 
 
-async def remove_member(
-    db: AsyncSession, group_id: uuid.UUID, target_user_id: uuid.UUID, requesting_user_id: str
-) -> None:
+async def remove_member(db: AsyncSession, group_id: uuid.UUID, target_user_id: uuid.UUID, requesting_user_id: str) -> None:
     rid = uuid.UUID(requesting_user_id)
     g = await db.scalar(select(Group).where(Group.id == group_id))
     if not g:
@@ -183,9 +162,7 @@ async def remove_member(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permission")
 
     m = await db.scalar(
-        select(GroupMembership).where(
-            GroupMembership.group_id == group_id, GroupMembership.user_id == target_user_id
-        )
+        select(GroupMembership).where(GroupMembership.group_id == group_id, GroupMembership.user_id == target_user_id)
     )
     if m:
         await db.delete(m)
@@ -203,9 +180,7 @@ async def delete_group(db: AsyncSession, group_id: uuid.UUID, user_id: str) -> N
     await db.commit()
 
 
-async def distribute_keys(
-    db: AsyncSession, group_id: uuid.UUID, user_id: str, req: DistributeKeysRequest
-) -> None:
+async def distribute_keys(db: AsyncSession, group_id: uuid.UUID, user_id: str, req: DistributeKeysRequest) -> None:
     uid = uuid.UUID(user_id)
     g = await db.scalar(select(Group).where(Group.id == group_id))
     if not g:

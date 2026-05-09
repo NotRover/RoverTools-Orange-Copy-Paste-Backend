@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     admin_api_key: str = ""  # Required to access /internal/* admin endpoints; leave empty to disable
 
     # Email — provider selection
-    email_provider: str = "brevo"          # "brevo" | "smtp"
+    email_provider: str = "brevo"  # "brevo" | "smtp"
 
     # Brevo (primary)
     brevo_api_key: str = ""
@@ -51,8 +51,8 @@ class Settings(BaseSettings):
     app_base_url: str = "http://localhost:1420"
 
     # Token TTLs (seconds)
-    email_verify_token_ttl: int = 86_400    # 24 h
-    password_reset_token_ttl: int = 3_600   # 1 h
+    email_verify_token_ttl: int = 86_400  # 24 h
+    password_reset_token_ttl: int = 3_600  # 1 h
 
     @property
     def cors_origins(self) -> list[str]:

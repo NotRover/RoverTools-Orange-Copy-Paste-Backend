@@ -21,6 +21,7 @@ def _now_ms() -> int:
 
 # ── Push ──────────────────────────────────────────────────────────────────────
 
+
 async def push_entries(
     db: AsyncSession,
     user_id: str,
@@ -101,6 +102,7 @@ async def _upsert_entry(
 
 # ── Pull ──────────────────────────────────────────────────────────────────────
 
+
 async def pull_entries(
     db: AsyncSession,
     user_id: str,
@@ -131,16 +133,19 @@ async def pull_entries(
 
 # ── Cursor ────────────────────────────────────────────────────────────────────
 
+
 async def update_cursor(db: AsyncSession, device_id: str, user_id: str, last_server_ts: int) -> None:
     did = uuid.UUID(device_id)
     uid = uuid.UUID(user_id)
 
-    stmt = pg_insert(SyncCursor).values(
-        device_id=did, user_id=uid, last_server_ts=last_server_ts
-    ).on_conflict_do_update(
-        index_elements=["device_id"],
-        set_={"last_server_ts": last_server_ts},
-        where=SyncCursor.last_server_ts < last_server_ts,
+    stmt = (
+        pg_insert(SyncCursor)
+        .values(device_id=did, user_id=uid, last_server_ts=last_server_ts)
+        .on_conflict_do_update(
+            index_elements=["device_id"],
+            set_={"last_server_ts": last_server_ts},
+            where=SyncCursor.last_server_ts < last_server_ts,
+        )
     )
     await db.execute(stmt)
     await db.commit()

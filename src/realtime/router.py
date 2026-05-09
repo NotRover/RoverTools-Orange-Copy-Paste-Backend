@@ -16,8 +16,8 @@ from src.redis_client import get_redis_pool
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["realtime"])
 
-_PING_INTERVAL = 25   # seconds between server pings
-_PRESENCE_TTL = 300   # seconds
+_PING_INTERVAL = 25  # seconds between server pings
+_PRESENCE_TTL = 300  # seconds
 
 
 def _now_ms() -> int:
@@ -52,9 +52,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
     # 2. Build channel list: user channel + all group channels
     channels = [f"user:{user_id}"]
     async with AsyncSessionLocal() as db:
-        memberships = await db.scalars(
-            select(GroupMembership).where(GroupMembership.user_id == uuid.UUID(user_id))
-        )
+        memberships = await db.scalars(select(GroupMembership).where(GroupMembership.user_id == uuid.UUID(user_id)))
         for m in memberships.all():
             channels.append(f"group:{m.group_id}")
 
@@ -67,6 +65,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
 
     # 5. Notify other devices this device came online
     from src.realtime import pubsub as rt
+
     await rt.publish(redis, f"user:{user_id}", "device:online", {"device_id": device_id})
 
     # 6. Main receive loop
@@ -82,7 +81,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
                     pass  # future: mark delivery confirmed
             except asyncio.TimeoutError:
                 await websocket.send_json({"event": "ping", "payload": {"server_ts": _now_ms()}})
-            except (WebSocketDisconnect, RuntimeError):
+            except WebSocketDisconnect, RuntimeError:
                 break
     finally:
         await hub.unregister(websocket)

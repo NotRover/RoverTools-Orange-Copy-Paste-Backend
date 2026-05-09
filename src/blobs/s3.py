@@ -3,8 +3,8 @@ from botocore.config import Config
 
 from src.config import settings
 
-_PRESIGNED_PUT_TTL = 300    # 5 minutes
-_PRESIGNED_GET_TTL = 3600   # 1 hour
+_PRESIGNED_PUT_TTL = 300  # 5 minutes
+_PRESIGNED_GET_TTL = 3600  # 1 hour
 _MAX_BLOB_BYTES = 5_242_880  # 5 MB hard cap
 
 

@@ -6,7 +6,7 @@ from src.worker.app import app
 
 logger = logging.getLogger(__name__)
 
-_ORPHAN_TTL_HOURS = 1   # blobs unconfirmed longer than this are considered orphans
+_ORPHAN_TTL_HOURS = 1  # blobs unconfirmed longer than this are considered orphans
 
 
 @app.task(name="src.worker.tasks.blob_cleanup.cleanup_orphan_blobs")
@@ -29,9 +29,7 @@ async def _cleanup() -> dict:
 
     deleted_count = 0
     async with Session() as db:
-        orphans = await db.scalars(
-            select(Blob).where(Blob.confirmed.is_(False), Blob.created_at < cutoff)
-        )
+        orphans = await db.scalars(select(Blob).where(Blob.confirmed.is_(False), Blob.created_at < cutoff))
         for blob in orphans.all():
             try:
                 delete_object(blob.key)

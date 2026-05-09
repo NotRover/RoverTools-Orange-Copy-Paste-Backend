@@ -41,9 +41,7 @@ async def test_push_single_entry(client: AsyncClient, auth_headers: dict):
 async def test_push_multiple_entries(client: AsyncClient, auth_headers: dict):
     headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
     entries = [_entry(f"cid-batch-{i}") for i in range(5)]
-    resp = await client.post(
-        "/api/v1/sync/push", json={"entries": entries}, headers=headers
-    )
+    resp = await client.post("/api/v1/sync/push", json={"entries": entries}, headers=headers)
     assert resp.status_code == 200
     body = resp.json()
     assert len(body["accepted"]) == 5
@@ -140,9 +138,7 @@ async def test_pull_cursor_pagination(client: AsyncClient, auth_headers: dict):
     assert body["next_cursor"] is not None
 
     # Second page
-    resp2 = await client.get(
-        f"/api/v1/sync/pull?after_ts={body['next_cursor']}&limit=2", headers=headers
-    )
+    resp2 = await client.get(f"/api/v1/sync/pull?after_ts={body['next_cursor']}&limit=2", headers=headers)
     assert resp2.status_code == 200
     assert len(resp2.json()["entries"]) >= 1
 

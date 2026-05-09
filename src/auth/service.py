@@ -35,6 +35,7 @@ def generate_kdf_salt() -> str:
 
 # ── Registration ──────────────────────────────────────────────────────────────
 
+
 async def register_user(db: AsyncSession, req: RegisterRequest) -> User:
     existing = await db.scalar(select(User).where(User.email == req.email))
     if existing:
@@ -56,6 +57,7 @@ async def register_user(db: AsyncSession, req: RegisterRequest) -> User:
 
 
 # ── Login ─────────────────────────────────────────────────────────────────────
+
 
 async def login_user(db: AsyncSession, req: LoginRequest) -> tuple[User, Device]:
     user = await db.scalar(select(User).where(User.email == req.email))
@@ -88,6 +90,7 @@ async def login_user(db: AsyncSession, req: LoginRequest) -> tuple[User, Device]
 
 # ── Token rotation ────────────────────────────────────────────────────────────
 
+
 async def store_refresh_token(db: AsyncSession, device: Device, raw_token: str) -> None:
     device.refresh_token_hash = _pwd_ctx.hash(raw_token)
     device.last_seen_at = _now_ms()
@@ -117,6 +120,7 @@ async def rotate_refresh_token(
 
 # ── Device management ─────────────────────────────────────────────────────────
 
+
 async def revoke_device(db: AsyncSession, device_id: uuid.UUID, requesting_user_id: str) -> None:
     device = await db.scalar(select(Device).where(Device.id == device_id))
     if not device:
@@ -129,9 +133,7 @@ async def revoke_device(db: AsyncSession, device_id: uuid.UUID, requesting_user_
 
 
 async def get_user_devices(db: AsyncSession, user_id: str, current_device_id: str) -> list[dict]:
-    result = await db.scalars(
-        select(Device).where(Device.user_id == uuid.UUID(user_id), Device.revoked.is_(False))
-    )
+    result = await db.scalars(select(Device).where(Device.user_id == uuid.UUID(user_id), Device.revoked.is_(False)))
     devices = result.all()
     return [
         {
@@ -147,6 +149,7 @@ async def get_user_devices(db: AsyncSession, user_id: str, current_device_id: st
 
 
 # ── Public key management ─────────────────────────────────────────────────────
+
 
 async def store_public_keys(
     db: AsyncSession,
@@ -218,9 +221,7 @@ async def verify_email(db: AsyncSession, redis: Redis, token: str) -> User:
 _RESET_PREFIX = "pwd_reset:"
 
 
-async def request_password_reset(
-    db: AsyncSession, redis: Redis, email: str
-) -> tuple[User, str] | None:
+async def request_password_reset(db: AsyncSession, redis: Redis, email: str) -> tuple[User, str] | None:
     """Returns (user, token) if found, None if not (caller should not reveal whether email exists)."""
     user = await db.scalar(select(User).where(User.email == email))
     if not user:
@@ -235,9 +236,7 @@ async def request_password_reset(
     return user, token
 
 
-async def confirm_password_reset(
-    db: AsyncSession, redis: Redis, token: str, new_password: str
-) -> None:
+async def confirm_password_reset(db: AsyncSession, redis: Redis, token: str, new_password: str) -> None:
     key = f"{_RESET_PREFIX}{token}"
     user_id = await redis.get(key)
     if not user_id:

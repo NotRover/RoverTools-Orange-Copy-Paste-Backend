@@ -25,9 +25,11 @@ def get_provider() -> EmailProvider:
 
     if provider == "brevo":
         from src.email.brevo import BrevoProvider
+
         _instance = BrevoProvider()
     elif provider == "smtp":
         from src.email.smtp import SmtpProvider
+
         _instance = SmtpProvider()
     else:
         raise ValueError(f"Unknown email provider: {provider!r}. Use 'brevo' or 'smtp'.")

@@ -13,9 +13,7 @@ async def get_settings(db: AsyncSession, user_id: str) -> UserSettings | None:
     return await db.scalar(select(UserSettings).where(UserSettings.user_id == uid))
 
 
-async def put_settings(
-    db: AsyncSession, user_id: str, req: SettingsPutRequest
-) -> SettingsPutResponse:
+async def put_settings(db: AsyncSession, user_id: str, req: SettingsPutRequest) -> SettingsPutResponse:
     uid = uuid.UUID(user_id)
     existing = await db.scalar(select(UserSettings).where(UserSettings.user_id == uid))
 
@@ -27,13 +25,17 @@ async def put_settings(
             encrypted_blob=existing.encrypted_blob,
         )
 
-    stmt = pg_insert(UserSettings).values(
-        user_id=uid,
-        encrypted_blob=req.encrypted_blob,
-        updated_at=req.updated_at,
-    ).on_conflict_do_update(
-        index_elements=["user_id"],
-        set_={"encrypted_blob": req.encrypted_blob, "updated_at": req.updated_at},
+    stmt = (
+        pg_insert(UserSettings)
+        .values(
+            user_id=uid,
+            encrypted_blob=req.encrypted_blob,
+            updated_at=req.updated_at,
+        )
+        .on_conflict_do_update(
+            index_elements=["user_id"],
+            set_={"encrypted_blob": req.encrypted_blob, "updated_at": req.updated_at},
+        )
     )
     await db.execute(stmt)
     await db.commit()

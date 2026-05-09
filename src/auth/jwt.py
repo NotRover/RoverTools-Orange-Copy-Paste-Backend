@@ -88,4 +88,5 @@ def decode_access_token(token: str) -> dict:
 def create_refresh_token() -> str:
     """Returns a secure random hex token (64 chars)."""
     import secrets
+
     return secrets.token_hex(32)

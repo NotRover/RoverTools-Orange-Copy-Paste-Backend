@@ -16,7 +16,7 @@ from src.blobs.schemas import (
     RequestUploadResponse,
 )
 
-_MAX_BLOB_BYTES = 5_242_880   # 5 MB
+_MAX_BLOB_BYTES = 5_242_880  # 5 MB
 
 
 def _now_ms() -> int:
@@ -69,9 +69,7 @@ async def request_upload(
 
 async def confirm_upload(db: AsyncSession, user_id: str, body: ConfirmUploadBody) -> None:
     uid = uuid.UUID(user_id)
-    blob = await db.scalar(
-        select(Blob).where(Blob.key == body.blob_key, Blob.user_id == uid)
-    )
+    blob = await db.scalar(select(Blob).where(Blob.key == body.blob_key, Blob.user_id == uid))
     if not blob:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blob not found")
     if blob.confirmed:
@@ -87,9 +85,7 @@ async def confirm_upload(db: AsyncSession, user_id: str, body: ConfirmUploadBody
 
 async def get_download_url(db: AsyncSession, user_id: str, blob_key: str) -> DownloadUrlResponse:
     uid = uuid.UUID(user_id)
-    blob = await db.scalar(
-        select(Blob).where(Blob.key == blob_key, Blob.user_id == uid, Blob.confirmed.is_(True))
-    )
+    blob = await db.scalar(select(Blob).where(Blob.key == blob_key, Blob.user_id == uid, Blob.confirmed.is_(True)))
     if not blob:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blob not found")
 
