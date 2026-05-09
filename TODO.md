@@ -124,6 +124,28 @@ Track implementation status per architecture phase.
 
 ---
 
+## Phase 9 — Admin ✅ COMPLETE
+
+- [x] `src/config.py` — added `admin_api_key: str = ""` (env: ADMIN_API_KEY)
+- [x] `src/auth/models.py` — added `suspended_at: BigInteger | None` to User
+- [x] `src/auth/service.py` — login rejects suspended users with 403
+- [x] `src/realtime/hub.py` — added `connection_count()` for metrics
+- [x] `src/admin/schemas.py` — UserAdminSummary, UserAdminDetail, UserListResponse, StatsResponse, QuotaUpdateRequest, SuspendRequest
+- [x] `src/admin/service.py` — get_stats, list_users, get_user, update_quota, set_suspended, delete_user
+- [x] `src/admin/router.py` — full rewrite:
+  - [x] `GET /internal/healthz` — public, DB + Redis liveness
+  - [x] `GET /internal/metrics` — Prometheus text/plain (12 gauges)
+  - [x] `GET /internal/stats` — JSON aggregate stats
+  - [x] `GET /internal/admin/users` — paginated list with search
+  - [x] `GET /internal/admin/users/{id}` — full user detail
+  - [x] `PATCH /internal/admin/users/{id}/quota` — update blob quota
+  - [x] `POST /internal/admin/users/{id}/suspend` — suspend / unsuspend
+  - [x] `DELETE /internal/admin/users/{id}` — hard delete
+- [x] `migrations/versions/0005_admin.py` — ADD COLUMN users.suspended_at
+- [x] `docs/ARCHITECTURE.md` — documented all admin endpoints, auth scheme, metrics, and suspension semantics
+
+---
+
 ## Cross-Cutting Updates ✅ COMPLETE
 
 - [x] `migrations/env.py` — imports all new models

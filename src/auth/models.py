@@ -17,6 +17,7 @@ class User(Base):
     kdf_salt: Mapped[str] = mapped_column(String(64), nullable=False)  # base64 Argon2id salt
     identity_pubkey: Mapped[str | None] = mapped_column(Text, nullable=True)  # base64 X25519
     email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    suspended_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=None)
     blob_bytes_used: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     blob_bytes_quota: Mapped[int] = mapped_column(BigInteger, nullable=False, default=524_288_000)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

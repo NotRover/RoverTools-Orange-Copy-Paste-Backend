@@ -64,6 +64,11 @@ async def login_user(db: AsyncSession, req: LoginRequest) -> tuple[User, Device]
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
         )
+    if user.suspended_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended",
+        )
 
     now = _now_ms()
     device = Device(

@@ -38,6 +38,11 @@ async def unregister(ws: WebSocket) -> None:
                 del _channels[ch]
 
 
+def connection_count() -> int:
+    """Return the number of currently connected WebSocket clients (no lock — approximate)."""
+    return len(_ws_device)
+
+
 async def broadcast(channel: str, raw: str, exclude_device: str | None = None) -> None:
     async with _lock:
         targets = list(_channels.get(channel, set()))
