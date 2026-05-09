@@ -1,27 +1,81 @@
 import uuid
-from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth import schemas, service
 from src.auth.jwt import create_access_token, create_refresh_token
 from src.config import settings
-from src.dependencies import get_current_user_id, get_redis
 from src.database import get_db
+from src.dependencies import get_current_user_id, get_redis
+from src.limiter import limiter
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+# ── Registration ──────────────────────────────────────────────────────────────
+
 @router.post("/register", response_model=schemas.RegisterResponse, status_code=201)
-async def register(body: schemas.RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(
+    body: schemas.RegisterRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+):
     user = await service.register_user(db, body)
+
+    token = await service.generate_verification_token(redis, str(user.id))
+    verify_url = f"{settings.app_base_url}/verify-email?token={token}"
+
+    from src.worker.tasks.email import send_verification_email
+    send_verification_email.delay(user.email, user.display_name, verify_url)
+
     return schemas.RegisterResponse(user_id=user.id)
 
 
+# ── Email verification ────────────────────────────────────────────────────────
+
+@router.post("/verify-email", response_model=schemas.MessageResponse)
+async def verify_email(
+    body: schemas.VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+):
+    await service.verify_email(db, redis, body.token)
+    return schemas.MessageResponse(message="Email verified successfully.")
+
+
+@router.post("/resend-verification", response_model=schemas.MessageResponse, status_code=202)
+@limiter.limit("3/hour")
+async def resend_verification(
+    request: Request,
+    body: schemas.ResendVerificationRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+):
+    from sqlalchemy import select
+    from src.auth.models import User
+
+    user = await db.scalar(select(User).where(User.email == body.email))
+    if user and not user.email_verified:
+        token = await service.generate_verification_token(redis, str(user.id))
+        verify_url = f"{settings.app_base_url}/verify-email?token={token}"
+        from src.worker.tasks.email import send_verification_email
+        send_verification_email.delay(user.email, user.display_name, verify_url)
+
+    # Always return 202 — don't reveal whether email exists
+    return schemas.MessageResponse(message="If that address is registered and unverified, a new email has been sent.")
+
+
+# ── Login ─────────────────────────────────────────────────────────────────────
+
 @router.post("/login", response_model=schemas.LoginResponse)
-async def login(body: schemas.LoginRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("10/minute;30/hour")
+async def login(
+    request: Request,
+    body: schemas.LoginRequest,
+    db: AsyncSession = Depends(get_db),
+):
     user, device = await service.login_user(db, body)
 
     access_token, _jti = create_access_token(str(user.id), str(device.id))
@@ -37,6 +91,8 @@ async def login(body: schemas.LoginRequest, db: AsyncSession = Depends(get_db)):
     )
 
 
+# ── Token refresh ─────────────────────────────────────────────────────────────
+
 @router.post("/refresh", response_model=schemas.RefreshResponse)
 async def refresh(body: schemas.RefreshRequest, db: AsyncSession = Depends(get_db)):
     user, device = await service.rotate_refresh_token(db, body.device_id, body.refresh_token)
@@ -48,11 +104,12 @@ async def refresh(body: schemas.RefreshRequest, db: AsyncSession = Depends(get_d
     return schemas.RefreshResponse(access_token=new_access, refresh_token=new_refresh)
 
 
+# ── Logout ────────────────────────────────────────────────────────────────────
+
 @router.post("/logout", status_code=204)
 async def logout(
     body: dict,
     db: AsyncSession = Depends(get_db),
-    redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
     user_id, _ = current
@@ -60,6 +117,8 @@ async def logout(
     if device_id:
         await service.revoke_device(db, uuid.UUID(str(device_id)), user_id)
 
+
+# ── Device management ─────────────────────────────────────────────────────────
 
 @router.delete("/devices/{device_id}", status_code=204)
 async def revoke_device(
@@ -80,6 +139,8 @@ async def list_devices(
     devices = await service.get_user_devices(db, user_id, device_id)
     return [schemas.DeviceOut(**d) for d in devices]
 
+
+# ── Public key management ─────────────────────────────────────────────────────
 
 @router.post("/keys/register", status_code=204)
 async def register_keys(
@@ -102,13 +163,34 @@ async def wrap_device_umk(
     await service.store_wrapped_umk(db, device_id, user_id, body.wrapped_umk)
 
 
-@router.post("/password-reset/request", status_code=204)
-async def password_reset_request(body: schemas.PasswordResetRequestBody):
-    # TODO: queue Celery email task (Phase 7)
-    pass
+# ── Password reset ────────────────────────────────────────────────────────────
+
+@router.post("/password-reset/request", response_model=schemas.MessageResponse, status_code=202)
+@limiter.limit("5/15minutes")
+async def password_reset_request(
+    request: Request,
+    body: schemas.PasswordResetRequestBody,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+):
+    result = await service.request_password_reset(db, redis, body.email)
+    if result:
+        user, token = result
+        reset_url = f"{settings.app_base_url}/reset-password?token={token}"
+        from src.worker.tasks.email import send_password_reset_email
+        send_password_reset_email.delay(user.email, user.display_name, reset_url)
+
+    # Always return the same message — don't reveal whether email is registered
+    return schemas.MessageResponse(
+        message="If that email address is registered, you'll receive a reset link shortly."
+    )
 
 
-@router.post("/password-reset/confirm", status_code=204)
-async def password_reset_confirm(body: schemas.PasswordResetConfirmBody):
-    # TODO: validate token, update password hash (Phase 7)
-    pass
+@router.post("/password-reset/confirm", response_model=schemas.MessageResponse)
+async def password_reset_confirm(
+    body: schemas.PasswordResetConfirmBody,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+):
+    await service.confirm_password_reset(db, redis, body.token, body.new_password)
+    return schemas.MessageResponse(message="Password updated successfully.")

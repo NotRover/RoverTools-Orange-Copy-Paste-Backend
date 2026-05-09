@@ -8,7 +8,11 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Import all models so Alembic can detect them
-from src.auth.models import User, Device  # noqa: F401
+from src.auth.models import Device, User  # noqa: F401
+from src.blobs.models import Blob  # noqa: F401
+from src.groups.models import Group, GroupMembership  # noqa: F401
+from src.settings.models import UserSettings  # noqa: F401
+from src.sync.models import SyncCursor, SyncEntry  # noqa: F401
 from src.database import Base
 
 config = context.config

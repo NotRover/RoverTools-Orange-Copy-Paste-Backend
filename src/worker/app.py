@@ -23,6 +23,10 @@ app.conf.update(
         "blob-cleanup-daily": {
             "task": "src.worker.tasks.blob_cleanup.cleanup_orphan_blobs",
             "schedule": 86400.0,  # every 24h
-        }
+        },
+        "detect-offline-devices": {
+            "task": "src.worker.tasks.notifications.detect_offline_devices",
+            "schedule": 60.0,  # every 60s
+        },
     },
 )
