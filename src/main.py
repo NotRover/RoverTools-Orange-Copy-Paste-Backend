@@ -8,7 +8,6 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from src.admin.router import router as admin_router
-from src.well_known import router as well_known_router
 from src.auth.router import router as auth_router
 from src.blobs.router import router as blobs_router
 from src.config import settings
@@ -21,6 +20,7 @@ from src.redis_client import close_redis_pool, get_redis_pool
 from src.settings.router import router as settings_router
 from src.sharing.router import router as sharing_router
 from src.sync.router import router as sync_router
+from src.well_known import router as well_known_router
 
 
 @asynccontextmanager
