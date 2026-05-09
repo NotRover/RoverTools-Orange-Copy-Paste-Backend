@@ -15,7 +15,7 @@ Track implementation status per architecture phase.
 - [x] `src/auth/service.py`
 - [x] `src/auth/jwt.py` — create/decode tokens, get_jwks() with lru_cache
 - [x] `src/auth/router.py`
-- [x] `src/admin/router.py` — /internal/healthz
+- [x] `src/admin/router.py` — /internal/healthz (full admin expanded in Phase 9)
 - [x] `migrations/versions/0001_initial_auth.py`
 - [x] `docker-compose.yml`
 - [x] `Dockerfile`
@@ -150,3 +150,6 @@ Track implementation status per architecture phase.
 
 - [x] `migrations/env.py` — imports all new models
 - [x] `src/main.py` — includes settings, sharing, and well_known routers
+- [x] `.env.example` — ADMIN_API_KEY, token TTL overrides added
+- [x] `pyproject.toml` — all runtime deps (asyncpg, alembic, redis[hiredis], celery[redis], boto3, python-jose[cryptography], passlib[bcrypt], cryptography, slowapi) + dev deps (fakeredis, pytest-asyncio) installed via `uv sync --extra dev`
+- [x] `docs/ARCHITECTURE.md` — users.suspended_at added to DDL; 5.1 auth routes completed; admin (5.7) and well-known (5.8) API sections added; Appendix A security checklist updated; Appendix B open/closed items separated
