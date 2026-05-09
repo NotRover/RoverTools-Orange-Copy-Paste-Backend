@@ -12,7 +12,6 @@ Design:
   without cleanup → publish device:offline and SREM from the set.
 """
 
-import asyncio
 import json
 import logging
 
@@ -31,8 +30,6 @@ _DEVICES_PATTERN = "user:*:devices"
 def detect_offline_devices() -> None:
     """Scan Redis for stale device presence entries and emit device:offline events."""
     r = sync_redis.from_url(settings.redis_url, decode_responses=True)
-    pub = r.pubsub()  # not used for subscribe — only for publish via r.publish
-
     offline_count = 0
     cursor = 0
     while True:

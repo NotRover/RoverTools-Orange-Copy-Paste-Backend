@@ -20,6 +20,7 @@ def get_jwks() -> dict:
 
     Cached at process level — keys don't change at runtime.
     """
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
     from cryptography.hazmat.primitives.serialization import (
         Encoding,
         PublicFormat,
@@ -27,8 +28,11 @@ def get_jwks() -> dict:
     )
 
     pem = settings.jwt_public_key
-    pub_key = load_pem_public_key(pem.encode())
-    pub_numbers = pub_key.public_numbers()  # type: ignore[union-attr]
+    raw_key = load_pem_public_key(pem.encode())
+    if not isinstance(raw_key, RSAPublicKey):
+        raise ValueError("JWT public key must be an RSA key (RS256 requires RSA)")
+    pub_key: RSAPublicKey = raw_key
+    pub_numbers = pub_key.public_numbers()
 
     def _b64url_int(n: int) -> str:
         length = (n.bit_length() + 7) // 8

@@ -3,8 +3,10 @@ import json
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Awaitable, cast
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from redis.asyncio import Redis
 from sqlalchemy import select
 
 from src.auth.jwt import decode_access_token
@@ -39,7 +41,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
         await websocket.close(code=4001)
         return
 
-    redis: Redis = await get_redis_pool()
+    redis: Redis = await get_redis_pool()  # type: ignore[assignment]
 
     # Check token revocation
     jti = payload.get("jti")
@@ -60,7 +62,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
     await hub.register(websocket, device_id, channels)
 
     # 4. Update Redis presence
-    await redis.sadd(f"user:{user_id}:devices", device_id)
+    await cast(Awaitable[int], redis.sadd(f"user:{user_id}:devices", device_id))
     await redis.expire(f"user:{user_id}:devices", _PRESENCE_TTL)
 
     # 5. Notify other devices this device came online
@@ -81,9 +83,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
                     pass  # future: mark delivery confirmed
             except asyncio.TimeoutError:
                 await websocket.send_json({"event": "ping", "payload": {"server_ts": _now_ms()}})
-            except WebSocketDisconnect, RuntimeError:
+            except (WebSocketDisconnect, RuntimeError):
                 break
     finally:
         await hub.unregister(websocket)
-        await redis.srem(f"user:{user_id}:devices", device_id)
+        await cast(Awaitable[int], redis.srem(f"user:{user_id}:devices", device_id))
         await rt.publish(redis, f"user:{user_id}", "device:offline", {"device_id": device_id})
