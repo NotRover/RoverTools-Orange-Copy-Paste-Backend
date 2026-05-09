@@ -254,6 +254,7 @@ CREATE TABLE users (
     kdf_salt         TEXT NOT NULL,          -- base64; Argon2id salt for UMK derivation
     identity_pubkey  TEXT,                   -- base64 X25519 public key (E2E)
     email_verified   BOOLEAN NOT NULL DEFAULT false,
+    suspended_at     BIGINT,                 -- NULL = active; set by admin to suspend account
     blob_bytes_used  BIGINT NOT NULL DEFAULT 0,
     blob_bytes_quota BIGINT NOT NULL DEFAULT 524288000,  -- 500 MB
     created_at       BIGINT NOT NULL,
@@ -398,33 +399,51 @@ CREATE TABLE blobs (
 
 ```
 POST   /api/v1/auth/register
-       Body: { email, password, display_name }
-       Returns: { user_id }
+       Body: { email, password, display_name? }
+       Returns: { user_id, message }
+       Note: queues verification email; account is usable before verification
+
+POST   /api/v1/auth/verify-email
+       Body: { token }
+       Returns: { message }
+       Note: token is a URL-safe random string delivered by email; TTL = 24h (EMAIL_VERIFY_TOKEN_TTL)
+
+POST   /api/v1/auth/resend-verification
+       Body: { email }
+       Returns: 202 { message }   -- always 202 regardless of whether email is registered
+       Rate limit: 3/hour per IP
 
 POST   /api/v1/auth/login
-       Body: { email, password, device_name, platform, app_version, device_pubkey? }
-       Returns: { access_token, refresh_token, device_id, kdf_salt, user: {...} }
+       Body: { email, password, device_name?, platform?, app_version?, device_pubkey? }
+       Returns: { access_token, refresh_token, device_id, kdf_salt, user: { id, email, display_name, email_verified } }
+       Note: 403 if account is suspended; each login creates a new Device row
 
 POST   /api/v1/auth/refresh
        Body: { refresh_token, device_id }
        Returns: { access_token, refresh_token }
+       Note: old refresh token is invalidated on use (rotation); theft detection revokes device
 
 POST   /api/v1/auth/logout
        Body: { device_id }
+       Note: marks device as revoked; access token expires naturally within 15 min
 
 DELETE /api/v1/auth/devices/{device_id}
+       Note: owner can only revoke their own devices
 
 GET    /api/v1/auth/devices
-       Returns: [{ device_id, device_name, platform, last_seen_at, is_current }]
+       Returns: [{ id, device_name, platform, app_version, last_seen_at, is_current }]
 
 POST   /api/v1/auth/password-reset/request
        Body: { email }
+       Returns: 202 { message }   -- always 202 regardless of whether email is registered
+       Rate limit: 5/15min per IP
 
 POST   /api/v1/auth/password-reset/confirm
        Body: { token, new_password }
+       Note: token TTL = 1h (PASSWORD_RESET_TOKEN_TTL)
 
 POST   /api/v1/auth/keys/register
-       Body: { identity_pubkey, device_pubkey }
+       Body: { identity_pubkey, device_pubkey }   -- base64 X25519 public keys
 
 POST   /api/v1/auth/devices/{device_id}/key-wrap
        Body: { wrapped_umk }    -- existing device wraps UMK for new device
@@ -530,7 +549,57 @@ DELETE /api/v1/sharing/sessions/{share_group_id}/leave
        Note: non-owner — removes only the requesting user; group continues for remaining members
 ```
 
-### 5.7 WebSocket Event Protocol
+### 5.7 Admin Routes
+
+All routes except `/internal/healthz` require `X-Admin-Key: <ADMIN_API_KEY>` header.
+
+```
+GET  /internal/healthz
+     Returns: { status: 'ok'|'degraded', db: 'ok'|'error', redis: 'ok'|'error' }
+     Note: public — no auth; suitable for load balancer health checks
+
+GET  /internal/metrics
+     Returns: text/plain Prometheus format
+     Gauges: orange_users_total, orange_users_verified_total, orange_users_suspended_total,
+             orange_devices_total, orange_devices_active_total,
+             orange_sync_entries_total, orange_sync_entries_deleted_total,
+             orange_blobs_total, orange_blobs_confirmed_total,
+             orange_storage_bytes_used, orange_ws_connections_active,
+             orange_redis_memory_bytes
+
+GET  /internal/stats
+     Returns: JSON equivalent of the Prometheus gauges above
+
+GET  /internal/admin/users
+     Query: ?offset=0&limit=50&search=<email|name>
+     Returns: { users: [...], total, offset, limit }
+     Each user: { id, email, display_name, email_verified, suspended_at, blob_bytes_used,
+                  blob_bytes_quota, device_count, entry_count, created_at }
+
+GET  /internal/admin/users/{user_id}
+     Returns: same as above + identity_pubkey, updated_at
+
+PATCH /internal/admin/users/{user_id}/quota
+     Body: { blob_bytes_quota: <bytes> }
+
+POST  /internal/admin/users/{user_id}/suspend
+     Body: { suspend: true | false }
+     Note: sets/clears users.suspended_at; suspended users get 403 on next login
+
+DELETE /internal/admin/users/{user_id}
+     Note: hard delete — cascades to all devices, entries, blobs metadata
+```
+
+### 5.8 Well-Known Routes
+
+```
+GET  /.well-known/jwks.json
+     Returns: JWKS document with the RS256 public key
+     Cache-Control: public, max-age=3600
+     Note: no auth required; intended for third-party JWT verification
+```
+
+### 5.9 WebSocket Event Protocol
 
 **Connection:** `GET /ws?token=<access_token>`
 
@@ -1086,27 +1155,39 @@ Existing entries are not deleted from any member's local store when sharing ends
 
 ## Appendix A — Security Checklist
 
-- [ ] All routes except `/auth/register`, `/auth/login`, `/auth/verify`, `/internal/healthz` require valid JWT
-- [ ] Refresh tokens stored as bcrypt hashes only
-- [ ] Login rate-limited: 5 attempts / 15 min per IP (`slowapi`)
-- [ ] Device private keys never transmitted to or stored by server
-- [ ] Server never stores or logs plaintext content
-- [ ] Pre-signed R2 (S3-compatible) PUT URLs expire in 5 minutes; GET URLs in 1 hour
-- [ ] Group key rotation triggered on member removal
-- [ ] CORS restricted to Tauri origins: `tauri://localhost` (macOS/Linux) and `http://tauri.localhost` (Windows) — Tauri 2 changes the scheme on Windows; both must be in the allowlist
-- [ ] All SQL via SQLAlchemy parameterized queries (no string interpolation)
-- [ ] `Content-Security-Policy` on any browser-facing endpoints
-- [ ] `Secure`, `HttpOnly`, `SameSite=Strict` on any cookies (if used)
+- [x] All routes except `/auth/register`, `/auth/login`, `/auth/verify-email`, `/auth/resend-verification`, `/auth/password-reset/*`, `/.well-known/jwks.json`, `/internal/healthz` require valid JWT
+- [x] Refresh tokens stored as bcrypt hashes only
+- [x] Login rate-limited: 10/min, 30/hr per IP via `slowapi`; password-reset/request: 5/15min; resend-verification: 3/hr
+- [x] Device private keys never transmitted to or stored by server (stored in OS keychain on client)
+- [x] Server stores only ciphertext for `encrypted_content`, `encrypted_metadata`, `encrypted_blob`
+- [x] Pre-signed R2 PUT URLs expire in 5 minutes; GET URLs in 1 hour (boto3 ExpiresIn)
+- [x] Group key rotation endpoint (`POST /groups/{id}/keys`) implemented; rotation is client-triggered on member removal
+- [x] CORS restricted to Tauri origins: `tauri://localhost,http://tauri.localhost` (configurable via `APP_CORS_ORIGINS`)
+- [x] All SQL via SQLAlchemy parameterized queries (ORM + `select()` — no string interpolation)
+- [x] `Content-Security-Policy: default-src 'none'; connect-src 'self'; frame-ancestors 'none'` set by `SecurityHeadersMiddleware`
+- [x] `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`, `Referrer-Policy`, `Permissions-Policy`, conditional HSTS set by `SecurityHeadersMiddleware`
+- [x] Admin endpoints protected by `X-Admin-Key` header; disabled by default if `ADMIN_API_KEY` is unset
+- [ ] `Secure`, `HttpOnly`, `SameSite=Strict` on any cookies — not applicable (JWT in Authorization header, no cookies used)
 
 ## Appendix B — Open Questions / Future Work
 
-1. **Mobile clients** — architecture supports them natively; only the integration layer differs
-2. **End-to-end encrypted search** — not possible server-side; would require client-side index (out of scope)
-3. **Shared clipboard feed UI** — group entries are pullable now; a dedicated UI view is needed in Phase 6
-4. **Webhook delivery** — POST to user-configured URLs on new entry (automation pipelines)
-5. **Subscription / billing** — quota enforcement is modeled; Stripe integration gates quota upgrades
-6. **Push notifications** — Celery `notifications.py` stub ready; FCM/APNs integration is future work
-7. **File size limit UI** — when a file/video entry is skipped due to the 5 MB cap, the Tauri UI should surface a notification; the sync status payload needs a `skipped` counter
-8. **Multi-file entries** — current design stores multi-file clipboard entries as a single blob-list entry; future work could split them into per-file entries for finer-grained sync control
-9. **Sharing session UI** — a dedicated sharing panel in the Tauri app settings is needed (invite, active sessions, scope toggle, end session)
-10. **Unidirectional sharing** — current design is always bidirectional; a future `direction: 'send_only'|'receive_only'|'both'` field on `group_memberships` could enable one-way broadcast
+**Implemented (no longer open):**
+
+- ~~Device presence / offline detection~~ — `detect_offline_devices` Celery beat task (60s) scans Redis presence keys, evicts stale entries, publishes `device:offline`
+- ~~JWKS endpoint~~ — `GET /.well-known/jwks.json` serves RS256 public key with 1h cache
+- ~~Email verification flow~~ — `POST /auth/verify-email` + `POST /auth/resend-verification` (Redis token, 24h TTL)
+- ~~Password reset flow~~ — `POST /auth/password-reset/request` + `/confirm` (Redis token, 1h TTL)
+- ~~Admin endpoints~~ — metrics, stats, user management (see §2.6 and §5.7)
+- ~~Sharing WS events~~ — `sharing:invite`, `sharing:accepted`, `sharing:scope_changed`, `sharing:ended` all published correctly
+
+**Still open:**
+
+1. **Mobile clients** — API supports them; only native client integration differs
+2. **End-to-end encrypted search** — not possible server-side; requires client-side inverted index
+3. **Webhook delivery** — POST to user-configured URLs on new sync entry (automation pipelines)
+4. **Subscription / billing** — `blob_bytes_quota` column is ready; Stripe integration needed to gate quota upgrades
+5. **FCM/APNs push notifications** — `notifications.py` handles presence expiry; device push token storage and FCM/APNs delivery are future work
+6. **File size limit UI** — when a `kind: 'file'` entry is skipped due to the 5 MB gate, the Tauri sync status payload should surface a `skipped` counter
+7. **Multi-file entries** — current design encodes a file list inside `encrypted_content`; splitting into per-file entries gives finer sync control
+8. **Sharing session UI** — dedicated Tauri panel for inviting, viewing active sessions, toggling scope, and ending sessions
+9. **Unidirectional sharing** — a `direction: 'send_only'|'receive_only'|'both'` field on `group_memberships` would enable broadcast-only sessions
