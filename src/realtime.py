@@ -193,6 +193,12 @@ async def publish_settings_updated(redis: Redis, user_id: str, updated_at: int) 
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: str = ""):
+    """Realtime WebSocket: subscribes the device to its user and group channels.
+
+    Authenticates via `?token=` (Supabase JWT) and `?device_id=` query params.
+    Emits `device:online` on connect and `device:offline` on disconnect, and
+    relays fan-out events (sync, group, sharing, settings) to the socket.
+    """
     try:
         payload = decode_supabase_token(token)
     except Exception:

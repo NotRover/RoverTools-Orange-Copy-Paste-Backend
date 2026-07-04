@@ -4,12 +4,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.version import API_VERSION
+
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Adds common defensive HTTP headers to every response."""
+    """Adds common defensive HTTP headers + the API contract version to every response."""
 
     async def dispatch(self, request: Request, call_next) -> Response:
         response: Response = await call_next(request)
+        response.headers["X-API-Version"] = API_VERSION
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"

@@ -341,6 +341,26 @@ CREATE TABLE blobs (
 - Errors: `{"detail": "..."}` + HTTP status.
 - Pagination: cursor-based — `?after_ts=<server_ts>&limit=200`.
 
+### 5.0 Versioning
+
+Source of truth: `src/version.py` (`API_VERSION`, `SERVICE_VERSION`).
+
+- **Product API is versioned** in the path: client-facing under `/api/v1`, admin
+  under `/internal/v1`. `API_VERSION` bumps (`v2`, …) only on a
+  backwards-incompatible contract change; `v1` and `v2` run side by side during a
+  migration window.
+- **Infra probes are intentionally unversioned**: `/internal/healthz` and
+  `/internal/metrics`. Load balancers and Prometheus hardcode these paths and must
+  not track a version on each bump.
+- **`SERVICE_VERSION`** (semver, e.g. `2.0.0`) is the deployable build version and
+  the OpenAPI `version`; it changes freely per release without implying a contract break.
+- Every HTTP response carries an **`X-API-Version`** header (= `API_VERSION`).
+- **Live schema:** Swagger UI at `/api/docs`, ReDoc at `/api/redoc`, raw spec at
+  `/api/openapi.json`. Every route declares a Pydantic `response_model` and a
+  docstring (surfaced as OpenAPI summary/description); tags group the surface
+  (auth, sync, settings, blobs, groups, sharing, ops, admin). The WebSocket `/ws`
+  contract is documented in §5.8 (FastAPI does not emit WebSockets into OpenAPI).
+
 ### 5.1 Auth Routes
 
 ```
@@ -434,17 +454,22 @@ DELETE /api/v1/sharing/sessions/{id}/leave   -- member: leave
 
 Joining a Live Share uses `POST /api/v1/groups/join` with the invite code.
 
-### 5.7 Admin Routes  (require `X-Admin-Key`, except `/healthz`)
+### 5.7 Internal Routes
+
+Split into **unversioned infra probes** and the **versioned admin API** (see §5.0).
 
 ```
-GET  /internal/healthz     Returns: { status, db, redis }   -- public
-GET  /internal/metrics     Prometheus text
-GET  /internal/stats       JSON aggregate
-GET  /internal/admin/users?offset=&limit=&search=<display_name>
-GET  /internal/admin/users/{user_id}      -- enriched with email/verified/banned when Supabase admin is configured
-PATCH /internal/admin/users/{user_id}/quota   Body: { blob_bytes_quota }
-POST  /internal/admin/users/{user_id}/suspend Body: { suspend: bool }   -- delegates to Supabase (ban/unban)
-DELETE /internal/admin/users/{user_id}        -- deletes profile (cascade) + Supabase user
+-- Unversioned probes (paths are stable across API versions)
+GET  /internal/healthz     Returns: { status, db, redis }   -- public, response_model=HealthResponse
+GET  /internal/metrics     Prometheus text (X-Admin-Key)     -- excluded from OpenAPI (text/plain)
+
+-- Versioned admin API (require X-Admin-Key)
+GET  /internal/v1/stats       JSON aggregate
+GET  /internal/v1/admin/users?offset=&limit=&search=<display_name>
+GET  /internal/v1/admin/users/{user_id}      -- enriched with email/verified/banned when Supabase admin is configured
+PATCH /internal/v1/admin/users/{user_id}/quota   Body: { blob_bytes_quota }
+POST  /internal/v1/admin/users/{user_id}/suspend Body: { suspend: bool }   -- delegates to Supabase (ban/unban)
+DELETE /internal/v1/admin/users/{user_id}        -- deletes profile (cascade) + Supabase user
 ```
 
 Metrics: `orange_users_total`, `orange_devices_total`, `orange_devices_active_total`,

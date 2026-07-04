@@ -9,7 +9,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from src import background, realtime
-from src.admin.router import router as admin_router
+from src.admin.router import admin_router, probe_router
 from src.auth.router import router as auth_router
 from src.blobs.router import router as blobs_router
 from src.config import settings
@@ -20,6 +20,27 @@ from src.middleware import SecurityHeadersMiddleware
 from src.redis_client import close_redis_pool, get_redis_pool
 from src.settings.router import router as settings_router
 from src.sync.router import router as sync_router
+from src.version import API_PREFIX, SERVICE_VERSION
+
+
+# ── OpenAPI tag descriptions ────────────────────────────────────────────────────
+OPENAPI_TAGS = [
+    {"name": "auth", "description": "Profile bootstrap, device registration, and E2E public-key storage. "
+     "Identity itself (signup/login/refresh/verify/reset) is handled by Supabase Auth."},
+    {"name": "sync", "description": "Encrypted clipboard/note entry push & pull with last-write-wins and a "
+     "per-device cursor. Deletes are tombstones (push with `deleted_at`)."},
+    {"name": "settings", "description": "Encrypted per-user settings blob with last-write-wins."},
+    {"name": "blobs", "description": "Presigned S3/R2 upload & download URLs for large attachments, with quota."},
+    {"name": "groups", "description": "Pool groups: shared encrypted history across a user's own trust group, "
+     "with invite codes and group-key distribution."},
+    {"name": "sharing", "description": "Live Share: short-lived cross-user sessions scoped to clipboard/notes/both."},
+    {"name": "realtime", "description": "WebSocket `/ws` fan-out of sync/presence/sharing events. Not part of the "
+     "OpenAPI HTTP schema; see the API reference doc for the event contract."},
+    {"name": "ops", "description": "Unversioned infrastructure probes: `/internal/healthz` (public) and "
+     "`/internal/metrics` (Prometheus, admin key)."},
+    {"name": "admin", "description": "Versioned management API under `/internal/v1` (requires `X-Admin-Key`): "
+     "stats and user administration."},
+]
 
 
 @asynccontextmanager
@@ -43,8 +64,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Orange Clipboard API",
-    version="2.0.0",
-    description="Smart Clipboard backend — cloud sync, realtime sharing, E2E encryption (Supabase Auth + Postgres)",
+    version=SERVICE_VERSION,
+    description=(
+        "Smart Clipboard backend — cloud sync, realtime sharing, E2E encryption "
+        "(Supabase Auth + Postgres).\n\n"
+        "**Versioning:** product endpoints live under `/api/v1` (client) and `/internal/v1` "
+        "(admin). Infra probes `/internal/healthz` and `/internal/metrics` are intentionally "
+        "unversioned. Every response carries an `X-API-Version` header."
+    ),
+    openapi_tags=OPENAPI_TAGS,
     lifespan=lifespan,
     docs_url="/api/docs",
     redoc_url="/api/redoc",
@@ -75,16 +103,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── API routes ────────────────────────────────────────────────────────────────
-app.include_router(auth_router, prefix="/api/v1")
-app.include_router(sync_router, prefix="/api/v1")
-app.include_router(settings_router, prefix="/api/v1")
-app.include_router(blobs_router, prefix="/api/v1")
-app.include_router(groups_router, prefix="/api/v1")
-app.include_router(sharing_router, prefix="/api/v1")
+# ── Versioned product API (/api/v1) ─────────────────────────────────────────────
+app.include_router(auth_router, prefix=API_PREFIX)
+app.include_router(sync_router, prefix=API_PREFIX)
+app.include_router(settings_router, prefix=API_PREFIX)
+app.include_router(blobs_router, prefix=API_PREFIX)
+app.include_router(groups_router, prefix=API_PREFIX)
+app.include_router(sharing_router, prefix=API_PREFIX)
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 app.include_router(realtime.router)
 
-# ── Internal / admin ─────────────────────────────────────────────────────────
+# ── Internal: unversioned probes + versioned admin API ──────────────────────────
+app.include_router(probe_router)
 app.include_router(admin_router)
