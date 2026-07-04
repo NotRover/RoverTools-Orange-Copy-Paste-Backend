@@ -6,7 +6,6 @@ class RequestUploadBody(BaseModel):
     mime_type: str
     size_bytes: int
     checksum: str  # SHA-256 hex
-    entry_client_id: str
 
 
 class RequestUploadResponse(BaseModel):

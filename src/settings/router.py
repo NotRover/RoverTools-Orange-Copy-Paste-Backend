@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database import get_db
 from src.dependencies import get_current_user_id, get_redis
-from src.realtime import pubsub as rt
+from src import realtime as rt
 from src.settings import service
 from src.settings.schemas import SettingsOut, SettingsPutRequest, SettingsPutResponse
 

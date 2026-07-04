@@ -8,44 +8,49 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+from src import background, realtime
 from src.admin.router import router as admin_router
 from src.auth.router import router as auth_router
 from src.blobs.router import router as blobs_router
 from src.config import settings
 from src.groups.router import router as groups_router
+from src.groups.sharing import router as sharing_router
 from src.limiter import limiter
 from src.middleware import SecurityHeadersMiddleware
-from src.realtime.pubsub import start_listener
-from src.realtime.router import router as realtime_router
 from src.redis_client import close_redis_pool, get_redis_pool
 from src.settings.router import router as settings_router
-from src.sharing.router import router as sharing_router
 from src.sync.router import router as sync_router
-from src.well_known import router as well_known_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await get_redis_pool()
-    pubsub_task = asyncio.create_task(start_listener(settings.redis_url))
-    yield
-    pubsub_task.cancel()
+    stop = asyncio.Event()
+    pubsub_task = asyncio.create_task(realtime.start_listener(settings.redis_url))
+    maintenance_task = asyncio.create_task(background.run_maintenance(stop))
     try:
-        await pubsub_task
-    except asyncio.CancelledError:
-        pass
-    await close_redis_pool()
+        yield
+    finally:
+        stop.set()
+        for task in (pubsub_task, maintenance_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await close_redis_pool()
 
 
 app = FastAPI(
     title="Orange Clipboard API",
-    version="1.0.0",
-    description="Smart Clipboard backend — cloud sync, realtime sharing, E2E encryption",
+    version="2.0.0",
+    description="Smart Clipboard backend — cloud sync, realtime sharing, E2E encryption (Supabase Auth + Postgres)",
     lifespan=lifespan,
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json",
 )
+
 
 async def _handle_rate_limit(request: Request, exc: Exception) -> Response:
     if isinstance(exc, RateLimitExceeded):
@@ -79,10 +84,7 @@ app.include_router(groups_router, prefix="/api/v1")
 app.include_router(sharing_router, prefix="/api/v1")
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
-app.include_router(realtime_router)
-
-# ── Well-known (JWKS, etc.) ───────────────────────────────────────────────────
-app.include_router(well_known_router)
+app.include_router(realtime.router)
 
 # ── Internal / admin ─────────────────────────────────────────────────────────
 app.include_router(admin_router)

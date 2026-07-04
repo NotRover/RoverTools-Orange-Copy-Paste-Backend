@@ -1,70 +1,55 @@
-from pathlib import Path
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # Database
+    # ── Database ────────────────────────────────────────────────────────────────
+    # Supabase Postgres connection string in prod (Project Settings → Database →
+    # Connection string → URI, with the async driver). Local Postgres for dev.
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/clipboard"
 
-    # Redis
+    # ── Redis ───────────────────────────────────────────────────────────────────
+    # Sole responsibilities: realtime pub/sub fan-out + device presence.
     redis_url: str = "redis://localhost:6379/0"
 
-    # JWT
-    jwt_private_key_path: Path = Path("./private.pem")
-    jwt_public_key_path: Path = Path("./public.pem")
-    jwt_algorithm: str = "RS256"
-    jwt_access_token_expire_minutes: int = 15
-    jwt_refresh_token_expire_days: int = 7
+    # ── Supabase Auth ─────────────────────────────────────────────────────────────
+    # We do NOT sign tokens — Supabase Auth issues them and we only verify.
+    supabase_url: str = ""  # e.g. https://<project-ref>.supabase.co
+    supabase_jwt_secret: str = ""  # Project Settings → API → JWT Secret (HS256)
+    supabase_jwt_algorithm: str = "HS256"
+    supabase_jwt_audience: str = "authenticated"
+    # Server-only key for admin ban/delete via the Supabase Admin API. Never ship to clients.
+    supabase_service_role_key: str = ""
 
-    # S3 / MinIO
+    # ── Blob storage (S3-compatible: Cloudflare R2 in prod, MinIO in dev) ─────────
     s3_endpoint_url: str = "http://localhost:9000"
     s3_bucket: str = "clipboard-blobs"
     aws_access_key_id: str = "minioadmin"
     aws_secret_access_key: str = "minioadmin"
-    aws_region: str = "us-east-1"
+    aws_region: str = "auto"
 
-    # App
+    # ── App ─────────────────────────────────────────────────────────────────────
     app_env: str = "development"
     app_cors_origins: str = "tauri://localhost,http://localhost:1420"
-    default_blob_quota_bytes: int = 524_288_000  # 500 MB
+    # Default per-user blob quota. Configurable globally here and per-user via the admin API.
+    default_blob_quota_bytes: int = 52_428_800  # 50 MB
 
-    # Admin
-    admin_api_key: str = ""  # Required to access /internal/* admin endpoints; leave empty to disable
+    # ── Admin ─────────────────────────────────────────────────────────────────────
+    admin_api_key: str = ""  # Required for /internal/* admin endpoints; empty disables them (503)
 
-    # Email — provider selection
+    # ── Email (sharing invites only; verification/reset are handled by Supabase) ──
     email_provider: str = "brevo"  # "brevo" | "smtp"
-
-    # Brevo (primary)
     brevo_api_key: str = ""
-
-    # SMTP (fallback / self-hosted)
     smtp_host: str = "localhost"
     smtp_port: int = 587
     smtp_user: str = ""
     smtp_password: str = ""
     email_from: str = "Orange Clipboard <noreply@example.com>"
 
-    # App — used to build links inside emails
-    app_base_url: str = "http://localhost:1420"
-
-    # Token TTLs (seconds)
-    email_verify_token_ttl: int = 86_400  # 24 h
-    password_reset_token_ttl: int = 3_600  # 1 h
-
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.app_cors_origins.split(",") if o.strip()]
-
-    @property
-    def jwt_private_key(self) -> str:
-        return self.jwt_private_key_path.read_text()
-
-    @property
-    def jwt_public_key(self) -> str:
-        return self.jwt_public_key_path.read_text()
 
 
 settings = Settings()

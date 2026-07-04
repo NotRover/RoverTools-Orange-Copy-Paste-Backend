@@ -1,3 +1,8 @@
+# Local development stack.
+#
+# In production the API talks to Supabase (Postgres + Auth) and a managed Redis
+# (e.g. Upstash) — only the `api` service is deployed, scaled horizontally behind
+# a load balancer. The `db` and `redis` services below exist purely for local dev.
 services:
   api:
     build: .
@@ -17,22 +22,7 @@ services:
       - .:/app
     working_dir: /app
 
-  worker:
-    build: .
-    command: celery -A src.worker.app worker -c 4 -l info
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/clipboard
-      REDIS_URL: redis://redis:6379/0
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    volumes:
-      - .:/app
-    working_dir: /app
-
+  # Local Postgres — stand-in for Supabase Postgres during development.
   db:
     image: postgres:16-alpine
     environment:
@@ -49,6 +39,7 @@ services:
       timeout: 5s
       retries: 5
 
+  # Redis — pub/sub fan-out + device presence.
   redis:
     image: redis:7-alpine
     ports:

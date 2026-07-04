@@ -5,10 +5,7 @@ from pydantic import BaseModel, Field
 
 class UserAdminSummary(BaseModel):
     id: uuid.UUID
-    email: str
     display_name: str
-    email_verified: bool
-    suspended_at: int | None
     blob_bytes_used: int
     blob_bytes_quota: int
     device_count: int
@@ -21,6 +18,10 @@ class UserAdminSummary(BaseModel):
 class UserAdminDetail(UserAdminSummary):
     identity_pubkey: str | None
     updated_at: int
+    # Account state fetched from Supabase Auth (None when Supabase admin is unconfigured).
+    email: str | None = None
+    email_verified: bool | None = None
+    banned: bool | None = None
 
 
 class UserListResponse(BaseModel):
@@ -40,14 +41,12 @@ class SuspendRequest(BaseModel):
 
 class StatsResponse(BaseModel):
     users_total: int
-    users_verified: int
-    users_suspended: int
     devices_total: int
     devices_active: int
+    devices_online: int
     entries_total: int
     entries_deleted: int
     blobs_total: int
     blobs_confirmed: int
     storage_bytes_used: int
-    ws_connections_active: int
     redis_memory_bytes: int | None
