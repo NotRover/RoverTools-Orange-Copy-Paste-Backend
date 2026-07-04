@@ -30,7 +30,7 @@ class GroupOut(BaseModel):
     group_type: str
     invite_code: str | None
     invite_expires_at: int | None
-    max_members: int
+    max_members: int | None
     created_at: int
     members: list[MemberOut] = Field(default_factory=list)
 
@@ -38,10 +38,6 @@ class GroupOut(BaseModel):
 
 
 # ── Invite / Join ─────────────────────────────────────────────────────────────
-
-
-class InviteRequest(BaseModel):
-    email: str | None = None
 
 
 class InviteResponse(BaseModel):

@@ -1,29 +1,26 @@
-"""
-Test fixtures.
+"""Test fixtures.
 
 Requires a running PostgreSQL reachable via TEST_DATABASE_URL
 (default: postgresql+asyncpg://postgres:postgres@localhost:5432/clipboard_test).
 
-Redis is replaced by fakeredis — no real Redis needed.
-Celery task dispatch (.delay) is monkeypatched to a MagicMock in all tests.
+Auth is Supabase-issued in production; here we mint HS256 tokens with the same
+secret the app verifies against. Redis is replaced by fakeredis.
 """
 
 import asyncio
 import os
+import time
 import uuid
 from collections.abc import AsyncGenerator
-from pathlib import Path
-from tempfile import TemporaryDirectory
-from unittest.mock import MagicMock
 
+import jwt
 import pytest
 import pytest_asyncio
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from fakeredis.aioredis import FakeRedis
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from src.config import settings
 from src.database import Base, get_db
 from src.dependencies import get_redis
 from src.main import app
@@ -33,9 +30,9 @@ TEST_DB_URL = os.getenv(
     "TEST_DATABASE_URL",
     "postgresql+asyncpg://postgres:postgres@localhost:5432/clipboard_test",
 )
+_TEST_JWT_SECRET = "test-supabase-jwt-secret"
 
 
-# ── Session-level event loop ───────────────────────────────────────────────────
 @pytest.fixture(scope="session")
 def event_loop():
     loop = asyncio.new_event_loop()
@@ -43,46 +40,23 @@ def event_loop():
     loop.close()
 
 
-# ── RSA keypair (generated once per session) ───────────────────────────────────
-@pytest.fixture(scope="session")
-def _rsa_pem() -> tuple[str, str]:
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    priv = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.TraditionalOpenSSL,
-        serialization.NoEncryption(),
-    ).decode()
-    pub = (
-        key.public_key()
-        .public_bytes(
-            serialization.Encoding.PEM,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        .decode()
-    )
-    return priv, pub
-
-
 @pytest.fixture(scope="session", autouse=True)
-def patch_settings(_rsa_pem: tuple[str, str]):
-    """Write ephemeral RSA keys to temp files and point settings at them."""
-    from src.auth.jwt import get_jwks
-    from src.config import settings
-
-    priv_pem, pub_pem = _rsa_pem
-    _tmpdir = TemporaryDirectory()
-    tmp = Path(_tmpdir.name)
-    (tmp / "private.pem").write_text(priv_pem)
-    (tmp / "public.pem").write_text(pub_pem)
-    settings.jwt_private_key_path = tmp / "private.pem"
-    settings.jwt_public_key_path = tmp / "public.pem"
-    # Invalidate any cached JWKS from a previous settings state
-    get_jwks.cache_clear()
+def _configure_settings():
+    settings.supabase_jwt_secret = _TEST_JWT_SECRET
+    settings.supabase_jwt_algorithm = "HS256"
+    settings.supabase_jwt_audience = "authenticated"
     yield
-    _tmpdir.cleanup()
 
 
-# ── Test database engine (session-scoped: create tables once, drop on teardown) ─
+def make_token(user_id: str) -> str:
+    now = int(time.time())
+    return jwt.encode(
+        {"sub": user_id, "aud": "authenticated", "iat": now, "exp": now + 3600},
+        _TEST_JWT_SECRET,
+        algorithm="HS256",
+    )
+
+
 @pytest_asyncio.fixture(scope="session")
 async def test_engine():
     engine = create_async_engine(TEST_DB_URL, echo=False)
@@ -97,9 +71,6 @@ async def test_engine():
 
 @pytest_asyncio.fixture
 async def db(test_engine) -> AsyncGenerator[AsyncSession, None]:
-    """Per-test DB session.  Uses join_transaction_mode='create_savepoint' so that
-    service-level session.commit() calls operate on savepoints, not real commits.
-    The outer connection is rolled back at the end of each test."""
     async with test_engine.connect() as conn:
         await conn.begin()
         session = AsyncSession(
@@ -115,7 +86,6 @@ async def db(test_engine) -> AsyncGenerator[AsyncSession, None]:
             await conn.rollback()
 
 
-# ── Fake Redis (per-test, decode_responses matches production behaviour) ─────
 @pytest_asyncio.fixture
 async def fake_redis() -> AsyncGenerator[FakeRedis, None]:
     r = FakeRedis(decode_responses=True)
@@ -123,7 +93,6 @@ async def fake_redis() -> AsyncGenerator[FakeRedis, None]:
     await r.aclose()
 
 
-# ── FastAPI test client with dependency overrides ─────────────────────────────
 @pytest_asyncio.fixture
 async def client(db: AsyncSession, fake_redis: FakeRedis) -> AsyncGenerator[AsyncClient, None]:
     async def _get_db():
@@ -139,55 +108,27 @@ async def client(db: AsyncSession, fake_redis: FakeRedis) -> AsyncGenerator[Asyn
     app.dependency_overrides.clear()
 
 
-# ── Suppress Celery task dispatch in every test ───────────────────────────────
-@pytest.fixture(autouse=True)
-def _no_celery(monkeypatch):
-    for attr in [
-        ("src.worker.tasks.email", "send_verification_email"),
-        ("src.worker.tasks.email", "send_password_reset_email"),
-        ("src.worker.tasks.email", "send_sharing_invite_email"),
-    ]:
-        import importlib
-
-        mod = importlib.import_module(attr[0])
-        task = getattr(mod, attr[1])
-        monkeypatch.setattr(task, "delay", MagicMock())
-
-
-# ── Convenience: register + verify + login, return auth headers ───────────────
 @pytest_asyncio.fixture
-async def auth_headers(client: AsyncClient, fake_redis: FakeRedis) -> dict:
-    email = f"test-{uuid.uuid4().hex[:8]}@example.com"
-    password = "TestPass123!secure"
+async def auth_headers(client: AsyncClient) -> dict:
+    """Simulate a signed-in Supabase user: bootstrap a profile + register a device."""
+    user_id = str(uuid.uuid4())
+    token = make_token(user_id)
+    base = {"Authorization": f"Bearer {token}"}
 
-    # Register
-    reg = await client.post(
-        "/api/v1/auth/register",
-        json={"email": email, "password": password, "display_name": "Test User"},
+    boot = await client.post("/api/v1/auth/bootstrap", json={"display_name": "Test User"}, headers=base)
+    assert boot.status_code == 200, boot.text
+
+    dev = await client.post(
+        "/api/v1/auth/devices",
+        json={"device_name": "Test", "platform": "windows"},
+        headers=base,
     )
-    assert reg.status_code == 201, reg.text
-    user_id = reg.json()["user_id"]
-
-    # Grab the verify token from fake Redis and confirm it
-    async for raw_key in fake_redis.scan_iter("email_verify:*"):
-        stored = await fake_redis.get(raw_key)
-        if stored == user_id:
-            token = raw_key.split("email_verify:")[1]
-            resp = await client.post("/api/v1/auth/verify-email", json={"token": token})
-            assert resp.status_code == 200, resp.text
-            break
-
-    # Login
-    login = await client.post(
-        "/api/v1/auth/login",
-        json={"email": email, "password": password, "platform": "windows"},
-    )
-    assert login.status_code == 200, login.text
+    assert dev.status_code == 201, dev.text
+    device_id = dev.json()["device_id"]
 
     return {
-        "Authorization": f"Bearer {login.json()['access_token']}",
-        "_refresh_token": login.json()["refresh_token"],
-        "_device_id": login.json()["device_id"],
-        "_email": email,
-        "_password": password,
+        "Authorization": f"Bearer {token}",
+        "X-Device-Id": device_id,
+        "_user_id": user_id,
+        "_kdf_salt": boot.json()["kdf_salt"],
     }
