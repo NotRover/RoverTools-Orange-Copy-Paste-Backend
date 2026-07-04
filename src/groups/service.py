@@ -40,7 +40,7 @@ async def create_group(db: AsyncSession, user_id: str, req: CreateGroupRequest) 
         group_type=req.group_type,
         invite_code=invite_code,
         invite_expires_at=expires_at,
-        max_members=0,
+        max_members=None,  # pools are unlimited
         created_at=_now_ms(),
     )
     db.add(group)
@@ -128,8 +128,8 @@ async def join_group(db: AsyncSession, user_id: str, req: JoinRequest) -> tuple[
     if g.invite_expires_at and g.invite_expires_at < now:
         raise HTTPException(status_code=status.HTTP_410_GONE, detail="Invite code expired")
 
-    # Check membership cap
-    if g.max_members > 0:
+    # Check membership cap (NULL = unlimited)
+    if g.max_members:
         count_result = await db.scalars(select(GroupMembership).where(GroupMembership.group_id == g.id))
         count = len(list(count_result.all()))
         if count >= g.max_members:

@@ -5,7 +5,7 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.models import User
+from src.auth.models import Profile
 from src.database import get_db
 from src.dependencies import get_current_user_id, get_redis
 from src.groups import service
@@ -14,12 +14,11 @@ from src.groups.schemas import (
     CreateGroupResponse,
     DistributeKeysRequest,
     GroupOut,
-    InviteRequest,
     InviteResponse,
     JoinRequest,
     JoinResponse,
 )
-from src.realtime import pubsub as rt
+from src import realtime as rt
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -57,7 +56,6 @@ async def get_group(
 @router.post("/{group_id}/invite", response_model=InviteResponse)
 async def refresh_invite(
     group_id: uuid.UUID,
-    body: InviteRequest,
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
@@ -77,7 +75,7 @@ async def join_group(
 
     if group.group_type == "live_share":
         # Fetch joining user's display_name for the sharing:accepted payload
-        joining_user = await db.scalar(select(User).where(User.id == uuid.UUID(user_id)))
+        joining_user = await db.scalar(select(Profile).where(Profile.id == uuid.UUID(user_id)))
         display_name = joining_user.display_name if joining_user else ""
 
         await rt.publish_sharing_accepted(
