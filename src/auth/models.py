@@ -20,8 +20,12 @@ class Profile(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
-    kdf_salt: Mapped[str] = mapped_column(String(64), nullable=False)  # base64 Argon2id salt (UMK derivation)
+    kdf_salt: Mapped[str] = mapped_column(String(64), nullable=False)  # base64 Argon2id salt (wrapping-key derivation)
     identity_pubkey: Mapped[str | None] = mapped_column(Text, nullable=True)  # base64 X25519
+    # Random UMK wrapped under the password-derived KEK (AES-GCM envelope, base64).
+    # None until first setup; the client unwraps it on login. Decouples the key from
+    # the password so a password change only re-wraps this blob.
+    pw_wrapped_umk: Mapped[str | None] = mapped_column(Text, nullable=True)
     blob_bytes_quota: Mapped[int] = mapped_column(BigInteger, nullable=False, default=52_428_800)  # 50 MB
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

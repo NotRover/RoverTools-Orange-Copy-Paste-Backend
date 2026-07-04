@@ -27,14 +27,32 @@ async def bootstrap(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_only),
 ):
-    """Idempotently ensure a profile exists and return the KDF salt the client
-    needs to derive its UMK. Called right after Supabase login."""
+    """Idempotently ensure a profile exists and return the KDF salt plus the
+    wrapped-UMK envelope (if set) the client needs to unlock its data. Called
+    right after Supabase login."""
     profile = await service.ensure_profile(db, user_id, body.display_name)
     return schemas.BootstrapResponse(
         user_id=profile.id,
         kdf_salt=profile.kdf_salt,
         display_name=profile.display_name,
+        wrapped_umk=profile.pw_wrapped_umk,
     )
+
+
+@router.put("/umk", status_code=204)
+async def set_wrapped_umk(
+    body: schemas.SetWrappedUmkRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_only),
+):
+    """Store the password-wrapped UMK envelope for the current account.
+
+    Set once on first setup; replaced when the account password changes. The
+    server only ever holds the wrapped blob — never the key.
+
+    Requires: Bearer token (Supabase JWT).
+    """
+    await service.set_wrapped_umk(db, user_id, body.wrapped_umk)
 
 
 # ── Device management ─────────────────────────────────────────────────────────

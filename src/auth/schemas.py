@@ -15,6 +15,16 @@ class BootstrapResponse(BaseModel):
     user_id: uuid.UUID
     kdf_salt: str
     display_name: str
+    # Random UMK wrapped under the password-derived key (base64 AES-GCM envelope).
+    # None on a brand-new account: the client then generates a UMK, wraps it, and
+    # stores it via PUT /auth/umk. On return, the client unwraps this to recover
+    # the key; a GCM auth failure means the wrong password was entered.
+    wrapped_umk: str | None = None
+
+
+class SetWrappedUmkRequest(BaseModel):
+    # base64 AES-GCM envelope: the random UMK wrapped under the password-derived key.
+    wrapped_umk: str = Field(max_length=512)
 
 
 # ── Device registration ─────────────────────────────────────────────────────────
