@@ -16,6 +16,10 @@ async def get_settings(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Return the current user's encrypted settings blob.
+
+    Requires: Bearer token + X-Device-Id header. Returns 404 if none stored yet.
+    """
     user_id, _ = current
     row = await service.get_settings(db, user_id)
     if not row:
@@ -30,6 +34,11 @@ async def put_settings(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Store the encrypted settings blob, resolving concurrent writes by last-write-wins.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `settings:updated` to the user channel when the client write wins.
+    """
     user_id, device_id = current
     result = await service.put_settings(db, user_id, body)
 

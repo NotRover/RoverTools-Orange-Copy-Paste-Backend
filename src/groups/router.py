@@ -29,6 +29,10 @@ async def create_group(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Create a new group owned by the current user and return its invite code.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     group, invite_code = await service.create_group(db, user_id, body)
     return CreateGroupResponse(group_id=group.id, invite_code=invite_code)
@@ -39,6 +43,10 @@ async def list_groups(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """List all groups the current user is a member of.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     return await service.list_groups(db, user_id)
 
@@ -49,6 +57,10 @@ async def get_group(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Return details for a single group the current user belongs to.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     return await service.get_group(db, group_id, user_id)
 
@@ -59,6 +71,10 @@ async def refresh_invite(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Rotate a group's invite code and return the new one.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     return await service.refresh_invite(db, group_id, user_id)
 
@@ -70,6 +86,12 @@ async def join_group(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Join a group using an invite code.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `sharing:accepted` to the owner for live_share groups, otherwise
+    `group:membership_changed` to the group channel.
+    """
     user_id, _ = current
     result, group = await service.join_group(db, user_id, body)
 
@@ -99,6 +121,11 @@ async def remove_member(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Remove a member from a group (owner action).
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `group:membership_changed` to the group channel.
+    """
     user_id, _ = current
     await service.remove_member(db, group_id, member_user_id, user_id)
     await rt.publish_group_membership_changed(redis, str(group_id), "left", str(member_user_id))
@@ -110,6 +137,10 @@ async def delete_group(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Delete a group the current user owns.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     await service.delete_group(db, group_id, user_id)
 
@@ -122,6 +153,11 @@ async def distribute_keys(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Distribute per-member wrapped group keys after a membership or rekey event.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `group:rekey` to each target member's user channel.
+    """
     user_id, _ = current
     await service.distribute_keys(db, group_id, user_id, body)
     for entry in body.wrapped_keys:
