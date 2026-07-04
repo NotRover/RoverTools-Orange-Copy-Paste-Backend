@@ -21,6 +21,10 @@ async def request_upload(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Request a presigned upload URL for a new blob, subject to quota.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     return await service.request_upload(db, user_id, body)
 
@@ -31,6 +35,10 @@ async def confirm_upload(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Confirm a completed blob upload and record it against the user's quota.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     await service.confirm_upload(db, user_id, body)
 
@@ -41,6 +49,10 @@ async def download_url(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Return a presigned download URL for a blob the user may access.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     return await service.get_download_url(db, user_id, blob_key)
 
@@ -50,5 +62,9 @@ async def quota(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Return the current user's blob storage quota and usage.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     return await service.get_quota(db, user_id)

@@ -1,13 +1,24 @@
-"""
-Internal/admin endpoints.
+"""Internal endpoints — infrastructure probes and admin management.
 
-/internal/healthz  — public, used by load balancers
-/internal/metrics  — Prometheus text, requires X-Admin-Key
-/internal/stats    — JSON aggregate, requires X-Admin-Key
-/internal/admin/*  — user management, requires X-Admin-Key
+Two routers with deliberately different versioning (see ``src/version.py``):
 
-Set ADMIN_API_KEY in .env to enable admin endpoints.
-If ADMIN_API_KEY is empty, all admin/metrics/stats endpoints return 503.
+* ``probe_router`` — **unversioned** infra endpoints under ``/internal``:
+    - ``GET /internal/healthz``  liveness/readiness (public, no auth)
+    - ``GET /internal/metrics``  Prometheus text (requires ``X-Admin-Key``)
+  These paths are hardcoded by load balancers and metric scrapers, so they stay
+  stable across API version bumps.
+
+* ``admin_router`` — **versioned** management API under ``/internal/v1``:
+    - ``GET  /internal/v1/stats``            JSON aggregate
+    - ``GET  /internal/v1/admin/users``      list users
+    - ``GET  /internal/v1/admin/users/{id}`` user detail
+    - ``PATCH /internal/v1/admin/users/{id}/quota``
+    - ``POST  /internal/v1/admin/users/{id}/suspend``
+    - ``DELETE /internal/v1/admin/users/{id}``
+  All require the ``X-Admin-Key`` header.
+
+Set ``ADMIN_API_KEY`` in the environment to enable the admin/metrics/stats
+endpoints; when it is unset they all return ``503 Service Unavailable``.
 """
 
 import uuid
@@ -21,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin import service
 from src.admin.schemas import (
+    HealthResponse,
     QuotaUpdateRequest,
     StatsResponse,
     SuspendRequest,
@@ -30,8 +42,12 @@ from src.admin.schemas import (
 from src.config import settings
 from src.database import get_db
 from src.dependencies import get_redis
+from src.version import INTERNAL_VERSIONED_PREFIX
 
-router = APIRouter(prefix="/internal", tags=["admin"])
+# Unversioned infrastructure probes.
+probe_router = APIRouter(prefix="/internal", tags=["ops"])
+# Versioned admin/management surface.
+admin_router = APIRouter(prefix=INTERNAL_VERSIONED_PREFIX, tags=["admin"])
 
 
 # ── Admin key dependency ───────────────────────────────────────────────────────
@@ -50,8 +66,14 @@ def require_admin_key(x_admin_key: Annotated[str | None, Header(alias="X-Admin-K
 # ── Health (public — no admin key required) ────────────────────────────────────
 
 
-@router.get("/healthz")
-async def healthz(db: AsyncSession = Depends(get_db), redis: Redis = Depends(get_redis)):
+@probe_router.get("/healthz", response_model=HealthResponse)
+async def healthz(db: AsyncSession = Depends(get_db), redis: Redis = Depends(get_redis)) -> HealthResponse:
+    """Liveness/readiness probe.
+
+    Public (no auth). Reports ``ok`` when both Postgres and Redis are reachable,
+    otherwise ``degraded`` with per-dependency status. Intended for load-balancer
+    health checks and orchestrator readiness gates.
+    """
     db_ok = False
     redis_ok = False
     try:
@@ -65,23 +87,28 @@ async def healthz(db: AsyncSession = Depends(get_db), redis: Redis = Depends(get
     except Exception:
         pass
     healthy = db_ok and redis_ok
-    return {
-        "status": "ok" if healthy else "degraded",
-        "db": "ok" if db_ok else "error",
-        "redis": "ok" if redis_ok else "error",
-    }
+    return HealthResponse(
+        status="ok" if healthy else "degraded",
+        db="ok" if db_ok else "error",
+        redis="ok" if redis_ok else "error",
+    )
 
 
 # ── Prometheus metrics ─────────────────────────────────────────────────────────
 
 
-@router.get(
+@probe_router.get(
     "/metrics",
     response_class=PlainTextResponse,
     dependencies=[Depends(require_admin_key)],
     include_in_schema=False,
 )
 async def metrics(db: AsyncSession = Depends(get_db), redis: Redis = Depends(get_redis)) -> str:
+    """Prometheus exposition-format metrics (text/plain).
+
+    Requires: ``X-Admin-Key``. Excluded from the OpenAPI schema because the body
+    is Prometheus text, not JSON. Scrape at ``/internal/metrics``.
+    """
     stats = await service.get_stats(db, redis)
     lines: list[str] = []
 
@@ -108,39 +135,66 @@ async def metrics(db: AsyncSession = Depends(get_db), redis: Redis = Depends(get
 # ── JSON stats ─────────────────────────────────────────────────────────────────
 
 
-@router.get("/stats", response_model=StatsResponse, dependencies=[Depends(require_admin_key)])
+@admin_router.get("/stats", response_model=StatsResponse, dependencies=[Depends(require_admin_key)])
 async def stats(db: AsyncSession = Depends(get_db), redis: Redis = Depends(get_redis)) -> StatsResponse:
+    """Aggregate service statistics as JSON.
+
+    Requires: ``X-Admin-Key``. Same underlying data as ``/internal/metrics`` but
+    structured for dashboards and ad-hoc inspection.
+    """
     return await service.get_stats(db, redis)
 
 
 # ── User management ────────────────────────────────────────────────────────────
 
 
-@router.get("/admin/users", response_model=UserListResponse, dependencies=[Depends(require_admin_key)])
+@admin_router.get("/admin/users", response_model=UserListResponse, dependencies=[Depends(require_admin_key)])
 async def list_users(
     db: AsyncSession = Depends(get_db),
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     search: Annotated[str | None, Query(max_length=200)] = None,
 ) -> UserListResponse:
+    """List user profiles with pagination and optional display-name search.
+
+    Requires: ``X-Admin-Key``.
+    """
     return await service.list_users(db, offset=offset, limit=limit, search=search)
 
 
-@router.get("/admin/users/{user_id}", response_model=UserAdminDetail, dependencies=[Depends(require_admin_key)])
+@admin_router.get("/admin/users/{user_id}", response_model=UserAdminDetail, dependencies=[Depends(require_admin_key)])
 async def get_user(user_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> UserAdminDetail:
+    """Fetch one user's profile, usage counts, and (if Supabase admin is
+    configured) account state (email, verification, ban status).
+
+    Requires: ``X-Admin-Key``.
+    """
     return await service.get_user(db, user_id)
 
 
-@router.patch("/admin/users/{user_id}/quota", status_code=204, dependencies=[Depends(require_admin_key)])
+@admin_router.patch("/admin/users/{user_id}/quota", status_code=204, dependencies=[Depends(require_admin_key)])
 async def update_quota(user_id: uuid.UUID, body: QuotaUpdateRequest, db: AsyncSession = Depends(get_db)) -> None:
+    """Override a user's blob storage quota (bytes).
+
+    Requires: ``X-Admin-Key``.
+    """
     await service.update_quota(db, user_id, body.blob_bytes_quota)
 
 
-@router.post("/admin/users/{user_id}/suspend", status_code=204, dependencies=[Depends(require_admin_key)])
+@admin_router.post("/admin/users/{user_id}/suspend", status_code=204, dependencies=[Depends(require_admin_key)])
 async def suspend_user(user_id: uuid.UUID, body: SuspendRequest) -> None:
+    """Suspend or un-suspend an account (delegates to the Supabase Admin API).
+
+    Requires: ``X-Admin-Key``.
+    """
     await service.set_suspended(user_id, body.suspend)
 
 
-@router.delete("/admin/users/{user_id}", status_code=204, dependencies=[Depends(require_admin_key)])
+@admin_router.delete("/admin/users/{user_id}", status_code=204, dependencies=[Depends(require_admin_key)])
 async def delete_user(user_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> None:
+    """Delete a user's app-side data (profile → cascades to devices/entries) and
+    the Supabase account.
+
+    Requires: ``X-Admin-Key``.
+    """
     await service.delete_user(db, user_id)

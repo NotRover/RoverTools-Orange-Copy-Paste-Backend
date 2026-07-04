@@ -1,6 +1,15 @@
 import uuid
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+
+class HealthResponse(BaseModel):
+    """Liveness/readiness probe result for load balancers and orchestrators."""
+
+    status: Literal["ok", "degraded"]
+    db: Literal["ok", "error"]
+    redis: Literal["ok", "error"]
 
 
 class UserAdminSummary(BaseModel):

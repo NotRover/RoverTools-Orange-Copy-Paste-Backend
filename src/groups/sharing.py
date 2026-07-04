@@ -176,6 +176,11 @@ async def send_invite(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Create a Live Share session and email an invite to the given address.
+
+    Requires: Bearer token + X-Device-Id header. The invite email is sent
+    best-effort as a background task; the invitee joins with the returned code.
+    """
     user_id, _ = current
     result = await create_invite(db, user_id, body.share_scope)
 
@@ -194,6 +199,10 @@ async def get_sessions(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """List the current user's active Live Share sessions and their members.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     return await list_sessions(db, user_id)
 
@@ -206,6 +215,11 @@ async def patch_scope(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Change the current user's share scope within a Live Share session.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `sharing:scope_changed` to the session's group channel.
+    """
     user_id, _ = current
     await update_scope(db, share_group_id, user_id, body.share_scope)
     await rt.publish_sharing_scope_changed(redis, str(share_group_id), user_id, body.share_scope)
@@ -218,6 +232,11 @@ async def dissolve_session(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Dissolve a Live Share session (owner only), disconnecting all members.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `sharing:ended` to the session's group channel before deletion.
+    """
     user_id, _ = current
     # Publish before delete so the group channel still has subscribers.
     await rt.publish_sharing_ended(redis, str(share_group_id), user_id)
@@ -231,6 +250,11 @@ async def leave(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Leave a Live Share session (non-owner members only).
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `sharing:scope_changed` to the session's group channel.
+    """
     user_id, _ = current
     leaving_scope = await leave_session(db, share_group_id, user_id)
     await rt.publish_sharing_scope_changed(redis, str(share_group_id), user_id, leaving_scope)

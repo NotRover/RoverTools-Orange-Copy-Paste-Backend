@@ -30,6 +30,11 @@ async def push(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Push local sync entries; returns accepted entries and any conflicts.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `sync:entry` to the user channel and each entry's group channels.
+    """
     user_id, device_id = current
     accepted, conflicts = await service.push_entries(db, user_id, device_id, body.entries)
 
@@ -52,6 +57,10 @@ async def pull(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Pull sync entries changed after a timestamp, with pagination cursor.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, _ = current
     rows, next_cursor = await service.pull_entries(db, user_id, after_ts, limit, entry_type)
     entries = [SyncEntryOut.model_validate(r) for r in rows]
@@ -64,6 +73,10 @@ async def update_cursor(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Advance the calling device's sync cursor to the given server timestamp.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, device_id = current
     await service.update_cursor(db, device_id, user_id, body.last_server_ts)
 
@@ -73,6 +86,10 @@ async def sync_status(
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
+    """Return the calling device's current sync cursor position.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
     user_id, device_id = current
     last_ts = await service.get_cursor(db, device_id)
     return SyncStatusResponse(device_id=uuid.UUID(device_id), last_server_ts=last_ts)
