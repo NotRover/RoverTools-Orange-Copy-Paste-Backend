@@ -51,6 +51,17 @@ async def ensure_profile(db: AsyncSession, user_id: str, display_name: str | Non
     return profile
 
 
+async def set_wrapped_umk(db: AsyncSession, user_id: str, wrapped_umk: str) -> None:
+    """Store (or replace) the password-wrapped UMK envelope for the account.
+    Set once on first setup; replaced when the account password changes."""
+    profile = await db.scalar(select(Profile).where(Profile.id == uuid.UUID(user_id)))
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    profile.pw_wrapped_umk = wrapped_umk
+    profile.updated_at = _now_ms()
+    await db.commit()
+
+
 # ── Device management ─────────────────────────────────────────────────────────
 
 
