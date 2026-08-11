@@ -17,7 +17,9 @@ dependencies = [
     "alembic>=1.13",
     "redis[hiredis]>=5.0",
     "boto3>=1.34",
-    "pyjwt>=2.9",
+    # [crypto] pulls in `cryptography`, required to verify Supabase's asymmetric
+    # (ES256/RS256) access tokens.
+    "pyjwt[crypto]>=2.9",
     "python-multipart>=0.0.9",
     "httpx>=0.27",
     "slowapi>=0.1.9",
