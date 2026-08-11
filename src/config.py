@@ -15,11 +15,17 @@ class Settings(BaseSettings):
 
     # ── Supabase Auth ─────────────────────────────────────────────────────────────
     # We do NOT sign tokens — Supabase Auth issues them and we only verify.
+    # Required: asymmetric (ES256/RS256) tokens are verified against this project's
+    # JWKS endpoint, which is derived from this URL.
     supabase_url: str = ""  # e.g. https://<project-ref>.supabase.co
-    supabase_jwt_secret: str = ""  # Project Settings → API → JWT Secret (HS256)
-    supabase_jwt_algorithm: str = "HS256"
+    # Legacy symmetric secret (Settings → JWT Keys). Only needed for projects
+    # created before 2025-10-01, which still sign with HS256; newer projects are
+    # asymmetric by default and leave this blank.
+    supabase_jwt_secret: str = ""
     supabase_jwt_audience: str = "authenticated"
-    # Server-only key for admin ban/delete via the Supabase Admin API. Never ship to clients.
+    # Server-only key for admin ban/delete via the Supabase Admin API (Settings →
+    # API Keys): a secret key (`sb_secret_…`) or the legacy `service_role` key,
+    # which Supabase deprecates at the end of 2026. Never ship to clients.
     supabase_service_role_key: str = ""
 
     # ── Blob storage (S3-compatible: Cloudflare R2 in prod, MinIO in dev) ─────────
