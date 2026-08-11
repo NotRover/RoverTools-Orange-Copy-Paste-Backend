@@ -1,0 +1,102 @@
+# Render Blueprint — Smart Clipboard sync backend.
+#
+# Provisions the FastAPI service plus a Render Key Value (Valkey) instance for
+# realtime pub/sub + device presence. Postgres and Auth come from Supabase, and
+# blob storage from Cloudflare R2, so neither is declared here.
+#
+# Apply: Render Dashboard → New → Blueprint, pointed at this repository.
+# Variables marked `sync: false` are prompted on first apply and never committed.
+# See docs/DEPLOY.md for the full procedure, including migrations.
+
+services:
+  - name: rovertools-clipboard-api
+    type: web
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # Realtime sync rides on WebSockets, which an idled instance cannot serve.
+    # `free` is fine for a smoke test but spins down after inactivity; `starter`
+    # stays always-on.
+    plan: starter
+    # Keep this close to your Supabase region — every request makes a DB round trip.
+    region: oregon
+    # Public, unauthenticated, and checks both Postgres and Redis, so a failing
+    # dependency correctly fails the deploy.
+    healthCheckPath: /internal/healthz
+    autoDeployTrigger: commit
+    envVars:
+      # Wired to the Key Value instance below over Render's private network —
+      # no credentials to copy by hand.
+      - key: REDIS_URL
+        fromService:
+          name: rovertools-clipboard-keyvalue
+          type: keyvalue
+          property: connectionString
+
+      - key: APP_ENV
+        value: production
+      # Origin of the Tauri desktop app. Comma-separate to add more.
+      - key: APP_CORS_ORIGINS
+        value: tauri://localhost
+      - key: DEFAULT_BLOB_QUOTA_BYTES
+        value: "52428800" # 50 MB per user
+
+      # ── Supabase: Postgres + Auth ──────────────────────────────────────────
+      # Settings → Database → Connection string (URI), driver rewritten to
+      # `postgresql+asyncpg://…`.
+      - key: DATABASE_URL
+        sync: false
+      # e.g. https://<project-ref>.supabase.co — also derives the JWKS endpoint
+      # used to verify access tokens.
+      - key: SUPABASE_URL
+        sync: false
+      # Server-only. Settings → API Keys → a secret key (`sb_secret_…`), or the
+      # legacy `service_role` key (Supabase deprecates it end of 2026).
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # LEAVE BLANK for projects created 2025-10-01 or later: those sign
+      # asymmetrically (ES256) and are verified via JWKS automatically. Set it
+      # only for an older project still signing HS256.
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+
+      # ── Cloudflare R2: encrypted blob storage ──────────────────────────────
+      - key: S3_ENDPOINT_URL
+        sync: false # https://<account-id>.r2.cloudflarestorage.com
+      - key: S3_BUCKET
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        value: auto
+
+      # ── Email: sharing invites only ────────────────────────────────────────
+      # Verification and password reset are handled by Supabase, not here.
+      # Leave the key blank if you don't use invites.
+      - key: EMAIL_PROVIDER
+        value: brevo
+      - key: BREVO_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+
+      # ── Admin surface ──────────────────────────────────────────────────────
+      # Guards /internal/metrics and /internal/v1/*. Blank disables them (503).
+      - key: ADMIN_API_KEY
+        sync: false
+
+    # Migrations are deliberately NOT applied automatically — see docs/DEPLOY.md.
+    # Uncomment only if you consciously want every deploy to migrate the database:
+    # preDeployCommand: alembic upgrade head
+
+  - name: rovertools-clipboard-keyvalue
+    type: keyvalue
+    plan: starter
+    region: oregon
+    # Empty list = reachable only from services in this Blueprint, never from
+    # the public internet.
+    ipAllowList: []
+    # Presence entries are short-lived and re-established by clients, so evicting
+    # the coldest keys under memory pressure beats refusing writes.
+    maxmemoryPolicy: allkeys-lru
