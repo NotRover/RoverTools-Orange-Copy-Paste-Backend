@@ -32,6 +32,12 @@ services:
           type: keyvalue
           property: connectionString
 
+      # Pinned so the container and Render's router agree from the first boot.
+      # Without it Render discovers the port after startup and restarts the
+      # deploy once to reconfigure. The Dockerfile honours $PORT.
+      - key: PORT
+        value: "8000"
+
       - key: APP_ENV
         value: production
       # Origin of the Tauri desktop app. Comma-separate to add more.
@@ -41,8 +47,10 @@ services:
         value: "52428800" # 50 MB per user
 
       # ── Supabase: Postgres + Auth ──────────────────────────────────────────
-      # Settings → Database → Connection string (URI), driver rewritten to
-      # `postgresql+asyncpg://…`.
+      # MUST be a Supavisor pooler URL, not the direct `db.<ref>.supabase.co`
+      # host: direct connections are IPv6-only and Render has no outbound IPv6,
+      # so they fail with "Network is unreachable". See docs/DEPLOY.md §3.
+      #   postgresql+asyncpg://postgres.<ref>:<pw>@aws-<region>.pooler.supabase.com:5432/postgres
       - key: DATABASE_URL
         sync: false
       # e.g. https://<project-ref>.supabase.co — also derives the JWKS endpoint

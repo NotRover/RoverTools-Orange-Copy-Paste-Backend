@@ -70,12 +70,34 @@ Create a project, then collect four values.
 | Secret key (`sb_secret_…`) | Settings → API Keys | `SUPABASE_SERVICE_ROLE_KEY` |
 | Legacy JWT secret | Settings → JWT Keys | `SUPABASE_JWT_SECRET` *(usually blank — see below)* |
 
-**Rewrite the database driver.** Supabase hands you a `postgresql://` URI; this
-service uses asyncpg:
+### ⚠️ Use the connection pooler, not the direct host
+
+Supabase's direct host (`db.<ref>.supabase.co`) resolves to **IPv6 only**, and
+Render has no outbound IPv6. A direct URL fails at startup with:
 
 ```
-postgresql+asyncpg://postgres:<password>@db.<project-ref>.supabase.co:5432/postgres
+OSError: [Errno 101] Network is unreachable
 ```
+
+Take the **Supavisor pooler** URI instead (Connect dialog → Session pooler) and
+rewrite the driver to asyncpg. Note the username carries the project ref:
+
+```
+postgresql+asyncpg://postgres.<project-ref>:<password>@aws-<region>.pooler.supabase.com:5432/postgres
+```
+
+| Mode | Port | Notes |
+|---|---|---|
+| **Session** (recommended here) | 5432 | Behaves like a normal connection; the app already pools |
+| Transaction | 6543 | Scales to more clients; **no prepared statements** |
+
+Both are IPv4-reachable on every tier. Session mode is the better fit — the app
+maintains its own SQLAlchemy pool. If you do use transaction mode, `database.py`
+detects port `6543` and disables asyncpg's statement caches automatically;
+without that you'd hit `prepared statement does not exist` under load.
+
+The direct host still works from a machine with IPv6 (e.g. running migrations
+locally), and Supabase sells an IPv4 add-on if you specifically need it.
 
 **About the JWT secret — this is the part that trips people up.** Supabase has
 signed access tokens with **asymmetric keys (ES256) by default since
@@ -242,9 +264,21 @@ Also confirm the `aud` claim is `authenticated` (`SUPABASE_JWT_AUDIENCE`).
 project URL is set. **500 "…SUPABASE_JWT_SECRET is not configured"** — an HS256
 token arrived on a deployment configured only for asymmetric keys.
 
+**`OSError: [Errno 101] Network is unreachable` on every DB call.** You're using
+the direct `db.<ref>.supabase.co` host, which is IPv6-only, from a platform with
+no outbound IPv6. Switch `DATABASE_URL` to the Supavisor pooler (§3). The symptom
+is a service that starts fine, logs `maintenance loop error; retrying` in a loop,
+and fails its health check — the API is up but every request touching Postgres
+fails.
+
+**`prepared statement "__asyncpg_…" does not exist`.** You're on the transaction
+pooler (port 6543) with statement caching on. `database.py` disables it
+automatically for `:6543` URLs — if you see this, the port isn't literally in the
+URL, so switch to session mode (5432) instead.
+
 **Health check fails on deploy.** `/internal/healthz` touches Postgres and Redis.
-Check `DATABASE_URL` (asyncpg driver? password URL-encoded?) and that the Key
-Value instance provisioned.
+Check `DATABASE_URL` (pooler host? asyncpg driver? password URL-encoded?) and
+that the Key Value instance provisioned.
 
 **WebSocket connects then drops.** Usually a free-plan instance idling out
 (§6). Confirm the token is passed as the `token` query parameter, since browsers
