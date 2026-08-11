@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, String, Text
+from sqlalchemy import BigInteger, Boolean, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,7 +42,18 @@ class Device(Base):
     __tablename__ = "devices"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    # FK to our own `profiles` table — unlike `profiles.id -> auth.users.id`, this
+    # is same-schema, so it is a real constraint. It also lets the ORM infer the
+    # `Profile.devices` / `Device.profile` join; without it, mapper configuration
+    # fails with NoForeignKeysError on the first query touching either table.
+    # The constraint already exists in the database: migration 0001 created it
+    # against `users.id`, and 0006's `RENAME TABLE` carried it over to `profiles`.
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     device_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     platform: Mapped[str] = mapped_column(String(32), nullable=False)  # windows | linux | macos
     app_version: Mapped[str] = mapped_column(String(32), nullable=False, default="")
