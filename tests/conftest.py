@@ -43,7 +43,6 @@ def event_loop():
 @pytest.fixture(scope="session", autouse=True)
 def _configure_settings():
     settings.supabase_jwt_secret = _TEST_JWT_SECRET
-    settings.supabase_jwt_algorithm = "HS256"
     settings.supabase_jwt_audience = "authenticated"
     yield
 
