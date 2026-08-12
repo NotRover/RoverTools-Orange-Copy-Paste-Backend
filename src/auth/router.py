@@ -32,12 +32,29 @@ async def bootstrap(
     """Idempotently ensure a profile exists and return the KDF salt plus the
     wrapped-UMK envelope (if set) the client needs to unlock its data. Called
     right after Supabase login. Mirrors the token's email claim into the profile
-    so addressed invites can be resolved to this user."""
-    profile = await service.ensure_profile(db, claims["sub"], body.display_name, claims.get("email"))
+    so addressed invites can be resolved to this user, and the provider avatar
+    URL so member lists can show a picture."""
+    metadata = claims.get("user_metadata") or {}
+    # GoTrue copies the Google profile picture into user_metadata; the key is
+    # "avatar_url" for the OAuth flow and "picture" on the raw OIDC claim.
+    avatar_url = metadata.get("avatar_url") or metadata.get("picture")
+    # The provider's name is a better identity than anything a client can guess,
+    # so it stands in when the client sends none. Reading it here rather than
+    # client-side means every client benefits without shipping an update.
+    claim_name = metadata.get("full_name") or metadata.get("name")
+    display_name = body.display_name or (claim_name if isinstance(claim_name, str) else None)
+    profile = await service.ensure_profile(
+        db,
+        claims["sub"],
+        display_name,
+        claims.get("email"),
+        avatar_url if isinstance(avatar_url, str) else None,
+    )
     return schemas.BootstrapResponse(
         user_id=profile.id,
         kdf_salt=profile.kdf_salt,
         display_name=profile.display_name,
+        avatar_url=profile.avatar_url,
         wrapped_umk=profile.pw_wrapped_umk,
     )
 

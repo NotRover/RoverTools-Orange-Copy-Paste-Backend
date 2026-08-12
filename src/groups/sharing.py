@@ -47,6 +47,8 @@ class InviteResponse(BaseModel):
 class SessionMember(BaseModel):
     user_id: uuid.UUID
     display_name: str
+    # Provider avatar URL (Google), or None — clients fall back to initials.
+    avatar_url: str | None = None
     scope: str
     # X25519 identity public key — lets the owner (re)wrap the session Group Key
     # for this member; None until the member registers keys.
@@ -122,6 +124,7 @@ async def _session_to_out(db: AsyncSession, g: Group, my_membership: GroupMember
             SessionMember(
                 user_id=m.user_id,
                 display_name=profile.display_name if profile else str(m.user_id),
+                avatar_url=profile.avatar_url if profile else None,
                 scope=m.share_scope,
                 identity_pubkey=profile.identity_pubkey if profile else None,
                 has_group_key=m.wrapped_group_key is not None,

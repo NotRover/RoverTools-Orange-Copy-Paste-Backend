@@ -23,11 +23,16 @@ def _generate_kdf_salt() -> str:
 
 
 async def ensure_profile(
-    db: AsyncSession, user_id: str, display_name: str | None, email: str | None = None
+    db: AsyncSession,
+    user_id: str,
+    display_name: str | None,
+    email: str | None = None,
+    avatar_url: str | None = None,
 ) -> Profile:
     """Get-or-create the profile for a Supabase user. Generates the KDF salt on
     first call; the salt is stable thereafter (it seeds UMK derivation). The
-    email claim is mirrored (lowercased) so invites can address this user."""
+    email claim is mirrored (lowercased) so invites can address this user, and
+    the provider avatar URL so member lists can show a picture."""
     uid = uuid.UUID(user_id)
     profile = await db.scalar(select(Profile).where(Profile.id == uid))
     now = _now_ms()
@@ -41,6 +46,7 @@ async def ensure_profile(
             id=uid,
             display_name=display_name or fallback_name,
             email=normalized_email,
+            avatar_url=avatar_url,
             kdf_salt=_generate_kdf_salt(),
             blob_bytes_quota=settings.default_blob_quota_bytes,
             created_at=now,
@@ -61,6 +67,12 @@ async def ensure_profile(
         changed = True
     if normalized_email and normalized_email != profile.email:
         profile.email = normalized_email
+        changed = True
+    # Providers rotate avatar URLs, so follow the claim whenever it moves. A
+    # missing claim never clears a stored picture: email/password logins for an
+    # account that also signs in with Google carry no avatar.
+    if avatar_url and avatar_url != profile.avatar_url:
+        profile.avatar_url = avatar_url
         changed = True
     if changed:
         profile.updated_at = now
