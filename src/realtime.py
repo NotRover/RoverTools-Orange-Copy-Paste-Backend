@@ -151,6 +151,22 @@ async def publish_group_membership_changed(redis: Redis, group_id: str, action: 
     await publish(redis, f"group:{group_id}", "group:membership_changed", payload)
 
 
+async def publish_membership_changed_to_user(redis: Redis, user_id: str, group_id: str, action: str) -> None:
+    """Same event, addressed to one user's own channel — for the joiner or the
+    removed member, who isn't (or is no longer) subscribed to the group channel."""
+    payload = {"group_id": group_id, "action": action, "user_id": user_id}
+    await publish(redis, f"user:{user_id}", "group:membership_changed", payload)
+
+
+async def publish_invite_received(redis: Redis, invitee_user_id: str, invite_payload: dict) -> None:
+    await publish(redis, f"user:{invitee_user_id}", "invite:received", invite_payload)
+
+
+async def publish_invite_updated(redis: Redis, user_id: str, invite_id: str, status: str, group_id: str) -> None:
+    payload = {"invite_id": invite_id, "status": status, "group_id": group_id}
+    await publish(redis, f"user:{user_id}", "invite:updated", payload)
+
+
 async def publish_group_rekey(redis: Redis, group_id: str, user_id: str, wrapped_key: str) -> None:
     payload = {"group_id": group_id, "wrapped_group_key": wrapped_key}
     await publish(redis, f"user:{user_id}", "group:rekey", payload)
@@ -213,13 +229,17 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
     redis: Redis = await get_redis_pool()  # type: ignore[assignment]
     await websocket.accept()
 
-    # Channel list: the user's own channel + every group they belong to.
-    channels = [f"user:{user_id}"]
-    async with AsyncSessionLocal() as db:
-        memberships = await db.scalars(select(GroupMembership).where(GroupMembership.user_id == uuid.UUID(user_id)))
-        channels.extend(f"group:{m.group_id}" for m in memberships.all())
+    async def _resolve_channels() -> list[str]:
+        # Channel list: the user's own channel + every group they belong to.
+        channels = [f"user:{user_id}"]
+        async with AsyncSessionLocal() as db:
+            memberships = await db.scalars(
+                select(GroupMembership).where(GroupMembership.user_id == uuid.UUID(user_id))
+            )
+            channels.extend(f"group:{m.group_id}" for m in memberships.all())
+        return channels
 
-    await _register(websocket, device_id, channels)
+    await _register(websocket, device_id, await _resolve_channels())
 
     # Presence: mark online + set the TTL key the sweeper watches.
     await cast(Awaitable[int], redis.sadd(devices_set_key(user_id), device_id))
@@ -233,6 +253,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
                 msg = json.loads(raw)
                 if msg.get("event") in ("pong", "ack"):
                     await redis.expire(presence_key(user_id, device_id), PRESENCE_TTL)
+                elif msg.get("event") == "resubscribe":
+                    # Membership changed mid-connection (join/leave/invite accept):
+                    # re-resolve the channel set so group fan-out starts (or stops)
+                    # immediately instead of on the next reconnect.
+                    await _unregister(websocket)
+                    await _register(websocket, device_id, await _resolve_channels())
             except asyncio.TimeoutError:
                 await websocket.send_json({"event": "ping", "payload": {"server_ts": _now_ms()}})
             except (WebSocketDisconnect, RuntimeError):

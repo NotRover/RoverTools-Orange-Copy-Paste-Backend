@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth import schemas, service
 from src.database import get_db
-from src.dependencies import get_current_user_id, get_current_user_only
+from src.dependencies import get_current_claims, get_current_user_id, get_current_user_only
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -25,12 +25,13 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 async def bootstrap(
     body: schemas.BootstrapRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_only),
+    claims: dict = Depends(get_current_claims),
 ):
     """Idempotently ensure a profile exists and return the KDF salt plus the
     wrapped-UMK envelope (if set) the client needs to unlock its data. Called
-    right after Supabase login."""
-    profile = await service.ensure_profile(db, user_id, body.display_name)
+    right after Supabase login. Mirrors the token's email claim into the profile
+    so addressed invites can be resolved to this user."""
+    profile = await service.ensure_profile(db, claims["sub"], body.display_name, claims.get("email"))
     return schemas.BootstrapResponse(
         user_id=profile.id,
         kdf_salt=profile.kdf_salt,
