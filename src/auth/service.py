@@ -32,11 +32,14 @@ async def ensure_profile(
     profile = await db.scalar(select(Profile).where(Profile.id == uid))
     now = _now_ms()
     normalized_email = email.lower() if email else None
+    # Fallback name from the email local-part: profiles created by clients that
+    # pass no display_name would otherwise render as blank members everywhere.
+    fallback_name = normalized_email.split("@")[0] if normalized_email else ""
 
     if profile is None:
         profile = Profile(
             id=uid,
-            display_name=display_name or "",
+            display_name=display_name or fallback_name,
             email=normalized_email,
             kdf_salt=_generate_kdf_salt(),
             blob_bytes_quota=settings.default_blob_quota_bytes,
@@ -51,6 +54,10 @@ async def ensure_profile(
     changed = False
     if display_name is not None and display_name != profile.display_name:
         profile.display_name = display_name
+        changed = True
+    elif not profile.display_name and fallback_name:
+        # Heal profiles that were created blank before the fallback existed.
+        profile.display_name = fallback_name
         changed = True
     if normalized_email and normalized_email != profile.email:
         profile.email = normalized_email
