@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import BigInteger, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -17,6 +17,8 @@ class Group(Base):
     invite_code: Mapped[str | None] = mapped_column(Text, unique=True, nullable=True)
     invite_expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     max_members: Mapped[int | None] = mapped_column(Integer, nullable=True)  # NULL = unlimited; 5 for live_share
+    # Owner's choice: may someone who joins later read entries from before they joined?
+    share_history: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
@@ -28,4 +30,7 @@ class GroupMembership(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")  # 'owner'|'admin'|'member'
     wrapped_group_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     share_scope: Mapped[str] = mapped_column(String(16), nullable=False, default="clipboard")
+    # Oldest entry this member may be served, resolved from the group's
+    # `share_history` at join time. NULL = no floor (full history).
+    history_from_ts: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     joined_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

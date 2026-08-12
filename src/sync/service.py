@@ -1,10 +1,11 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.groups.models import GroupMembership
 from src.sync.models import SyncCursor, SyncEntry
 from src.sync.schemas import (
     AcceptedEntry,
@@ -109,10 +110,29 @@ async def pull_entries(
     entry_type: str,
 ) -> tuple[list[SyncEntry], int | None]:
     uid = uuid.UUID(user_id)
-    q = select(SyncEntry).where(
-        SyncEntry.user_id == uid,
-        SyncEntry.server_ts > after_ts,
-    )
+
+    # A device pulls its own user's entries plus anything shared into a group it
+    # belongs to. Without the group arm, entries shared by another member only
+    # ever arrive over the live WebSocket fan-out — so a member who was offline
+    # when they were pushed would never receive them at all.
+    visible = [and_(SyncEntry.user_id == uid, SyncEntry.server_ts > after_ts)]
+
+    memberships = (
+        await db.scalars(select(GroupMembership).where(GroupMembership.user_id == uid))
+    ).all()
+    for m in memberships:
+        arm = and_(
+            SyncEntry.group_ids.overlap([m.group_id]),
+            SyncEntry.server_ts > after_ts,
+        )
+        # `history_from_ts` is the owner's share-history choice resolved at join
+        # time; NULL means no floor. Applied per membership because the caller may
+        # have full history in one group and post-join-only in another.
+        if m.history_from_ts is not None:
+            arm = and_(arm, SyncEntry.server_ts >= m.history_from_ts)
+        visible.append(arm)
+
+    q = select(SyncEntry).where(or_(*visible))
     if entry_type in ("clipboard", "note"):
         q = q.where(SyncEntry.entry_type == entry_type)
 
