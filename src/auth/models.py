@@ -24,6 +24,10 @@ class Profile(Base):
     # the identity authority; this copy exists so invites addressed to an email
     # can be resolved to a user without an Admin API round-trip. Lowercased.
     email: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
+    # Mirror of the identity provider's avatar URL (Google, via the Supabase
+    # user_metadata claim), captured at bootstrap. A public HTTPS URL — no image
+    # data is stored here and none passes through the server.
+    avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     kdf_salt: Mapped[str] = mapped_column(String(64), nullable=False)  # base64 Argon2id salt (wrapping-key derivation)
     identity_pubkey: Mapped[str | None] = mapped_column(Text, nullable=True)  # base64 X25519
     # Random UMK wrapped under the password-derived KEK (AES-GCM envelope, base64).

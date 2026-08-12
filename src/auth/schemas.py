@@ -15,6 +15,8 @@ class BootstrapResponse(BaseModel):
     user_id: uuid.UUID
     kdf_salt: str
     display_name: str
+    # Provider avatar URL (Google), or None for accounts without one.
+    avatar_url: str | None = None
     # Random UMK wrapped under the password-derived key (base64 AES-GCM envelope).
     # None on a brand-new account: the client then generates a UMK, wraps it, and
     # stores it via PUT /auth/umk. On return, the client unwraps this to recover
