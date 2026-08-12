@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.auth.models import Profile
 from src.groups.models import Group, GroupMembership
 from src.groups.schemas import (
     CreateGroupRequest,
@@ -41,6 +42,7 @@ async def create_group(db: AsyncSession, user_id: str, req: CreateGroupRequest) 
         invite_code=invite_code,
         invite_expires_at=expires_at,
         max_members=None,  # pools are unlimited
+        share_history=req.share_history,
         created_at=_now_ms(),
     )
     db.add(group)
@@ -50,6 +52,8 @@ async def create_group(db: AsyncSession, user_id: str, req: CreateGroupRequest) 
         group_id=group.id,
         user_id=uid,
         role="owner",
+        # The owner always sees the full group history — they authored it.
+        history_from_ts=None,
         joined_at=_now_ms(),
     )
     db.add(membership)
@@ -87,8 +91,23 @@ async def get_group(db: AsyncSession, group_id: uuid.UUID, user_id: str) -> Grou
 
 
 async def _group_to_out(db: AsyncSession, g: Group, requesting_user_id: uuid.UUID) -> GroupOut:
-    members_rows = await db.scalars(select(GroupMembership).where(GroupMembership.group_id == g.id))
-    members = [MemberOut(user_id=m.user_id, role=m.role, joined_at=m.joined_at) for m in members_rows.all()]
+    # Include each member's identity public key so the owner's client can wrap the
+    # Group Key for them. Only public key material is exposed — never the wrapped
+    # keys themselves, which are per-member secrets.
+    rows = (
+        await db.execute(
+            select(GroupMembership, Profile.identity_pubkey)
+            .outerjoin(Profile, Profile.id == GroupMembership.user_id)
+            .where(GroupMembership.group_id == g.id)
+        )
+    ).all()
+    members = [
+        MemberOut(user_id=m.user_id, role=m.role, joined_at=m.joined_at, identity_pubkey=pubkey)
+        for m, pubkey in rows
+    ]
+    my_wrapped = next(
+        (m.wrapped_group_key for m, _ in rows if m.user_id == requesting_user_id), None
+    )
     return GroupOut(
         id=g.id,
         owner_id=g.owner_id,
@@ -97,8 +116,10 @@ async def _group_to_out(db: AsyncSession, g: Group, requesting_user_id: uuid.UUI
         invite_code=g.invite_code,
         invite_expires_at=g.invite_expires_at,
         max_members=g.max_members,
+        share_history=g.share_history,
         created_at=g.created_at,
         members=members,
+        my_wrapped_group_key=my_wrapped,
     )
 
 
@@ -143,6 +164,9 @@ async def join_group(db: AsyncSession, user_id: str, req: JoinRequest) -> tuple[
             user_id=uid,
             role="member",
             wrapped_group_key=req.wrapped_group_key,
+            # Resolve the owner's policy once, at join time, so later policy
+            # changes don't retroactively expand what an existing member sees.
+            history_from_ts=None if g.share_history else now,
             joined_at=now,
         )
         db.add(membership)
