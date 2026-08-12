@@ -102,7 +102,13 @@ async def _group_to_out(db: AsyncSession, g: Group, requesting_user_id: uuid.UUI
         )
     ).all()
     members = [
-        MemberOut(user_id=m.user_id, role=m.role, joined_at=m.joined_at, identity_pubkey=pubkey)
+        MemberOut(
+            user_id=m.user_id,
+            role=m.role,
+            joined_at=m.joined_at,
+            identity_pubkey=pubkey,
+            has_group_key=m.wrapped_group_key is not None,
+        )
         for m, pubkey in rows
     ]
     my_wrapped = next(

@@ -27,6 +27,12 @@ class MemberOut(BaseModel):
     # Group Key for them. None until that member registers their keys — such a
     # member cannot be wrapped for yet and is retried on the next distribution.
     identity_pubkey: str | None = None
+    # Whether this member already holds a wrapped Group Key. Lets the owner wrap
+    # only for members who need one, instead of re-distributing to everybody on
+    # every reconcile — which the server echoes back as `group:rekey` and would
+    # otherwise drive an endless distribute/reconcile cycle. The key itself is
+    # never exposed, only its presence.
+    has_group_key: bool = False
 
 
 class GroupOut(BaseModel):
