@@ -22,6 +22,8 @@ class CreateGroupResponse(BaseModel):
 class MemberOut(BaseModel):
     user_id: uuid.UUID
     display_name: str = ""
+    # Provider avatar URL (Google), or None — clients fall back to initials.
+    avatar_url: str | None = None
     role: str
     joined_at: int
     # The member's X25519 identity public key, needed by the owner to wrap the

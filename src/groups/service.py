@@ -120,7 +120,12 @@ async def _group_to_out(db: AsyncSession, g: Group, requesting_user_id: uuid.UUI
     # keys themselves, which are per-member secrets.
     rows = (
         await db.execute(
-            select(GroupMembership, Profile.identity_pubkey, Profile.display_name)
+            select(
+                GroupMembership,
+                Profile.identity_pubkey,
+                Profile.display_name,
+                Profile.avatar_url,
+            )
             .outerjoin(Profile, Profile.id == GroupMembership.user_id)
             .where(GroupMembership.group_id == g.id)
         )
@@ -129,15 +134,16 @@ async def _group_to_out(db: AsyncSession, g: Group, requesting_user_id: uuid.UUI
         MemberOut(
             user_id=m.user_id,
             display_name=display_name or "",
+            avatar_url=avatar_url,
             role=m.role,
             joined_at=m.joined_at,
             identity_pubkey=pubkey,
             has_group_key=m.wrapped_group_key is not None,
         )
-        for m, pubkey, display_name in rows
+        for m, pubkey, display_name, avatar_url in rows
     ]
     my_wrapped = next(
-        (m.wrapped_group_key for m, _, _ in rows if m.user_id == requesting_user_id), None
+        (m.wrapped_group_key for m, _, _, _ in rows if m.user_id == requesting_user_id), None
     )
     return GroupOut(
         id=g.id,
