@@ -8,7 +8,7 @@ identity key), device registration, and E2E key wrapping.
 
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -123,6 +123,25 @@ async def register_keys(
     """
     user_id, device_id = current
     await service.store_public_keys(db, user_id, device_id, body.identity_pubkey, body.device_pubkey)
+
+
+@router.get("/umk/device", response_model=schemas.DeviceWrappedUmkResponse)
+async def get_device_wrapped_umk(
+    db: AsyncSession = Depends(get_db),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Return the UMK wrapped for the calling device — the silent session
+    restore path. 404 when no wrap is stored or the device was revoked, which
+    is what makes revocation actually cut a device off: its keychain state
+    alone can no longer recover the master key.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
+    user_id, device_id = current
+    wrapped = await service.get_device_wrapped_umk(db, device_id, user_id)
+    if not wrapped:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No device key wrap")
+    return schemas.DeviceWrappedUmkResponse(wrapped_umk=wrapped)
 
 
 @router.post("/devices/{device_id}/key-wrap", status_code=204)
