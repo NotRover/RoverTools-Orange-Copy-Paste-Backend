@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field
 class CreateGroupRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     group_type: Literal["pool"] = "pool"
+    # May members who join later read entries pushed before they joined?
+    share_history: bool = True
 
 
 class CreateGroupResponse(BaseModel):
@@ -21,6 +23,10 @@ class MemberOut(BaseModel):
     user_id: uuid.UUID
     role: str
     joined_at: int
+    # The member's X25519 identity public key, needed by the owner to wrap the
+    # Group Key for them. None until that member registers their keys — such a
+    # member cannot be wrapped for yet and is retried on the next distribution.
+    identity_pubkey: str | None = None
 
 
 class GroupOut(BaseModel):
@@ -31,8 +37,14 @@ class GroupOut(BaseModel):
     invite_code: str | None
     invite_expires_at: int | None
     max_members: int | None
+    share_history: bool = True
     created_at: int
     members: list[MemberOut] = Field(default_factory=list)
+    # The *requesting* member's own wrapped Group Key, so a client can recover it
+    # after a restart. Group keys live in memory only on the client, and the
+    # `group:rekey` WebSocket event is fire-and-forget — without this, a member who
+    # restarted could never decrypt the group again. Never exposes another member's key.
+    my_wrapped_group_key: str | None = None
 
     model_config = {"from_attributes": True}
 
