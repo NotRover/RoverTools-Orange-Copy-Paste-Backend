@@ -22,17 +22,22 @@ def _generate_kdf_salt() -> str:
 # ── Profile bootstrap ───────────────────────────────────────────────────────────
 
 
-async def ensure_profile(db: AsyncSession, user_id: str, display_name: str | None) -> Profile:
+async def ensure_profile(
+    db: AsyncSession, user_id: str, display_name: str | None, email: str | None = None
+) -> Profile:
     """Get-or-create the profile for a Supabase user. Generates the KDF salt on
-    first call; the salt is stable thereafter (it seeds UMK derivation)."""
+    first call; the salt is stable thereafter (it seeds UMK derivation). The
+    email claim is mirrored (lowercased) so invites can address this user."""
     uid = uuid.UUID(user_id)
     profile = await db.scalar(select(Profile).where(Profile.id == uid))
     now = _now_ms()
+    normalized_email = email.lower() if email else None
 
     if profile is None:
         profile = Profile(
             id=uid,
             display_name=display_name or "",
+            email=normalized_email,
             kdf_salt=_generate_kdf_salt(),
             blob_bytes_quota=settings.default_blob_quota_bytes,
             created_at=now,
@@ -43,8 +48,14 @@ async def ensure_profile(db: AsyncSession, user_id: str, display_name: str | Non
         await db.refresh(profile)
         return profile
 
+    changed = False
     if display_name is not None and display_name != profile.display_name:
         profile.display_name = display_name
+        changed = True
+    if normalized_email and normalized_email != profile.email:
+        profile.email = normalized_email
+        changed = True
+    if changed:
         profile.updated_at = now
         await db.commit()
         await db.refresh(profile)

@@ -20,6 +20,10 @@ class Profile(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # Mirror of the Supabase email claim, captured at bootstrap. Supabase stays
+    # the identity authority; this copy exists so invites addressed to an email
+    # can be resolved to a user without an Admin API round-trip. Lowercased.
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
     kdf_salt: Mapped[str] = mapped_column(String(64), nullable=False)  # base64 Argon2id salt (wrapping-key derivation)
     identity_pubkey: Mapped[str | None] = mapped_column(Text, nullable=True)  # base64 X25519
     # Random UMK wrapped under the password-derived KEK (AES-GCM envelope, base64).

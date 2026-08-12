@@ -47,13 +47,12 @@ def _configure_settings():
     yield
 
 
-def make_token(user_id: str) -> str:
+def make_token(user_id: str, email: str | None = None) -> str:
     now = int(time.time())
-    return jwt.encode(
-        {"sub": user_id, "aud": "authenticated", "iat": now, "exp": now + 3600},
-        _TEST_JWT_SECRET,
-        algorithm="HS256",
-    )
+    claims: dict = {"sub": user_id, "aud": "authenticated", "iat": now, "exp": now + 3600}
+    if email:
+        claims["email"] = email
+    return jwt.encode(claims, _TEST_JWT_SECRET, algorithm="HS256")
 
 
 @pytest_asyncio.fixture(scope="session")

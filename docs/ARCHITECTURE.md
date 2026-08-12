@@ -331,6 +331,45 @@ CREATE TABLE blobs (
 
 ---
 
+### 4.9 `group_invites` (v2.1)
+
+Addressed counterpart to the bearer `invite_code`: one row per
+(group, invitee email), so an invitation survives the invitee being offline and
+the inviter can see its fate. `profiles.email` (added in the same migration,
+0009) is the lowercased mirror of the Supabase JWT email claim, captured at
+bootstrap, used to resolve invitees to user ids locally.
+
+```mermaid
+erDiagram
+    profiles ||--o{ group_invites : "inviter / invitee (resolved)"
+    groups ||--o{ group_invites : "CASCADE on group delete"
+    groups ||--o{ group_memberships : ""
+    profiles ||--o{ group_memberships : ""
+    profiles {
+        uuid id PK "= Supabase auth.users.id"
+        string email "lowercased JWT-claim mirror, nullable"
+        text identity_pubkey "base64 X25519"
+    }
+    group_invites {
+        uuid id PK
+        uuid group_id FK
+        uuid inviter_id
+        string invitee_email "lowercased"
+        uuid invitee_user_id "NULL until resolved"
+        string status "pending | accepted | declined | revoked"
+        bigint created_at
+        bigint expires_at "judged at read time"
+    }
+    group_memberships {
+        uuid group_id PK
+        uuid user_id PK
+        text wrapped_group_key "recovery blob, nullable"
+        bigint history_from_ts "pull floor, nullable"
+    }
+```
+
+---
+
 ## 5. API Design
 
 ### Conventions
@@ -461,6 +500,52 @@ DELETE /api/v1/sharing/sessions/{id}/leave   -- member: leave
 
 Joining a Live Share uses `POST /api/v1/groups/join` with the invite code.
 
+`GET /sharing/sessions` additionally returns `owner_id`, `my_wrapped_group_key`,
+and per-member `identity_pubkey`/`has_group_key` — the restart-recovery contract
+(§7.4). `POST /sharing/invite` also records an addressed invite (§5.6b).
+
+### 5.6b Invite Routes (addressed invites, v2.1)
+
+The bearer `invite_code` is complemented by persistent, per-email invites.
+Lifecycle: `pending → accepted | declined` (invitee) `| revoked` (inviter);
+expiry (72 h) is judged at read/accept time, no sweeper.
+
+```
+POST   /api/v1/groups/{id}/invites   Body: { email }   -- owner only
+       Returns: 201 { id, group_id, group_name, group_type, inviter_id,
+                      inviter_name, invitee_email, status, created_at, expires_at }
+       Publishes invite:received to the invitee when resolvable; emails the code.
+GET    /api/v1/invites               Returns: { sent: [...], received: [...] }
+       received = pending, unexpired, matched by user id or the token's email claim
+POST   /api/v1/invites/{id}/accept   Joins the group; same events as a code join
+POST   /api/v1/invites/{id}/decline
+DELETE /api/v1/invites/{id}          -- inviter revokes a pending invite
+```
+
+Invitee resolution uses `profiles.email`, a lowercased mirror of the Supabase
+JWT email claim captured at bootstrap (§4.9) — no Admin API round-trip.
+
+```mermaid
+sequenceDiagram
+    participant O as Owner client
+    participant API as Backend
+    participant R as Redis pub/sub
+    participant I as Invitee client
+
+    O->>API: POST /groups/{id}/invites {email}
+    API->>API: upsert group_invites (pending, 72h TTL)
+    alt email matches a profile
+        API->>R: user:{invitee} invite:received
+        R-->>I: badge + accept/decline banner
+    end
+    API--)I: invite email with short code (best-effort)
+    I->>API: POST /invites/{id}/accept
+    API->>API: add membership (cap + history floor), status=accepted
+    API->>R: sharing:accepted / group:membership_changed
+    API->>R: user:{inviter} invite:updated
+    R-->>O: wrap Group Key for new member (§7.4)
+```
+
 ### 5.7 Internal Routes
 
 Split into **unversioned infra probes** and the **versioned admin API** (see §5.0).
@@ -500,19 +585,26 @@ user belongs to.
 { "event": "device:offline", "payload": { "device_id": "..." } }
 { "event": "group:membership_changed", "payload": { "group_id": "...", "action": "joined|left", "user_id": "..." } }
 { "event": "group:rekey",  "payload": { "group_id": "...", "wrapped_group_key": "..." } }
-{ "event": "sharing:accepted",     "payload": { "share_group_id": "...", "new_member": {...}, "wrapped_group_key": "..." } }
+{ "event": "sharing:accepted",     "payload": { "share_group_id": "...", "new_member": { "id", "display_name", "identity_pubkey" }, "wrapped_group_key": "..." } }
+{ "event": "invite:received",      "payload": { ...InviteOut } }
+{ "event": "invite:updated",       "payload": { "invite_id": "...", "status": "accepted|declined|revoked", "group_id": "..." } }
 { "event": "sharing:ended",        "payload": { "share_group_id": "...", "ended_by": "..." } }
 { "event": "sharing:scope_changed","payload": { "share_group_id": "...", "user_id": "...", "share_scope": "..." } }
 { "event": "settings:updated",     "payload": { "updated_at": 1234567 } }
 { "event": "ping",         "payload": { "server_ts": 1234567 } }
 ```
 
-**Client → Server:** `{ "event": "pong" }` / `{ "event": "ack" }` (either refreshes the presence TTL).
+**Client → Server:** `{ "event": "pong" }` / `{ "event": "ack" }` (either refreshes
+the presence TTL), and `{ "event": "resubscribe" }` — re-resolves the socket's
+channel set after a membership change, so group fan-out starts (or stops)
+without a reconnect. The server supports this by publishing
+`group:membership_changed` to the affected user's *own* channel too: the joiner
+isn't on the group channel yet, and a removed member may already be off it.
 
-> `sharing:invite` exists as a publish helper but is **not currently emitted** — Live
-> Share invites are delivered by email, because mapping an invite email to a user id
-> is owned by Supabase (the backend stores no email). Wire it up later via a Supabase
-> Admin lookup if live "you've been invited" prompts are wanted.
+> `sharing:invite` exists as a publish helper but is superseded by
+> `invite:received` — addressed invites (§5.6b) resolve the invitee via
+> `profiles.email`, so live "you've been invited" prompts work without a
+> Supabase Admin lookup.
 
 ---
 
@@ -592,6 +684,32 @@ Group creator generates a random 32-byte Group Key, wraps it per member with
 `X25519(my_priv, member_identity_pubkey)`, and posts all copies to
 `POST /groups/{id}/keys`. Group entries are encrypted with the Group Key. On member
 removal the owner rotates the key and re-distributes (`group:rekey` WS event).
+
+Wrapped keys persist on the membership row, which gives every client a restart
+recovery path — Group Keys live only in memory client-side. Pools recover via
+`GroupOut.my_wrapped_group_key`, Live Share sessions via
+`SessionOut.my_wrapped_group_key` (v2.1; sessions previously had no recovery
+path and were lost on every restart). The `sharing:accepted` payload carries
+the joiner's `identity_pubkey` — required for the owner-side wrap; its absence
+before v2.1 is what broke Live Share key delivery end-to-end.
+
+```mermaid
+sequenceDiagram
+    participant J as Joiner client
+    participant API as Backend
+    participant R as Redis pub/sub
+    participant O as Owner client
+
+    J->>API: join (code or invite accept)
+    API->>R: user:{owner} sharing:accepted {id, display_name, identity_pubkey}
+    R-->>O: sharing:accepted
+    Note over O: wrapped = wrap(X25519(owner_priv, joiner_pub), GroupKey)
+    O->>API: POST /groups/{id}/keys [{user_id, wrapped}]
+    API->>API: persist wrapped_group_key on membership
+    API->>R: user:{joiner} group:rekey
+    R-->>J: group:rekey → unwrap, cache in memory
+    Note over J,API: restart: GET /groups | /sharing/sessions returns<br/>my_wrapped_group_key + owner pubkey → unwrap again
+```
 
 ### 7.5 Server Visibility
 

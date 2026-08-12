@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,7 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.models import Profile
 from src.database import get_db
 from src.dependencies import get_current_user_id, get_redis
+from src.groups import invites as invites_module
 from src.groups import service
+from src.groups.models import Group
 from src.groups.schemas import (
     CreateGroupRequest,
     CreateGroupResponse,
@@ -95,20 +97,29 @@ async def join_group(
     user_id, _ = current
     result, group = await service.join_group(db, user_id, body)
 
-    if group.group_type == "live_share":
-        # Fetch joining user's display_name for the sharing:accepted payload
-        joining_user = await db.scalar(select(Profile).where(Profile.id == uuid.UUID(user_id)))
-        display_name = joining_user.display_name if joining_user else ""
+    joining_user = await db.scalar(select(Profile).where(Profile.id == uuid.UUID(user_id)))
 
+    if group.group_type == "live_share":
+        # The owner needs the joiner's identity public key to wrap the Group Key
+        # for them — without it the client-side handshake cannot complete.
         await rt.publish_sharing_accepted(
             redis,
             owner_user_id=str(group.owner_id),
             share_group_id=str(result.group_id),
-            new_member={"id": user_id, "display_name": display_name},
+            new_member={
+                "id": user_id,
+                "display_name": joining_user.display_name if joining_user else "",
+                "identity_pubkey": joining_user.identity_pubkey if joining_user else None,
+            },
             wrapped_group_key=body.wrapped_group_key,
         )
     else:
         await rt.publish_group_membership_changed(redis, str(result.group_id), "joined", user_id)
+
+    # The joiner's own socket isn't subscribed to the group channel yet (channel
+    # sets are resolved at connect time), so tell them directly — their client
+    # resubscribes and reconciles keys on this event.
+    await rt.publish_membership_changed_to_user(redis, user_id, str(result.group_id), "joined")
 
     return result
 
@@ -129,6 +140,9 @@ async def remove_member(
     user_id, _ = current
     await service.remove_member(db, group_id, member_user_id, user_id)
     await rt.publish_group_membership_changed(redis, str(group_id), "left", str(member_user_id))
+    # Removed members are (or may be) no longer on the group channel — notify
+    # them directly so their client drops the group and resubscribes.
+    await rt.publish_membership_changed_to_user(redis, str(member_user_id), str(group_id), "left")
 
 
 @router.delete("/{group_id}", status_code=204)
@@ -143,6 +157,30 @@ async def delete_group(
     """
     user_id, _ = current
     await service.delete_group(db, group_id, user_id)
+
+
+@router.post("/{group_id}/invites", response_model=invites_module.InviteOut, status_code=201)
+async def send_group_invite(
+    group_id: uuid.UUID,
+    body: invites_module.CreateInviteRequest,
+    background: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Send an addressed invite to join this group (owner action).
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `invite:received` to the invitee when they're a known user, and
+    queues a best-effort invite email carrying the group's short code.
+    """
+    user_id, _ = current
+    g = await db.scalar(select(Group).where(Group.id == group_id))
+    if not g:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    if str(g.owner_id) != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
+    return await invites_module.create_invite(db, redis, background, g, user_id, body.email)
 
 
 @router.post("/{group_id}/keys", status_code=204)

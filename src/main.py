@@ -13,6 +13,7 @@ from src.admin.router import admin_router, probe_router
 from src.auth.router import router as auth_router
 from src.blobs.router import router as blobs_router
 from src.config import settings
+from src.groups.invites import router as invites_router
 from src.groups.router import router as groups_router
 from src.groups.sharing import router as sharing_router
 from src.limiter import limiter
@@ -34,6 +35,8 @@ OPENAPI_TAGS = [
     {"name": "groups", "description": "Pool groups: shared encrypted history across a user's own trust group, "
      "with invite codes and group-key distribution."},
     {"name": "sharing", "description": "Live Share: short-lived cross-user sessions scoped to clipboard/notes/both."},
+    {"name": "invites", "description": "Addressed group invites: persistent, per-email invitations with accept/decline/"
+     "revoke and live `invite:*` notifications — the in-app counterpart to bearer invite codes."},
     {"name": "realtime", "description": "WebSocket `/ws` fan-out of sync/presence/sharing events. Not part of the "
      "OpenAPI HTTP schema; see the API reference doc for the event contract."},
     {"name": "ops", "description": "Unversioned infrastructure probes: `/internal/healthz` (public) and "
@@ -110,6 +113,7 @@ app.include_router(settings_router, prefix=API_PREFIX)
 app.include_router(blobs_router, prefix=API_PREFIX)
 app.include_router(groups_router, prefix=API_PREFIX)
 app.include_router(sharing_router, prefix=API_PREFIX)
+app.include_router(invites_router, prefix=API_PREFIX)
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 app.include_router(realtime.router)

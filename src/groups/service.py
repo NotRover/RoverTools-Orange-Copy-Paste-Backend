@@ -21,18 +21,42 @@ from src.groups.schemas import (
 _INVITE_TTL_HOURS = 72
 _LIVE_SHARE_MAX_MEMBERS = 5
 
+# Human-typeable invite alphabet: no I/L/O/0/1, so a code survives being read
+# aloud or retyped from a screenshot. 8 chars of 31 symbols ≈ 8.5e11 codes —
+# ample for short-lived, rate-limited, single-group secrets.
+_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+_CODE_LENGTH = 8
+
 
 def _now_ms() -> int:
     return int(datetime.now(UTC).timestamp() * 1000)
 
 
-def _new_invite_code() -> str:
-    return secrets.token_urlsafe(24)
+def new_invite_code() -> str:
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
+
+
+def normalize_invite_code(raw: str) -> str:
+    """Canonicalize user input for the short code format: strip separators and
+    uppercase. Anything longer than the short format is a legacy
+    `token_urlsafe` code, which is case-sensitive — returned untouched."""
+    stripped = raw.strip().replace("-", "").replace(" ", "")
+    if len(stripped) == _CODE_LENGTH and stripped.isalnum():
+        return stripped.upper()
+    return raw.strip()
+
+
+def format_invite_code(code: str) -> str:
+    """Display form of a short code (`KX7Q2M4X` → `KX7Q-2M4X`); legacy codes
+    pass through unchanged."""
+    if len(code) == _CODE_LENGTH and code.isalnum():
+        return f"{code[:4]}-{code[4:]}"
+    return code
 
 
 async def create_group(db: AsyncSession, user_id: str, req: CreateGroupRequest) -> tuple[Group, str]:
     uid = uuid.UUID(user_id)
-    invite_code = _new_invite_code()
+    invite_code = new_invite_code()
     expires_at = int((datetime.now(UTC) + timedelta(hours=_INVITE_TTL_HOURS)).timestamp() * 1000)
 
     group = Group(
@@ -96,7 +120,7 @@ async def _group_to_out(db: AsyncSession, g: Group, requesting_user_id: uuid.UUI
     # keys themselves, which are per-member secrets.
     rows = (
         await db.execute(
-            select(GroupMembership, Profile.identity_pubkey)
+            select(GroupMembership, Profile.identity_pubkey, Profile.display_name)
             .outerjoin(Profile, Profile.id == GroupMembership.user_id)
             .where(GroupMembership.group_id == g.id)
         )
@@ -104,15 +128,16 @@ async def _group_to_out(db: AsyncSession, g: Group, requesting_user_id: uuid.UUI
     members = [
         MemberOut(
             user_id=m.user_id,
+            display_name=display_name or "",
             role=m.role,
             joined_at=m.joined_at,
             identity_pubkey=pubkey,
             has_group_key=m.wrapped_group_key is not None,
         )
-        for m, pubkey in rows
+        for m, pubkey, display_name in rows
     ]
     my_wrapped = next(
-        (m.wrapped_group_key for m, _ in rows if m.user_id == requesting_user_id), None
+        (m.wrapped_group_key for m, _, _ in rows if m.user_id == requesting_user_id), None
     )
     return GroupOut(
         id=g.id,
@@ -137,7 +162,7 @@ async def refresh_invite(db: AsyncSession, group_id: uuid.UUID, user_id: str) ->
     if g.owner_id != uid:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
 
-    new_code: str = _new_invite_code()
+    new_code: str = new_invite_code()
     new_expires: int = int((datetime.now(UTC) + timedelta(hours=_INVITE_TTL_HOURS)).timestamp() * 1000)
     g.invite_code = new_code
     g.invite_expires_at = new_expires
@@ -145,15 +170,20 @@ async def refresh_invite(db: AsyncSession, group_id: uuid.UUID, user_id: str) ->
     return InviteResponse(invite_code=new_code, expires_at=new_expires)
 
 
-async def join_group(db: AsyncSession, user_id: str, req: JoinRequest) -> tuple[JoinResponse, Group]:
-    uid = uuid.UUID(user_id)
-    g = await db.scalar(select(Group).where(Group.invite_code == req.invite_code))
-    if not g:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid invite code")
-
+async def add_membership(
+    db: AsyncSession, g: Group, uid: uuid.UUID, wrapped_group_key: str | None = None
+) -> None:
+    """Idempotently add `uid` to `g`, enforcing the member cap and resolving the
+    owner's history policy at join time (so later policy changes don't
+    retroactively expand what an existing member sees). Shared by the
+    invite-code join and the addressed-invite accept paths."""
     now = _now_ms()
-    if g.invite_expires_at and g.invite_expires_at < now:
-        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Invite code expired")
+
+    existing = await db.scalar(
+        select(GroupMembership).where(GroupMembership.group_id == g.id, GroupMembership.user_id == uid)
+    )
+    if existing:
+        return
 
     # Check membership cap (NULL = unlimited)
     if g.max_members:
@@ -162,21 +192,30 @@ async def join_group(db: AsyncSession, user_id: str, req: JoinRequest) -> tuple[
         if count >= g.max_members:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Group is full")
 
-    # Idempotent — already a member
-    existing = await db.scalar(select(GroupMembership).where(GroupMembership.group_id == g.id, GroupMembership.user_id == uid))
-    if not existing:
-        membership = GroupMembership(
-            group_id=g.id,
-            user_id=uid,
-            role="member",
-            wrapped_group_key=req.wrapped_group_key,
-            # Resolve the owner's policy once, at join time, so later policy
-            # changes don't retroactively expand what an existing member sees.
-            history_from_ts=None if g.share_history else now,
-            joined_at=now,
-        )
-        db.add(membership)
-        await db.commit()
+    membership = GroupMembership(
+        group_id=g.id,
+        user_id=uid,
+        role="member",
+        wrapped_group_key=wrapped_group_key,
+        history_from_ts=None if g.share_history else now,
+        joined_at=now,
+    )
+    db.add(membership)
+    await db.commit()
+
+
+async def join_group(db: AsyncSession, user_id: str, req: JoinRequest) -> tuple[JoinResponse, Group]:
+    uid = uuid.UUID(user_id)
+    code = normalize_invite_code(req.invite_code)
+    g = await db.scalar(select(Group).where(Group.invite_code == code))
+    if not g:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid invite code")
+
+    now = _now_ms()
+    if g.invite_expires_at and g.invite_expires_at < now:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Invite code expired")
+
+    await add_membership(db, g, uid, req.wrapped_group_key)
 
     return JoinResponse(group_id=g.id, name=g.name, group_type=g.group_type), g
 
