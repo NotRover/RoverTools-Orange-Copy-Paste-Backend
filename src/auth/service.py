@@ -138,6 +138,15 @@ async def store_public_keys(
     await db.commit()
 
 
+async def get_device_wrapped_umk(db: AsyncSession, device_id: str, user_id: str) -> str | None:
+    """The UMK wrapped for this device, or None when absent or the device was
+    revoked (revocation clears the wrap, cutting off silent restore)."""
+    device = await db.scalar(select(Device).where(Device.id == uuid.UUID(device_id)))
+    if not device or str(device.user_id) != user_id or device.revoked:
+        return None
+    return device.wrapped_umk
+
+
 async def store_wrapped_umk(
     db: AsyncSession,
     target_device_id: uuid.UUID,

@@ -65,3 +65,7 @@ class RegisterPublicKeysRequest(BaseModel):
 
 class WrapUmkRequest(BaseModel):
     wrapped_umk: str  # base64 AES-256-GCM(shared_secret, UMK)
+
+
+class DeviceWrappedUmkResponse(BaseModel):
+    wrapped_umk: str
