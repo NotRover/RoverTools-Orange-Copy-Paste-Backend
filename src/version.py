@@ -20,7 +20,7 @@ hardcode their paths and must not have to track a version on every bump:
 """
 
 API_VERSION = "v1"
-SERVICE_VERSION = "2.0.0"
+SERVICE_VERSION = "2.1.0"
 
 API_PREFIX = f"/api/{API_VERSION}"
 INTERNAL_VERSIONED_PREFIX = f"/internal/{API_VERSION}"
