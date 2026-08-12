@@ -9,11 +9,13 @@ identity key), device registration, and E2E key wrapping.
 import uuid
 
 from fastapi import APIRouter, Depends
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src import realtime as rt
 from src.auth import schemas, service
 from src.database import get_db
-from src.dependencies import get_current_claims, get_current_user_id, get_current_user_only
+from src.dependencies import get_current_claims, get_current_user_id, get_current_user_only, get_redis
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -76,14 +78,21 @@ async def register_device(
 @router.get("/devices", response_model=list[schemas.DeviceOut])
 async def list_devices(
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
     user_id: str = Depends(get_current_user_only),
 ):
-    """List all registered devices for the current user.
+    """List all registered devices for the current user, with a presence
+    snapshot (`online`) resolved from Redis at request time.
 
     Requires: Bearer token (Supabase JWT).
     """
     devices = await service.get_user_devices(db, user_id)
-    return [schemas.DeviceOut.model_validate(d) for d in devices]
+    out = []
+    for d in devices:
+        item = schemas.DeviceOut.model_validate(d)
+        item.online = bool(await redis.exists(rt.presence_key(user_id, str(d.id))))
+        out.append(item)
+    return out
 
 
 @router.delete("/devices/{device_id}", status_code=204)

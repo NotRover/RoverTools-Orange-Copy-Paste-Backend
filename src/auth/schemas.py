@@ -47,6 +47,10 @@ class DeviceOut(BaseModel):
     platform: str
     app_version: str
     last_seen_at: int
+    # Presence snapshot at list time (Redis presence key exists). Live updates
+    # still flow over WS `device:online`/`device:offline`; this seeds the UI so
+    # devices don't all render offline until the next event happens to arrive.
+    online: bool = False
 
     model_config = {"from_attributes": True}
 
