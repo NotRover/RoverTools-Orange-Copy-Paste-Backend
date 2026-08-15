@@ -48,6 +48,20 @@ def devices_set_key(user_id: str) -> str:
     return f"user:{user_id}:devices"
 
 
+async def user_is_online(redis: Redis, user_id: str) -> bool:
+    """True when at least one of the user's devices holds a live presence key.
+
+    The device set can outlive a socket that died without a clean close, so
+    membership alone is not proof — each candidate is checked against its
+    TTL key, which only a connected (and heartbeating) device keeps alive.
+    """
+    device_ids = await cast(Awaitable[set[str]], redis.smembers(devices_set_key(user_id)))
+    for device_id in device_ids:
+        if await redis.exists(presence_key(user_id, device_id)):
+            return True
+    return False
+
+
 # ── In-process connection hub ───────────────────────────────────────────────────
 
 # channel_name → set of (websocket, device_id)
@@ -72,6 +86,12 @@ async def _unregister(ws: WebSocket) -> None:
             _channels[ch].discard((ws, device_id))  # type: ignore[arg-type]
             if not _channels[ch]:
                 del _channels[ch]
+
+
+def _group_channels(channels: list[str]) -> list[str]:
+    """Just the group channels — the user's own channel carries device-level
+    presence already and must not get the per-user event too."""
+    return [c for c in channels if c.startswith("group:")]
 
 
 def connection_count() -> int:
@@ -200,6 +220,18 @@ async def publish_sharing_scope_changed(redis: Redis, group_id: str, user_id: st
     await publish(redis, f"group:{group_id}", "sharing:scope_changed", payload)
 
 
+async def publish_user_presence(redis: Redis, group_channels: list[str], user_id: str, online: bool) -> None:
+    """Tell a user's shared groups that they came online or went fully offline.
+
+    `device:online` is addressed to the user's own channel, so other members of
+    a pool group or Live Share session never learn about it — their member list
+    stays stuck at whatever the last REST snapshot said. This is the same fact,
+    per-user rather than per-device, addressed to the people who can see it.
+    """
+    for channel in group_channels:
+        await publish(redis, channel, "user:presence", {"user_id": user_id, "online": online})
+
+
 async def publish_settings_updated(redis: Redis, user_id: str, updated_at: int) -> None:
     await publish(redis, f"user:{user_id}", "settings:updated", {"updated_at": updated_at})
 
@@ -239,12 +271,18 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
             channels.extend(f"group:{m.group_id}" for m in memberships.all())
         return channels
 
-    await _register(websocket, device_id, await _resolve_channels())
+    channels = await _resolve_channels()
+    await _register(websocket, device_id, channels)
 
-    # Presence: mark online + set the TTL key the sweeper watches.
+    # Presence: mark online + set the TTL key the sweeper watches. Resolved
+    # before the write, so "was the user already reachable" isn't answered by
+    # this very connection.
+    was_online = await user_is_online(redis, user_id)
     await cast(Awaitable[int], redis.sadd(devices_set_key(user_id), device_id))
     await redis.set(presence_key(user_id, device_id), "1", ex=PRESENCE_TTL)
     await publish(redis, f"user:{user_id}", "device:online", {"device_id": device_id})
+    if not was_online:
+        await publish_user_presence(redis, _group_channels(channels), user_id, True)
 
     try:
         while True:
@@ -258,7 +296,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
                     # re-resolve the channel set so group fan-out starts (or stops)
                     # immediately instead of on the next reconnect.
                     await _unregister(websocket)
-                    await _register(websocket, device_id, await _resolve_channels())
+                    channels = await _resolve_channels()
+                    await _register(websocket, device_id, channels)
             except asyncio.TimeoutError:
                 await websocket.send_json({"event": "ping", "payload": {"server_ts": _now_ms()}})
             except (WebSocketDisconnect, RuntimeError):
@@ -268,3 +307,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
         await cast(Awaitable[int], redis.srem(devices_set_key(user_id), device_id))
         await redis.delete(presence_key(user_id, device_id))
         await publish(redis, f"user:{user_id}", "device:offline", {"device_id": device_id})
+        # Only the user's last device going away makes them offline to others.
+        if not await user_is_online(redis, user_id):
+            await publish_user_presence(redis, _group_channels(channels), user_id, False)
