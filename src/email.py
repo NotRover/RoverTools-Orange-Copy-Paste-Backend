@@ -96,7 +96,7 @@ def send_sharing_invite(
 <p><a href="{join_url}">{join_url}</a></p>
 <p>Invite code: <strong>{invite_code}</strong></p>
 <p>This invite expires in 24 hours.</p>
-<p>— Orange Clipboard</p>
+<p>Orange Clipboard</p>
 """
     text = (
         f"Hi {invitee_name or 'there'},\n\n"
