@@ -160,12 +160,12 @@ the public `/internal/healthz`.
 | API framework      | FastAPI + uvicorn                     | Async, Pydantic v2, native WebSocket, auto OpenAPI               |
 | Database           | Supabase **Postgres 16**              | Managed; asyncpg + SQLAlchemy 2 async core; RLS available        |
 | Identity / Auth    | Supabase **Auth (GoTrue)**            | Managed signup, email verify, password reset, sessions, JWTs     |
-| JWT verification   | PyJWT, **HS256** (project secret)     | We verify only; Supabase signs. Switchable to JWKS later         |
+| JWT verification   | PyJWT — **ES256/RS256 via JWKS**, legacy HS256 | We verify only; Supabase signs. Asymmetric by default, symmetric accepted when `SUPABASE_JWT_SECRET` is set |
 | Cache / realtime   | Redis 7                               | Pub/sub fan-out + device presence (nothing else)                 |
 | Blob storage       | Cloudflare **R2** (S3-compatible)     | Direct presigned PUT/GET; zero egress; MinIO for local dev       |
 | Background jobs    | in-process asyncio + PG advisory lock | Presence sweep + orphan blob cleanup; no Celery/broker           |
 | Email              | Brevo REST (default) or stdlib SMTP   | Sharing invites only; via `BackgroundTasks`                      |
-| KDF (E2E)          | Argon2id (client-side)                | Memory-hard; password → UMK                                      |
+| KDF (E2E)          | Argon2id (client-side)                | Memory-hard; password → key-wrapping key for the random UMK      |
 | Content encryption | AES-256-GCM (client-side)             | AEAD; server stores ciphertext only                              |
 | Key exchange       | X25519 (client-side)                  | Multi-device UMK wrapping + group keys                           |
 
@@ -174,20 +174,22 @@ the public `/internal/healthz`.
 ```
 fastapi, uvicorn[standard], pydantic, pydantic-settings,
 sqlalchemy[asyncio], asyncpg, alembic,
-redis[hiredis], boto3, pyjwt,
+redis[hiredis], boto3, pyjwt[crypto],
 python-multipart, httpx, slowapi, email-validator
 ```
 
-There is **no** `celery`, `python-jose`, `passlib`, or `cryptography` dependency —
-tokens are verified (not signed) with PyJWT, and all cryptography is client-side.
+There is **no** `celery`, `python-jose`, or `passlib` dependency. `cryptography`
+comes in only as `pyjwt[crypto]`, which PyJWT needs to verify Supabase's asymmetric
+(ES256/RS256) tokens — the server verifies tokens it never signs, and every
+content-encryption operation is client-side.
 
 ---
 
 ## 4. Data Models
 
-All IDs are UUID v4. Timestamps are `BIGINT` milliseconds since the Unix epoch (to
-match the Tauri app's `u64`). `client_id` preserves the app's local sequential IDs
-for dedup.
+All server-assigned IDs are UUID v4. Timestamps are `BIGINT` milliseconds since the
+Unix epoch (to match the Tauri app's `u64`). `client_id` is stored as `TEXT` and
+carries the app's own entry ID — itself a UUID v4 — which is what dedup keys on.
 
 ### 4.1 `profiles`
 
@@ -427,6 +429,11 @@ DELETE /api/v1/auth/devices/{device_id}         -- soft-revoke; clears wrapped_u
 
 POST   /api/v1/auth/keys/register               -- requires X-Device-Id
        Body: { identity_pubkey, device_pubkey }  (base64 X25519)
+
+GET    /api/v1/auth/umk/device                  -- requires X-Device-Id
+       Returns: { wrapped_umk }   -- the UMK wrapped for the calling device;
+       the silent session-restore path. 404 when no wrap is stored or the device
+       was revoked, which is what makes revocation cut a device off for real.
 
 POST   /api/v1/auth/devices/{device_id}/key-wrap
        Body: { wrapped_umk }    -- an existing device wraps the UMK for another device
