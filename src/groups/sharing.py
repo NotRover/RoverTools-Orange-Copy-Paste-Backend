@@ -54,6 +54,10 @@ class SessionMember(BaseModel):
     # for this member; None until the member registers keys.
     identity_pubkey: str | None = None
     has_group_key: bool = False
+    # Presence snapshot resolved from Redis at request time: true when any of
+    # this member's devices is connected. Without it clients have no way to
+    # tell who is actually reachable in the session.
+    online: bool = False
 
 
 class SessionOut(BaseModel):
@@ -104,18 +108,20 @@ async def create_invite(db: AsyncSession, user_id: str, share_scope: str) -> Inv
     return InviteResponse(share_group_id=group.id, invite_code=invite_code, expires_at=expires_at)
 
 
-async def list_sessions(db: AsyncSession, user_id: str) -> list[SessionOut]:
+async def list_sessions(db: AsyncSession, redis: Redis, user_id: str) -> list[SessionOut]:
     uid = uuid.UUID(user_id)
     memberships = await db.scalars(select(GroupMembership).where(GroupMembership.user_id == uid))
     sessions: list[SessionOut] = []
     for m in memberships.all():
         g = await db.scalar(select(Group).where(Group.id == m.group_id, Group.group_type == "live_share"))
         if g:
-            sessions.append(await _session_to_out(db, g, m))
+            sessions.append(await _session_to_out(db, redis, g, m))
     return sessions
 
 
-async def _session_to_out(db: AsyncSession, g: Group, my_membership: GroupMembership) -> SessionOut:
+async def _session_to_out(
+    db: AsyncSession, redis: Redis, g: Group, my_membership: GroupMembership
+) -> SessionOut:
     rows = await db.scalars(select(GroupMembership).where(GroupMembership.group_id == g.id))
     members: list[SessionMember] = []
     for m in rows.all():
@@ -128,6 +134,7 @@ async def _session_to_out(db: AsyncSession, g: Group, my_membership: GroupMember
                 scope=m.share_scope,
                 identity_pubkey=profile.identity_pubkey if profile else None,
                 has_group_key=m.wrapped_group_key is not None,
+                online=await rt.user_is_online(redis, str(m.user_id)),
             )
         )
     return SessionOut(
@@ -225,14 +232,16 @@ async def send_invite(
 @router.get("/sessions", response_model=list[SessionOut])
 async def get_sessions(
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
     """List the current user's active Live Share sessions and their members.
 
     Requires: Bearer token + X-Device-Id header.
+    Each member carries an `online` presence snapshot resolved from Redis.
     """
     user_id, _ = current
-    return await list_sessions(db, user_id)
+    return await list_sessions(db, redis, user_id)
 
 
 @router.patch("/sessions/{share_group_id}/scope", status_code=204)
