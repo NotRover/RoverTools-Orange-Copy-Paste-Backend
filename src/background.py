@@ -17,11 +17,14 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Awaitable, cast
 
-from sqlalchemy import select, text
+from sqlalchemy import and_, exists, select, text, update
 
 from src.blobs import s3
 from src.blobs.models import Blob
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from src.database import AsyncSessionLocal, engine
+from src.sync.models import SyncEntry
 from src.redis_client import get_redis_pool
 
 logger = logging.getLogger(__name__)
@@ -31,6 +34,10 @@ _PRESENCE_SWEEP_INTERVAL = 60  # seconds
 _BLOB_CLEANUP_INTERVAL = 3600  # seconds (hourly)
 _LOCK_RETRY_INTERVAL = 30  # seconds between attempts to become the leader
 _ORPHAN_TTL_MS = 3600 * 1000  # unconfirmed blobs older than 1h are orphans
+# A blob is confirmed before the entry that points at it is pushed, and that
+# push can sit in a client's offline queue for days. Only sweep blobs that have
+# been unreferenced for longer than any plausible queue.
+_UNREFERENCED_GRACE_MS = 7 * 24 * 3600 * 1000
 
 
 async def run_maintenance(stop: asyncio.Event) -> None:
@@ -63,6 +70,13 @@ async def _leader_loop(stop: asyncio.Event) -> None:
             logger.exception("presence sweep failed")
 
         if elapsed_since_cleanup >= _BLOB_CLEANUP_INTERVAL:
+            try:
+                # Release first, so anything it frees is collected on the next
+                # pass rather than sitting for another hour.
+                async with AsyncSessionLocal() as db:
+                    await _release_unreferenced_blobs(db)
+            except Exception:
+                logger.exception("unreferenced blob sweep failed")
             try:
                 await _cleanup_orphan_blobs()
             except Exception:
@@ -101,6 +115,35 @@ async def _sweep_presence() -> None:
                 offline += 1
     if offline:
         logger.info("presence sweep: evicted %d stale device(s)", offline)
+
+
+async def _release_unreferenced_blobs(db: AsyncSession) -> None:
+    """Stop charging quota for blobs nothing points at any more.
+
+    The push path releases a blob when its entry is tombstoned or replaced, but
+    that only covers the transitions it can see. A blob also ends up
+    unreferenced when the entry push after a confirmed upload never lands, when
+    an account is deleted, or through any path added later that forgets to
+    release. This is the backstop that makes those cases self-healing instead
+    of permanent: whatever the cause, storage the user cannot reach stops
+    counting against them, and `_cleanup_orphan_blobs` removes the object.
+
+    Deliberately blunt - it asks "does a live entry point at this?" rather than
+    tracking why - because the failure it exists to prevent is the one nobody
+    predicted.
+    """
+    cutoff = int((datetime.now(UTC) - timedelta(milliseconds=_UNREFERENCED_GRACE_MS)).timestamp() * 1000)
+    unreferenced = ~exists().where(and_(SyncEntry.blob_key == Blob.key, SyncEntry.deleted_at.is_(None)))
+    keys = (
+        await db.scalars(
+            select(Blob.key).where(Blob.confirmed.is_(True), Blob.created_at < cutoff, unreferenced)
+        )
+    ).all()
+    if not keys:
+        return
+    await db.execute(update(Blob).where(Blob.key.in_(keys)).values(confirmed=False))
+    await db.commit()
+    logger.info("unreferenced blob sweep: released %d blob(s)", len(keys))
 
 
 async def _cleanup_orphan_blobs() -> None:
