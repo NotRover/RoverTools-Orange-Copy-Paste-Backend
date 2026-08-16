@@ -1,4 +1,3 @@
-import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -17,7 +16,6 @@ from src.sync.schemas import (
     PushRequest,
     PushResponse,
     SyncEntryOut,
-    SyncStatusResponse,
 )
 
 router = APIRouter(prefix="/sync", tags=["sync"])
@@ -33,7 +31,7 @@ async def push(
     """Push local sync entries; returns accepted entries and any conflicts.
 
     Requires: Bearer token + X-Device-Id header.
-    Emits `sync:entry` to the user channel and each entry's group channels.
+    Emits `sync:entry` to the user channel and each entry's space channels.
     """
     user_id, device_id = current
     accepted, conflicts = await service.push_entries(db, user_id, device_id, body.entries)
@@ -43,8 +41,8 @@ async def push(
         entry = await db.scalar(select(SyncEntry).where(SyncEntry.id == acc.server_id))
         if entry:
             payload = SyncEntryOut.model_validate(entry).model_dump(mode="json")
-            group_ids = [str(g) for g in (entry.group_ids or [])]
-            await rt.publish_sync_entry(redis, user_id, device_id, payload, group_ids)
+            space_ids = [str(s) for s in (entry.space_ids or [])]
+            await rt.publish_sync_entry(redis, user_id, device_id, payload, space_ids)
 
     return PushResponse(accepted=accepted, conflicts=conflicts)
 
@@ -80,16 +78,3 @@ async def update_cursor(
     user_id, device_id = current
     await service.update_cursor(db, device_id, user_id, body.last_server_ts)
 
-
-@router.get("/status", response_model=SyncStatusResponse)
-async def sync_status(
-    db: AsyncSession = Depends(get_db),
-    current: tuple[str, str] = Depends(get_current_user_id),
-):
-    """Return the calling device's current sync cursor position.
-
-    Requires: Bearer token + X-Device-Id header.
-    """
-    user_id, device_id = current
-    last_ts = await service.get_cursor(db, device_id)
-    return SyncStatusResponse(device_id=uuid.UUID(device_id), last_server_ts=last_ts)
