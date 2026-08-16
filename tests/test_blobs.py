@@ -123,3 +123,50 @@ async def test_replacing_an_image_releases_the_old_blob(client: AsyncClient, aut
 
     # Only the replacement counts.
     assert await _used_bytes(client, headers) == 2048
+
+
+async def test_sweep_releases_blobs_no_entry_points_at(client: AsyncClient, auth_headers: dict, db):
+    """The backstop: a confirmed blob nothing references stops costing quota.
+
+    The push path releases blobs on the transitions it can see. This covers the
+    ones it cannot - an entry push that never lands after a confirmed upload,
+    an account deletion, or a future path that forgets to release.
+    """
+    from sqlalchemy import text
+
+    from src.background import _release_unreferenced_blobs
+
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    key = await _upload_blob(client, headers, 4096)
+    assert await _used_bytes(client, headers) == 4096
+
+    # Age it past the grace period; the sweep deliberately ignores fresh blobs
+    # so it cannot race an upload whose entry push is still queued.
+    await db.execute(text("UPDATE blobs SET created_at = 0 WHERE key = :k"), {"k": key})
+    await db.commit()
+
+    await _release_unreferenced_blobs(db)
+
+    assert await _used_bytes(client, headers) == 0
+
+
+async def test_sweep_spares_blobs_still_in_use(client: AsyncClient, auth_headers: dict, db):
+    """The other half: a blob a live entry points at must survive the sweep."""
+    from sqlalchemy import text
+
+    from src.background import _release_unreferenced_blobs
+
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    key = await _upload_blob(client, headers, 4096)
+    resp = await client.post(
+        "/api/v1/sync/push",
+        json={"entries": [_image_entry("cid-blob-live", key, ts=1_800_000_000_000)]},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    await db.execute(text("UPDATE blobs SET created_at = 0 WHERE key = :k"), {"k": key})
+    await db.commit()
+
+    await _release_unreferenced_blobs(db)
+
+    assert await _used_bytes(client, headers) == 4096

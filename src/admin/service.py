@@ -10,7 +10,7 @@ from typing import Awaitable, cast
 
 from fastapi import HTTPException, status
 from redis.asyncio import Redis
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import supabase_admin
@@ -162,8 +162,12 @@ async def set_suspended(user_id: uuid.UUID, suspend: bool) -> None:
 
 async def delete_user(db: AsyncSession, user_id: uuid.UUID) -> None:
     """Delete app-side data (profile cascades to devices) and the Supabase user."""
+    # blobs.user_id has no ON DELETE, so the rows have to go first - and their
+    # R2 objects with them, or a deleted account leaves its images in the
+    # bucket forever. Unconfirming hands both jobs to the hourly reaper.
+    await db.execute(update(Blob).where(Blob.user_id == user_id).values(confirmed=False))
     p = await db.scalar(select(Profile).where(Profile.id == user_id))
     if p:
         await db.delete(p)
-        await db.commit()
+    await db.commit()
     await supabase_admin.delete_user(str(user_id))
