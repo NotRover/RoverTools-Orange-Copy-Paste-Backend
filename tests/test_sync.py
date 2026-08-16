@@ -143,14 +143,6 @@ async def test_pull_cursor_pagination(client: AsyncClient, auth_headers: dict):
     assert len(resp2.json()["entries"]) >= 1
 
 
-async def test_sync_status(client: AsyncClient, auth_headers: dict):
-    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
-    resp = await client.get("/api/v1/sync/status", headers=headers)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "device_id" in body
-    assert "last_server_ts" in body
-
 
 async def test_update_cursor(client: AsyncClient, auth_headers: dict):
     headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}

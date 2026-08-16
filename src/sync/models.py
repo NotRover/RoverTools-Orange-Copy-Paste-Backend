@@ -29,8 +29,14 @@ class SyncEntry(Base):
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    # Group membership — server-visible for routing; names are inside encrypted_metadata
-    group_ids: Mapped[list[uuid.UUID]] = mapped_column(ARRAY(PGUUID(as_uuid=True)), nullable=False, server_default="{}")
+    # Space membership — server-visible for routing; names are inside encrypted_metadata
+    space_ids: Mapped[list[uuid.UUID]] = mapped_column(ARRAY(PGUUID(as_uuid=True)), nullable=False, server_default="{}")
+
+    # Per-entry content-key envelope: JSON map of wrapped copies of the CEK —
+    # `"personal"` (wrapped under the owner's UMK) plus one per space id. Content
+    # is encrypted once under the CEK; this map is what lets a single ciphertext
+    # fan out to several spaces. Opaque to the server.
+    wrapped_keys: Mapped[str] = mapped_column(Text, nullable=False, server_default="{}")
 
     # Blob-backed content (images / files)
     blob_key: Mapped[str | None] = mapped_column(Text, nullable=True)

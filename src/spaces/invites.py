@@ -1,10 +1,10 @@
-"""Addressed group invites — the persistent counterpart to bearer invite codes.
+"""Addressed space invites — the persistent counterpart to bearer invite codes.
 
 An invite targets one email, survives the invitee being offline, and gives the
-inviter visibility into its fate. Both pool groups and Live Share sessions use
-it: creating one publishes `invite:received` to the invitee (when their profile
-is known) and sends a best-effort email carrying the group's short code as the
-fallback join path. Accepting joins the group directly by invite id.
+inviter visibility into its fate. Creating one publishes `invite:received` to
+the invitee (when their profile is known) and sends a best-effort email carrying
+the space's short code as the fallback join path. Accepting joins the space
+directly by invite id.
 
 Status lifecycle: pending → accepted | declined (invitee) | revoked (inviter).
 Expiry is judged against `expires_at` at read/accept time rather than by a
@@ -24,8 +24,8 @@ from src import email, realtime as rt
 from src.auth.models import Profile
 from src.database import get_db
 from src.dependencies import get_current_claims, get_current_user_id, get_redis
-from src.groups import service as groups_service
-from src.groups.models import Group, GroupInvite, GroupMembership
+from src.spaces import service as spaces_service
+from src.spaces.models import Space, SpaceInvite, SpaceMembership
 
 _INVITE_TTL_HOURS = 72
 
@@ -43,9 +43,8 @@ class CreateInviteRequest(BaseModel):
 
 class InviteOut(BaseModel):
     id: uuid.UUID
-    group_id: uuid.UUID
-    group_name: str
-    group_type: str
+    space_id: uuid.UUID
+    space_name: str
     inviter_id: uuid.UUID
     inviter_name: str
     invitee_email: str
@@ -62,23 +61,21 @@ class InviteListResponse(BaseModel):
 
 
 class AcceptResponse(BaseModel):
-    group_id: uuid.UUID
+    space_id: uuid.UUID
     name: str
-    group_type: str
 
 
 # ── Service ─────────────────────────────────────────────────────────────
 
 
-async def _invite_to_out(db: AsyncSession, inv: GroupInvite, g: Group | None = None) -> InviteOut:
-    if g is None:
-        g = await db.scalar(select(Group).where(Group.id == inv.group_id))
+async def _invite_to_out(db: AsyncSession, inv: SpaceInvite, s: Space | None = None) -> InviteOut:
+    if s is None:
+        s = await db.scalar(select(Space).where(Space.id == inv.space_id))
     inviter = await db.scalar(select(Profile).where(Profile.id == inv.inviter_id))
     return InviteOut(
         id=inv.id,
-        group_id=inv.group_id,
-        group_name=g.name if g else "",
-        group_type=g.group_type if g else "pool",
+        space_id=inv.space_id,
+        space_name=s.name if s else "",
         inviter_id=inv.inviter_id,
         inviter_name=inviter.display_name if inviter else "",
         invitee_email=inv.invitee_email,
@@ -92,12 +89,12 @@ async def create_invite(
     db: AsyncSession,
     redis: Redis,
     background: BackgroundTasks,
-    group: Group,
+    space: Space,
     inviter_id: str,
     invitee_email: str,
 ) -> InviteOut:
     """Create (or refresh) a pending invite from `inviter_id` to `invitee_email`
-    for `group`, notify the invitee over WS when resolvable, and queue the
+    for `space`, notify the invitee over WS when resolvable, and queue the
     invite email. Callers have already verified the inviter may invite."""
     now = _now_ms()
     normalized = invitee_email.lower()
@@ -109,20 +106,20 @@ async def create_invite(
 
     if invitee:
         already_member = await db.scalar(
-            select(GroupMembership).where(
-                GroupMembership.group_id == group.id, GroupMembership.user_id == invitee.id
+            select(SpaceMembership).where(
+                SpaceMembership.space_id == space.id, SpaceMembership.user_id == invitee.id
             )
         )
         if already_member:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already a member")
 
-    # One live invite per (group, email): refresh the pending row instead of
+    # One live invite per (space, email): refresh the pending row instead of
     # stacking duplicates the invitee would see as repeated notifications.
     invite = await db.scalar(
-        select(GroupInvite).where(
-            GroupInvite.group_id == group.id,
-            GroupInvite.invitee_email == normalized,
-            GroupInvite.status == "pending",
+        select(SpaceInvite).where(
+            SpaceInvite.space_id == space.id,
+            SpaceInvite.invitee_email == normalized,
+            SpaceInvite.status == "pending",
         )
     )
     expires_at = int((datetime.now(UTC) + timedelta(hours=_INVITE_TTL_HOURS)).timestamp() * 1000)
@@ -130,8 +127,8 @@ async def create_invite(
         invite.expires_at = expires_at
         invite.invitee_user_id = invitee.id if invitee else None
     else:
-        invite = GroupInvite(
-            group_id=group.id,
+        invite = SpaceInvite(
+            space_id=space.id,
             inviter_id=inviter_uuid,
             invitee_email=normalized,
             invitee_user_id=invitee.id if invitee else None,
@@ -143,25 +140,25 @@ async def create_invite(
     await db.commit()
     await db.refresh(invite)
 
-    out = await _invite_to_out(db, invite, group)
+    out = await _invite_to_out(db, invite, space)
 
     if invitee:
         await rt.publish_invite_received(redis, str(invitee.id), out.model_dump(mode="json"))
 
     inviter = await db.scalar(select(Profile).where(Profile.id == inviter_uuid))
-    code = groups_service.format_invite_code(group.invite_code or "")
+    code = spaces_service.format_invite_code(space.invite_code or "")
     background.add_task(
         email.send_sharing_invite, normalized, "", inviter.display_name if inviter else "", code
     )
     return out
 
 
-def _is_expired(inv: GroupInvite) -> bool:
+def _is_expired(inv: SpaceInvite) -> bool:
     return inv.expires_at < _now_ms()
 
 
-async def _get_invite_for_invitee(db: AsyncSession, invite_id: uuid.UUID, claims: dict) -> GroupInvite:
-    inv = await db.scalar(select(GroupInvite).where(GroupInvite.id == invite_id))
+async def _get_invite_for_invitee(db: AsyncSession, invite_id: uuid.UUID, claims: dict) -> SpaceInvite:
+    inv = await db.scalar(select(SpaceInvite).where(SpaceInvite.id == invite_id))
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
     uid = uuid.UUID(claims["sub"])
@@ -198,20 +195,20 @@ async def list_invites(
 
     received_rows = (
         await db.scalars(
-            select(GroupInvite).where(
-                GroupInvite.status == "pending",
-                GroupInvite.expires_at > now,
-                (GroupInvite.invitee_user_id == uid)
-                | (GroupInvite.invitee_email == caller_email if caller_email else False),
+            select(SpaceInvite).where(
+                SpaceInvite.status == "pending",
+                SpaceInvite.expires_at > now,
+                (SpaceInvite.invitee_user_id == uid)
+                | (SpaceInvite.invitee_email == caller_email if caller_email else False),
             )
         )
     ).all()
 
     sent_rows = (
         await db.scalars(
-            select(GroupInvite)
-            .where(GroupInvite.inviter_id == uid)
-            .order_by(GroupInvite.created_at.desc())
+            select(SpaceInvite)
+            .where(SpaceInvite.inviter_id == uid)
+            .order_by(SpaceInvite.created_at.desc())
             .limit(50)
         )
     ).all()
@@ -229,46 +226,31 @@ async def accept_invite(
     redis: Redis = Depends(get_redis),
     claims: dict = Depends(get_current_claims),
 ):
-    """Accept an invite addressed to the caller and join its group.
+    """Accept an invite addressed to the caller and join its space.
 
-    Emits the same events as an invite-code join (`sharing:accepted` for
-    live_share, `group:membership_changed` otherwise) plus `invite:updated`
-    to the inviter.
+    Emits the same events as an invite-code join (`space:membership_changed`)
+    plus `invite:updated` to the inviter.
 
     Requires: Bearer token (Supabase JWT).
     """
     inv = await _get_invite_for_invitee(db, invite_id, claims)
     uid = uuid.UUID(claims["sub"])
 
-    g = await db.scalar(select(Group).where(Group.id == inv.group_id))
-    if not g:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group no longer exists")
+    s = await db.scalar(select(Space).where(Space.id == inv.space_id))
+    if not s:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Space no longer exists")
 
-    await groups_service.add_membership(db, g, uid)
+    await spaces_service.add_membership(db, s, uid)
     inv.status = "accepted"
     inv.invitee_user_id = uid
     await db.commit()
 
-    joining_user = await db.scalar(select(Profile).where(Profile.id == uid))
     user_id = str(uid)
-    if g.group_type == "live_share":
-        await rt.publish_sharing_accepted(
-            redis,
-            owner_user_id=str(g.owner_id),
-            share_group_id=str(g.id),
-            new_member={
-                "id": user_id,
-                "display_name": joining_user.display_name if joining_user else "",
-                "identity_pubkey": joining_user.identity_pubkey if joining_user else None,
-            },
-            wrapped_group_key=None,
-        )
-    else:
-        await rt.publish_group_membership_changed(redis, str(g.id), "joined", user_id)
-    await rt.publish_membership_changed_to_user(redis, user_id, str(g.id), "joined")
-    await rt.publish_invite_updated(redis, str(inv.inviter_id), str(inv.id), "accepted", str(g.id))
+    await rt.publish_space_membership_changed(redis, str(s.id), "joined", user_id)
+    await rt.publish_membership_changed_to_user(redis, user_id, str(s.id), "joined")
+    await rt.publish_invite_updated(redis, str(inv.inviter_id), str(inv.id), "accepted", str(s.id))
 
-    return AcceptResponse(group_id=g.id, name=g.name, group_type=g.group_type)
+    return AcceptResponse(space_id=s.id, name=s.name)
 
 
 @router.post("/{invite_id}/decline", status_code=204)
@@ -288,7 +270,7 @@ async def decline_invite(
     inv.status = "declined"
     inv.invitee_user_id = uuid.UUID(claims["sub"])
     await db.commit()
-    await rt.publish_invite_updated(redis, str(inv.inviter_id), str(inv.id), "declined", str(inv.group_id))
+    await rt.publish_invite_updated(redis, str(inv.inviter_id), str(inv.id), "declined", str(inv.space_id))
 
 
 @router.delete("/{invite_id}", status_code=204)
@@ -305,7 +287,7 @@ async def revoke_invite(
     Requires: Bearer token + X-Device-Id header.
     """
     user_id, _ = current
-    inv = await db.scalar(select(GroupInvite).where(GroupInvite.id == invite_id))
+    inv = await db.scalar(select(SpaceInvite).where(SpaceInvite.id == invite_id))
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
     if str(inv.inviter_id) != user_id:
@@ -316,5 +298,5 @@ async def revoke_invite(
     await db.commit()
     if inv.invitee_user_id:
         await rt.publish_invite_updated(
-            redis, str(inv.invitee_user_id), str(inv.id), "revoked", str(inv.group_id)
+            redis, str(inv.invitee_user_id), str(inv.id), "revoked", str(inv.space_id)
         )

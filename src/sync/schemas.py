@@ -19,7 +19,9 @@ class PushEntry(BaseModel):
     deleted_at: int | None = None
     blob_key: str | None = None
     blob_size: int | None = None
-    group_ids: list[uuid.UUID] = Field(default_factory=list)
+    space_ids: list[uuid.UUID] = Field(default_factory=list)
+    # CEK envelope map: {"personal": wrapped, "<space_id>": wrapped, ...}. Opaque.
+    wrapped_keys: str = "{}"
 
 
 class PushRequest(BaseModel):
@@ -59,7 +61,8 @@ class SyncEntryOut(BaseModel):
     server_ts: int
     deleted_at: int | None
     pinned: bool
-    group_ids: list[uuid.UUID]
+    space_ids: list[uuid.UUID]
+    wrapped_keys: str
     blob_key: str | None
     blob_size: int | None
 
@@ -71,13 +74,8 @@ class PullResponse(BaseModel):
     next_cursor: int | None
 
 
-# ── Cursor / Status ───────────────────────────────────────────────────────────
+# ── Cursor ────────────────────────────────────────────────────────────────────
 
 
 class CursorUpdateRequest(BaseModel):
-    last_server_ts: int
-
-
-class SyncStatusResponse(BaseModel):
-    device_id: uuid.UUID
     last_server_ts: int
