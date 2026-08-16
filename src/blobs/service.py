@@ -84,6 +84,26 @@ async def confirm_upload(db: AsyncSession, user_id: str, body: ConfirmUploadBody
     await db.commit()
 
 
+async def release_blob(db: AsyncSession, user_id: str | uuid.UUID, blob_key: str) -> bool:
+    """Drop a blob's last reference, so the hourly reaper can delete it.
+
+    Marking it unconfirmed rather than deleting it here does three things: the
+    quota stops counting it immediately (``_used_bytes`` sums confirmed blobs
+    only), the R2 object is removed by the existing orphan cleanup instead of
+    inside a latency-sensitive push, and a mistake stays recoverable until that
+    sweep runs.
+
+    Returns True when a blob was released. Missing or already-released blobs
+    are not an error - this is called on every image overwrite and delete.
+    """
+    uid = uuid.UUID(str(user_id))
+    blob = await db.scalar(select(Blob).where(Blob.key == blob_key, Blob.user_id == uid))
+    if blob is None or not blob.confirmed:
+        return False
+    blob.confirmed = False
+    return True
+
+
 async def get_download_url(db: AsyncSession, user_id: str, blob_key: str) -> DownloadUrlResponse:
     uid = uuid.UUID(user_id)
     blob = await db.scalar(select(Blob).where(Blob.key == blob_key, Blob.confirmed.is_(True)))

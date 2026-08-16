@@ -5,6 +5,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.blobs import service as blobs_service
 from src.spaces.models import SpaceMembership
 from src.sync.models import SyncCursor, SyncEntry
 from src.sync.schemas import (
@@ -64,6 +65,13 @@ async def _upsert_entry(
         if not incoming_tombstone and entry.updated_at <= existing.updated_at:
             return ConflictEntry(client_id=entry.client_id, reason="stale_update")
 
+        # The row is about to stop pointing at its current blob, either because
+        # this push carries a new one (every image re-push uploads a fresh
+        # object) or because it is a tombstone. Nothing else references it, so
+        # release it - otherwise it occupies the user's quota forever with no
+        # way to reclaim it.
+        superseded_blob = existing.blob_key if existing.blob_key != entry.blob_key else None
+
         existing.encrypted_content = entry.encrypted_content
         existing.encrypted_metadata = entry.encrypted_metadata
         existing.updated_at = entry.updated_at
@@ -74,6 +82,8 @@ async def _upsert_entry(
         existing.blob_size = entry.blob_size
         existing.space_ids = entry.space_ids
         existing.wrapped_keys = entry.wrapped_keys
+        if superseded_blob:
+            await blobs_service.release_blob(db, user_id, superseded_blob)
         await db.commit()
         return AcceptedEntry(client_id=entry.client_id, server_id=existing.id, server_ts=server_ts)
 
