@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.models import Profile
 from src.blobs import s3
 from src.blobs.models import Blob
-from src.groups.models import GroupMembership
+from src.spaces.models import SpaceMembership
 from src.sync.models import SyncEntry
 from src.blobs.schemas import (
     ConfirmUploadBody,
@@ -89,26 +89,26 @@ async def get_download_url(db: AsyncSession, user_id: str, blob_key: str) -> Dow
     blob = await db.scalar(select(Blob).where(Blob.key == blob_key, Blob.confirmed.is_(True)))
     if not blob:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blob not found")
-    if blob.user_id != uid and not await _shares_group_with_blob(db, uid, blob_key):
+    if blob.user_id != uid and not await _shares_space_with_blob(db, uid, blob_key):
         # 404, not 403 — don't confirm the key exists to non-members.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blob not found")
     return DownloadUrlResponse(presigned_get_url=s3.generate_presigned_get(blob_key), expires_in_seconds=3600)
 
 
-async def _shares_group_with_blob(db: AsyncSession, uid: uuid.UUID, blob_key: str) -> bool:
-    """True when some live sync entry carries this blob into a group the caller
+async def _shares_space_with_blob(db: AsyncSession, uid: uuid.UUID, blob_key: str) -> bool:
+    """True when some live sync entry carries this blob into a space the caller
     belongs to. This is what makes shared image entries readable by other
     members — without it, download URLs are owner-only and every shared image
     silently fails to materialize on the receiving side."""
     entry = await db.scalar(
         select(SyncEntry).where(SyncEntry.blob_key == blob_key, SyncEntry.deleted_at.is_(None))
     )
-    if not entry or not entry.group_ids:
+    if not entry or not entry.space_ids:
         return False
     membership = await db.scalar(
-        select(GroupMembership).where(
-            GroupMembership.user_id == uid,
-            GroupMembership.group_id.in_(entry.group_ids),
+        select(SpaceMembership).where(
+            SpaceMembership.user_id == uid,
+            SpaceMembership.space_id.in_(entry.space_ids),
         )
     )
     return membership is not None
