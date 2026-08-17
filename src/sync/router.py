@@ -31,10 +31,20 @@ async def push(
     """Push local sync entries; returns accepted entries and any conflicts.
 
     Requires: Bearer token + X-Device-Id header.
-    Emits `sync:entry` to the user channel and each entry's space channels.
+    Emits `sync:entry` to the user channel and each entry's space channels, and
+    `space:entry_removed` to any space an entry was un-shared from.
     """
     user_id, device_id = current
-    accepted, conflicts = await service.push_entries(db, user_id, device_id, body.entries)
+    accepted, conflicts, withdrawals = await service.push_entries(db, user_id, device_id, body.entries)
+
+    # Un-share carries no fan-out of its own: the push only reaches the spaces
+    # the entry still lists, and pull matches the same array, so members would
+    # keep a withdrawn entry forever.
+    for w in withdrawals:
+        for space_id in w.space_ids:
+            await rt.publish_space_entry_removed(
+                redis, space_id, w.client_id, w.entry_type, user_id, origin_device=device_id
+            )
 
     # Fan-out accepted entries to connected devices via WebSocket
     for acc in accepted:
