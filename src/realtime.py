@@ -162,6 +162,30 @@ async def publish_sync_entry(
 
 
 
+async def publish_space_entry_removed(
+    redis: Redis,
+    space_id: str,
+    client_id: str,
+    entry_type: str,
+    author_id: str,
+    origin_device: str | None = None,
+) -> None:
+    """Tell a space that one of its entries is no longer in it — taken down by
+    the space owner, or un-shared by whoever posted it.
+
+    Pull only matches rows that still carry the space id, so once the id is
+    gone the row is invisible: a member already holding a copy would never
+    learn it was withdrawn.
+    """
+    payload = {
+        "space_id": space_id,
+        "client_id": client_id,
+        "entry_type": entry_type,
+        "author_id": author_id,
+    }
+    await publish(redis, f"space:{space_id}", "space:entry_removed", payload, origin_device=origin_device)
+
+
 async def publish_space_membership_changed(redis: Redis, space_id: str, action: str, affected_user_id: str) -> None:
     payload = {"space_id": space_id, "action": action, "user_id": affected_user_id}
     await publish(redis, f"space:{space_id}", "space:membership_changed", payload)

@@ -1,3 +1,4 @@
+import json
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -16,6 +17,7 @@ from src.spaces.schemas import (
     MemberOut,
     SpaceOut,
 )
+from src.sync.models import SyncEntry
 
 _INVITE_TTL_HOURS = 72
 
@@ -265,3 +267,50 @@ async def distribute_keys(
         if m:
             m.wrapped_space_keys = entry.wrapped_space_keys
     await db.commit()
+
+
+async def remove_entry_from_space(
+    db: AsyncSession, space_id: uuid.UUID, client_id: str, entry_type: str, user_id: str
+) -> str:
+    """Take a shared entry down from a space (owner action). Returns the author's id.
+
+    Moderation, not deletion: the space id and its wrapped copy of the CEK are
+    dropped from the entry, so the space stops carrying it and future members
+    cannot decrypt it. The author's own row survives — they keep their personal
+    copy, which is wrapped under their UMK and unaffected.
+
+    Pull's space arm matches on `space_ids` overlap, so a row that just lost the
+    space is invisible to members from here on. The `space:entry_removed` event
+    is what tells the members already holding a copy to drop it.
+    """
+    uid = uuid.UUID(user_id)
+    s = await db.scalar(select(Space).where(Space.id == space_id))
+    if not s:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Space not found")
+    if s.owner_id != uid:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
+
+    rows = await db.scalars(
+        select(SyncEntry).where(
+            SyncEntry.client_id == client_id,
+            SyncEntry.entry_type == entry_type,
+            SyncEntry.space_ids.overlap([space_id]),
+        )
+    )
+    matched = rows.all()
+    if not matched:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not in this space")
+
+    author_id = str(matched[0].user_id)
+    server_ts = _now_ms()
+    for row in matched:
+        row.space_ids = [sid for sid in row.space_ids if sid != space_id]
+        try:
+            keys = json.loads(row.wrapped_keys or "{}")
+        except json.JSONDecodeError:
+            keys = {}
+        if isinstance(keys, dict) and keys.pop(str(space_id), None) is not None:
+            row.wrapped_keys = json.dumps(keys)
+        row.server_ts = server_ts
+    await db.commit()
+    return author_id

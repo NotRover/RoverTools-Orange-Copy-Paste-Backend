@@ -115,6 +115,31 @@ async def remove_member(
     await rt.publish_membership_changed_to_user(redis, str(member_user_id), str(space_id), "left")
 
 
+@router.delete("/{space_id}/entries/{client_id}", status_code=204)
+async def remove_space_entry(
+    space_id: uuid.UUID,
+    client_id: str,
+    entry_type: str = "clipboard",
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Take a shared entry down from a space (owner action).
+
+    Moderation, not deletion: the space id and its wrapped key copy are dropped
+    from the entry. The author keeps their personal copy.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `space:entry_removed` to the space channel.
+    """
+    user_id, device_id = current
+    author_id = await service.remove_entry_from_space(db, space_id, client_id, entry_type, user_id)
+    # This device already dropped its copy when it issued the call.
+    await rt.publish_space_entry_removed(
+        redis, str(space_id), client_id, entry_type, author_id, origin_device=device_id
+    )
+
+
 @router.delete("/{space_id}", status_code=204)
 async def delete_space(
     space_id: uuid.UUID,

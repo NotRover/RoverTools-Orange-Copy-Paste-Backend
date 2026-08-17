@@ -1,4 +1,5 @@
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import and_, or_, select
@@ -19,6 +20,15 @@ def _now_ms() -> int:
     return int(datetime.now(UTC).timestamp() * 1000)
 
 
+@dataclass(frozen=True)
+class Withdrawal:
+    """One entry, and the spaces it just left. Internal — not a wire schema."""
+
+    client_id: str
+    entry_type: str
+    space_ids: list[str]
+
+
 # ── Push ──────────────────────────────────────────────────────────────────────
 
 
@@ -27,20 +37,35 @@ async def push_entries(
     user_id: str,
     device_id: str,
     entries: list[PushEntry],
-) -> tuple[list[AcceptedEntry], list[ConflictEntry]]:
+) -> tuple[list[AcceptedEntry], list[ConflictEntry], list[Withdrawal]]:
+    """Third return value: entries that left a space in this push.
+
+    Fan-out only reaches the spaces an entry still carries, and pull matches on
+    the same array — so without this, un-sharing is silent and every member
+    keeps their copy forever.
+    """
     accepted: list[AcceptedEntry] = []
     conflicts: list[ConflictEntry] = []
+    withdrawals: list[Withdrawal] = []
     uid = uuid.UUID(user_id)
     did = uuid.UUID(device_id)
 
     for entry in entries:
-        result = await _upsert_entry(db, uid, did, entry)
+        result, dropped = await _upsert_entry(db, uid, did, entry)
         if isinstance(result, AcceptedEntry):
             accepted.append(result)
+            if dropped:
+                withdrawals.append(
+                    Withdrawal(
+                        client_id=entry.client_id,
+                        entry_type=entry.entry_type,
+                        space_ids=[str(s) for s in dropped],
+                    )
+                )
         else:
             conflicts.append(result)
 
-    return accepted, conflicts
+    return accepted, conflicts, withdrawals
 
 
 async def _upsert_entry(
@@ -48,7 +73,7 @@ async def _upsert_entry(
     user_id: uuid.UUID,
     device_id: uuid.UUID,
     entry: PushEntry,
-) -> AcceptedEntry | ConflictEntry:
+) -> tuple[AcceptedEntry | ConflictEntry, list[uuid.UUID]]:
     existing = await db.scalar(
         select(SyncEntry).where(
             SyncEntry.user_id == user_id,
@@ -63,7 +88,11 @@ async def _upsert_entry(
         # Tombstone always wins
         incoming_tombstone = entry.deleted_at is not None and existing.deleted_at is None
         if not incoming_tombstone and entry.updated_at <= existing.updated_at:
-            return ConflictEntry(client_id=entry.client_id, reason="stale_update")
+            return ConflictEntry(client_id=entry.client_id, reason="stale_update"), []
+
+        # Spaces this push takes the entry out of. A tombstone keeps its spaces
+        # so it can fan out as a delete, so this only ever fires on un-share.
+        dropped = [s for s in (existing.space_ids or []) if s not in entry.space_ids]
 
         # The row is about to stop pointing at its current blob, either because
         # this push carries a new one (every image re-push uploads a fresh
@@ -85,7 +114,7 @@ async def _upsert_entry(
         if superseded_blob:
             await blobs_service.release_blob(db, user_id, superseded_blob)
         await db.commit()
-        return AcceptedEntry(client_id=entry.client_id, server_id=existing.id, server_ts=server_ts)
+        return AcceptedEntry(client_id=entry.client_id, server_id=existing.id, server_ts=server_ts), dropped
 
     new_entry = SyncEntry(
         client_id=entry.client_id,
@@ -108,7 +137,7 @@ async def _upsert_entry(
     db.add(new_entry)
     await db.commit()
     await db.refresh(new_entry)
-    return AcceptedEntry(client_id=entry.client_id, server_id=new_entry.id, server_ts=server_ts)
+    return AcceptedEntry(client_id=entry.client_id, server_id=new_entry.id, server_ts=server_ts), []
 
 
 # ── Pull ──────────────────────────────────────────────────────────────────────
