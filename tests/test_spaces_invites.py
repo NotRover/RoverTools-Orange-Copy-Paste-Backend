@@ -387,6 +387,103 @@ async def test_share_history_on_serves_full_history_to_new_members(client: Async
     assert "old-entry" in ids
 
 
+@pytest.mark.asyncio
+async def test_opening_share_history_reaches_members_who_already_joined(client: AsyncClient):
+    """Flipping the policy on must drop the floor for existing members, not just
+    for whoever joins next - they are the ones who were stuck."""
+    owner = await make_user(client, "hist3-owner@example.com")
+    created = await create_space(client, owner, share_history=False)
+    sid = created["space_id"]
+
+    await client.post(
+        "/api/v1/sync/push",
+        json={
+            "entries": [
+                {
+                    "client_id": "walled-off",
+                    "entry_type": "clipboard",
+                    "kind": "text",
+                    "encrypted_content": "ciphertext",
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "space_ids": [sid],
+                    "wrapped_keys": '{"personal": "w", "%s": "w"}' % sid,
+                }
+            ]
+        },
+        headers=clean(owner),
+    )
+
+    member = await make_user(client, "hist3-member@example.com")
+    await client.post("/api/v1/spaces/join", json={"invite_code": created["invite_code"]}, headers=clean(member))
+
+    pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
+    assert all(e["client_id"] != "walled-off" for e in pulled.json()["entries"])
+
+    patched = await client.patch(
+        f"/api/v1/spaces/{sid}", json={"share_history": True}, headers=clean(owner)
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["share_history"] is True
+
+    pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
+    assert "walled-off" in {e["client_id"] for e in pulled.json()["entries"]}
+
+
+@pytest.mark.asyncio
+async def test_only_owner_can_change_share_history(client: AsyncClient):
+    owner = await make_user(client, "hist4-owner@example.com")
+    created = await create_space(client, owner, share_history=False)
+    sid = created["space_id"]
+
+    member = await make_user(client, "hist4-member@example.com")
+    await client.post("/api/v1/spaces/join", json={"invite_code": created["invite_code"]}, headers=clean(member))
+
+    resp = await client.patch(
+        f"/api/v1/spaces/{sid}", json={"share_history": True}, headers=clean(member)
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_closing_share_history_keeps_existing_members_access(client: AsyncClient):
+    """Turning it off is a policy for the next joiner. It must not retroactively
+    wall off someone who could already read the history."""
+    owner = await make_user(client, "hist5-owner@example.com")
+    created = await create_space(client, owner, share_history=True)
+    sid = created["space_id"]
+
+    await client.post(
+        "/api/v1/sync/push",
+        json={
+            "entries": [
+                {
+                    "client_id": "still-visible",
+                    "entry_type": "clipboard",
+                    "kind": "text",
+                    "encrypted_content": "ciphertext",
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "space_ids": [sid],
+                    "wrapped_keys": '{"personal": "w", "%s": "w"}' % sid,
+                }
+            ]
+        },
+        headers=clean(owner),
+    )
+
+    member = await make_user(client, "hist5-member@example.com")
+    await client.post("/api/v1/spaces/join", json={"invite_code": created["invite_code"]}, headers=clean(member))
+
+    resp = await client.patch(
+        f"/api/v1/spaces/{sid}", json={"share_history": False}, headers=clean(owner)
+    )
+    assert resp.status_code == 200, resp.text
+
+    pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
+    assert "still-visible" in {e["client_id"] for e in pulled.json()["entries"]}
+
+
 # ── Multi-space fan-out ────────────────────────────────────────────────
 
 
