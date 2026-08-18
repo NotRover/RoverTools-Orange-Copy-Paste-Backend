@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["realtime"])
 
 PING_INTERVAL = 25  # seconds between server pings
+# Every socket joins this, which is what makes a broadcast one publish instead
+# of one per connected user.
+BROADCAST_CHANNEL = "broadcast:all"
 PRESENCE_TTL = 300  # seconds; refreshed on every client message/pong
 
 
@@ -121,7 +124,7 @@ async def start_listener(redis_url: str) -> None:
     """Long-lived task (started in app lifespan): forward Redis messages to local sockets."""
     redis = from_url(redis_url, decode_responses=True)
     pubsub = redis.pubsub()
-    await pubsub.psubscribe("user:*", "space:*")
+    await pubsub.psubscribe("user:*", "space:*", "broadcast:*")
     try:
         async for message in pubsub.listen():
             if message.get("type") != "pmessage":
@@ -242,6 +245,17 @@ async def publish_user_presence(redis: Redis, space_channels: list[str], user_id
         await publish(redis, channel, "user:presence", {"user_id": user_id, "online": online})
 
 
+async def publish_announcement(redis: Redis, user_id: str | None, announcement: dict) -> None:
+    """Push a server-authored announcement, to one user or to everyone.
+
+    Best-effort by design: this only reaches sockets that are connected right
+    now, and the durable copy is the database row the client pulls on its next
+    refresh.
+    """
+    channel = f"user:{user_id}" if user_id else BROADCAST_CHANNEL
+    await publish(redis, channel, "announcement:new", announcement)
+
+
 async def publish_settings_updated(redis: Redis, user_id: str, updated_at: int) -> None:
     await publish(redis, f"user:{user_id}", "settings:updated", {"updated_at": updated_at})
 
@@ -272,8 +286,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
     await websocket.accept()
 
     async def _resolve_channels() -> list[str]:
-        # Channel list: the user's own channel + every space they belong to.
-        channels = [f"user:{user_id}"]
+        # Channel list: the user's own channel, the broadcast channel, and
+        # every space they belong to.
+        channels = [f"user:{user_id}", BROADCAST_CHANNEL]
         async with AsyncSessionLocal() as db:
             memberships = await db.scalars(
                 select(SpaceMembership).where(SpaceMembership.user_id == uuid.UUID(user_id))

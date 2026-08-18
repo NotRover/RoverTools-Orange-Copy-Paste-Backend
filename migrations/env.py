@@ -8,6 +8,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Import all models so Alembic can detect them
+from src.announcements.models import Announcement  # noqa: F401
 from src.auth.models import Device, Profile  # noqa: F401
 from src.blobs.models import Blob  # noqa: F401
 from src.spaces.models import Space, SpaceInvite, SpaceMembership  # noqa: F401

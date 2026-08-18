@@ -15,6 +15,8 @@ Two routers with deliberately different versioning (see ``src/version.py``):
     - ``PATCH /internal/v1/admin/users/{id}/quota``
     - ``POST  /internal/v1/admin/users/{id}/suspend``
     - ``DELETE /internal/v1/admin/users/{id}``
+    - ``POST  /internal/v1/admin/announcements``       post a message to a user or everyone
+    - ``DELETE /internal/v1/admin/announcements/{id}``
   All require the ``X-Admin-Key`` header.
 
 Set ``ADMIN_API_KEY`` in the environment to enable the admin/metrics/stats
@@ -31,6 +33,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin import service
+from src.announcements import router as announcements_router
+from src.announcements.schemas import AnnouncementCreateResponse
 from src.admin.schemas import (
     HealthResponse,
     QuotaUpdateRequest,
@@ -198,3 +202,26 @@ async def delete_user(user_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
     Requires: ``X-Admin-Key``.
     """
     await service.delete_user(db, user_id)
+
+
+# ── Announcements ──────────────────────────────────────────────────────────────
+#
+# The handlers live in ``src/announcements/router.py`` next to the rest of that
+# domain; only the mounting is here, because posting an announcement is an admin
+# act and belongs behind the admin key.
+
+admin_router.add_api_route(
+    "/admin/announcements",
+    announcements_router.create_announcement,
+    methods=["POST"],
+    response_model=AnnouncementCreateResponse,
+    dependencies=[Depends(require_admin_key)],
+    tags=["admin"],
+)
+admin_router.add_api_route(
+    "/admin/announcements/{announcement_id}",
+    announcements_router.delete_announcement,
+    methods=["DELETE"],
+    dependencies=[Depends(require_admin_key)],
+    tags=["admin"],
+)
