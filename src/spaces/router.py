@@ -147,10 +147,11 @@ async def remove_space_entry(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
-    """Take a shared entry down from a space (owner action).
+    """Take a shared entry down from a space.
 
-    Moderation, not deletion: the space id and its wrapped key copy are dropped
-    from the entry. The author keeps their personal copy.
+    Allowed for the space owner (any entry) and for the member who shared it
+    (their own). Moderation, not deletion: the space id and its wrapped key copy
+    are dropped from the entry. The author keeps their personal copy.
 
     Requires: Bearer token + X-Device-Id header.
     Emits `space:entry_removed` to the space channel.

@@ -597,3 +597,99 @@ async def test_space_member_can_download_shared_blob(client: AsyncClient):
 
     denied = await client.get(f"/api/v1/blobs/{blob_key}/download-url", headers=clean(outsider))
     assert denied.status_code == 404
+
+
+# ── Removing an entry from a space ─────────────────────────────────────
+
+
+async def _push_into_space(client: AsyncClient, headers: dict, sid: str, client_id: str) -> None:
+    resp = await client.post(
+        "/api/v1/sync/push",
+        json={
+            "entries": [
+                {
+                    "client_id": client_id,
+                    "entry_type": "clipboard",
+                    "kind": "text",
+                    "encrypted_content": "ciphertext",
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "space_ids": [sid],
+                    "wrapped_keys": '{"personal": "w", "%s": "w"}' % sid,
+                }
+            ]
+        },
+        headers=clean(headers),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_member_can_remove_their_own_entry_from_a_space(client: AsyncClient):
+    """Unsharing. The member who posted it takes it back out; their personal
+    copy survives, the space stops carrying it."""
+    owner = await make_user(client, "rm1-owner@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+
+    member = await make_user(client, "rm1-member@example.com")
+    await client.post(
+        "/api/v1/spaces/join", json={"invite_code": created["invite_code"]}, headers=clean(member)
+    )
+    await _push_into_space(client, member, sid, "mine")
+
+    resp = await client.delete(
+        f"/api/v1/spaces/{sid}/entries/mine?entry_type=clipboard", headers=clean(member)
+    )
+    assert resp.status_code == 204, resp.text
+
+    # Gone from the space for everyone else...
+    pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(owner))
+    assert all(e["client_id"] != "mine" for e in pulled.json()["entries"])
+
+    # ...but still the author's own row.
+    own = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
+    mine = [e for e in own.json()["entries"] if e["client_id"] == "mine"]
+    assert len(mine) == 1
+    assert mine[0]["space_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_remove_someone_elses_entry(client: AsyncClient):
+    """Only the space owner moderates. A member has no say over what another
+    member shared."""
+    owner = await make_user(client, "rm2-owner@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+
+    author = await make_user(client, "rm2-author@example.com")
+    other = await make_user(client, "rm2-other@example.com")
+    for who in (author, other):
+        await client.post(
+            "/api/v1/spaces/join", json={"invite_code": created["invite_code"]}, headers=clean(who)
+        )
+    await _push_into_space(client, author, sid, "theirs")
+
+    resp = await client.delete(
+        f"/api/v1/spaces/{sid}/entries/theirs?entry_type=clipboard", headers=clean(other)
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_owner_can_remove_a_members_entry(client: AsyncClient):
+    """Moderation still works: the owner takes down anything in their space."""
+    owner = await make_user(client, "rm3-owner@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+
+    member = await make_user(client, "rm3-member@example.com")
+    await client.post(
+        "/api/v1/spaces/join", json={"invite_code": created["invite_code"]}, headers=clean(member)
+    )
+    await _push_into_space(client, member, sid, "posted")
+
+    resp = await client.delete(
+        f"/api/v1/spaces/{sid}/entries/posted?entry_type=clipboard", headers=clean(owner)
+    )
+    assert resp.status_code == 204, resp.text

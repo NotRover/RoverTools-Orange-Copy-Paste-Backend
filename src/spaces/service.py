@@ -320,7 +320,11 @@ async def distribute_keys(
 async def remove_entry_from_space(
     db: AsyncSession, space_id: uuid.UUID, client_id: str, entry_type: str, user_id: str
 ) -> str:
-    """Take a shared entry down from a space (owner action). Returns the author's id.
+    """Take a shared entry down from a space. Returns the author's id.
+
+    Two callers, one effect. The space owner may take down anything in the space
+    (moderation); any member may take down what they themselves shared
+    (unsharing). Nobody else gets to touch it.
 
     Moderation, not deletion: the space id and its wrapped copy of the CEK are
     dropped from the entry, so the space stops carrying it and future members
@@ -335,8 +339,6 @@ async def remove_entry_from_space(
     s = await db.scalar(select(Space).where(Space.id == space_id))
     if not s:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Space not found")
-    if s.owner_id != uid:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
 
     rows = await db.scalars(
         select(SyncEntry).where(
@@ -348,6 +350,17 @@ async def remove_entry_from_space(
     matched = rows.all()
     if not matched:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not in this space")
+
+    # A non-owner may only take down rows they wrote. Narrowing rather than
+    # rejecting outright keeps the owner path untouched: they still clear every
+    # row carrying this client_id, whoever wrote it.
+    if s.owner_id != uid:
+        matched = [row for row in matched if row.user_id == uid]
+        if not matched:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the space owner or the member who shared it can remove this",
+            )
 
     author_id = str(matched[0].user_id)
     server_ts = _now_ms()
