@@ -911,6 +911,9 @@ Server sees: entry type/kind, timestamps, `pinned`, blob keys and sizes, which s
 entry was shared into (`space_ids`), space membership (user ↔ space), space names, invitee
 emails, and public keys.
 
+The one plaintext exception is `announcements` (§ 16) — rows the *server itself*
+wrote, so there was never a plaintext of the user's to protect.
+
 Server never sees: `encrypted_content`, `encrypted_metadata`,
 `user_settings.encrypted_blob`, the UMK, any CEK, or any Space Key. `wrapped_keys` and
 `wrapped_space_keys` pass through as opaque strings — the server stores and echoes them
@@ -928,7 +931,7 @@ presence + publish helpers.
 ### 8.1 Fan-out (horizontally scalable)
 
 Each API process keeps an in-memory hub of its **local** sockets and runs one Redis
-`psubscribe("user:*", "space:*")` listener. A write publishes an event to Redis; every
+`psubscribe("user:*", "space:*", "broadcast:*")` listener. A write publishes an event to Redis; every
 process forwards it to its own local sockets on that channel. No sticky sessions; add
 replicas freely.
 
@@ -1093,9 +1096,10 @@ orange-copy-paste-clipboard-backend/
 │   ├── settings/             # router/service/models/schemas
 │   ├── blobs/                # router/service/models/schemas + s3.py
 │   ├── spaces/               # router/service/models/schemas + invites.py (addressed invites)
+│   ├── announcements/        # router/service/models/schemas (server-authored messages)
 │   └── admin/                # router/service/schemas
-├── migrations/               # Alembic (0001–0011)
-├── tests/                    # conftest + test_auth / test_sync / test_blobs / test_spaces_invites
+├── migrations/               # Alembic (0001–0012)
+├── tests/                    # conftest + test_auth / test_sync / test_blobs / test_spaces_invites / test_announcements
 ├── docker-compose.yml        # api + db + redis (dev)
 ├── Dockerfile
 ├── pyproject.toml
@@ -1194,7 +1198,46 @@ of client-side storage, not a gap to be closed server-side.
 
 ---
 
-## 16. Security Checklist
+## 16. Announcements
+
+The one table holding plaintext, and deliberately: an announcement is the
+*service* talking - a maintenance window, a quota change, a note to one account.
+Nothing in it derives from an entry, a note, or a space name, so there is nothing
+the server would have had to decrypt in order to write it. Anything that *would*
+need decrypting is not an announcement, and belongs in an event the client can
+phrase itself.
+
+One table, addressed or not:
+
+| `user_id` | Means | Published to |
+|-----------|-------|--------------|
+| a uuid | that account only | `user:<id>` |
+| null | everybody | `broadcast:all`, which every socket joins on connect |
+
+Delivery is doubled, because the interesting case is a user who is not looking.
+The row is written first, then pushed over the socket - so a client with nothing
+connected still gets it from `GET /api/v1/announcements`, and one that is
+connected does not wait for its next refresh. The client keys both on
+`announcement:<id>`, making a double delivery a no-op.
+
+**Reads are watermarked, not marked read.** There is no per-user read state here
+- the endpoint answers "what is newer than `since`". That is what lets a client
+dismiss a message without the next refresh resurrecting it: it advances its own
+watermark past whatever it was handed and never asks for that window again. A
+first launch omits `since` and gets the last 30 days, capped at 100 rows newest
+first, so a new device arrives with what is current rather than a changelog.
+
+`expires_at` is the other half of that: a notice about Tuesday's maintenance is
+worse than useless on Friday, and without a stop date every new device would be
+told about every window the service ever had.
+
+Posting is an admin act (`POST /internal/v1/admin/announcements`, `X-Admin-Key`).
+`DELETE` stops the row being served; devices already told keep their copy, since
+this is the server forgetting rather than a recall.
+
+---
+
+## 17. Security Checklist
 
 - [x] All `/api/v1/*` routes (except `/auth/bootstrap`'s own JWT gate) require a valid
       Supabase JWT; `/internal/*` (except `/healthz`) require `X-Admin-Key`.

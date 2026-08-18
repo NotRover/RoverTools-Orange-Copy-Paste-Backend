@@ -13,6 +13,7 @@ from src.admin.router import admin_router, probe_router
 from src.auth.router import router as auth_router
 from src.blobs.router import router as blobs_router
 from src.config import settings
+from src.announcements.router import router as announcements_router
 from src.spaces.invites import router as invites_router
 from src.spaces.router import router as spaces_router
 from src.limiter import limiter
@@ -35,6 +36,8 @@ OPENAPI_TAGS = [
      "with invite codes and per-member Space Key distribution."},
     {"name": "invites", "description": "Addressed space invites: persistent, per-email invitations with accept/decline/"
      "revoke and live `invite:*` notifications — the in-app counterpart to bearer invite codes."},
+    {"name": "announcements", "description": "Server-authored messages to users - the one thing here that is not "
+     "ciphertext, because it is the service's own words. Read by the client's notification centre."},
     {"name": "realtime", "description": "WebSocket `/ws` fan-out of sync/presence/sharing events. Not part of the "
      "OpenAPI HTTP schema; see the API reference doc for the event contract."},
     {"name": "ops", "description": "Unversioned infrastructure probes: `/internal/healthz` (public) and "
@@ -111,6 +114,7 @@ app.include_router(settings_router, prefix=API_PREFIX)
 app.include_router(blobs_router, prefix=API_PREFIX)
 app.include_router(spaces_router, prefix=API_PREFIX)
 app.include_router(invites_router, prefix=API_PREFIX)
+app.include_router(announcements_router, prefix=API_PREFIX)
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 app.include_router(realtime.router)
