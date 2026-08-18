@@ -12,6 +12,14 @@ class CreateSpaceRequest(BaseModel):
     share_history: bool = True
 
 
+class UpdateSpaceRequest(BaseModel):
+    # Owner-only. Turning this ON also drops the floor for members who already
+    # joined, so "share the history" means what it says rather than applying to
+    # future joiners only. Turning it OFF never takes history away from someone
+    # who can already read it - it only changes what the next joiner gets.
+    share_history: bool
+
+
 class CreateSpaceResponse(BaseModel):
     space_id: uuid.UUID
     invite_code: str

@@ -212,6 +212,16 @@ async def publish_space_rekey(redis: Redis, space_id: str, user_id: str, wrapped
     await publish(redis, f"user:{user_id}", "space:rekey", payload)
 
 
+async def publish_space_history_opened(redis: Redis, space_id: str) -> None:
+    """The owner opened this space's back catalogue to everyone.
+
+    Members need this because a pull only asks for entries newer than its
+    cursor: the rows that just became visible are older than that, so nothing
+    would fetch them. The event is what tells a client to go back for them.
+    """
+    await publish(redis, f"space:{space_id}", "space:history_opened", {"space_id": space_id})
+
+
 
 async def publish_user_presence(redis: Redis, space_channels: list[str], user_id: str, online: bool) -> None:
     """Tell a user's spaces that they came online or went fully offline.
