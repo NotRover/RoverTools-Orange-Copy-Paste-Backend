@@ -133,31 +133,40 @@ attachments need it.
 
 ## 5. Apply Database Migrations
 
-**Render applies migrations on every deploy.** `render.yaml` sets
-`preDeployCommand: alembic upgrade head`, which runs once before any traffic
-moves to the new version; a failure aborts the deploy, so the app never boots
-against a schema it does not match. Nothing in the app's *startup* path runs
-migrations - a restarting replica never migrates.
+**On a free instance nothing migrates itself. Run migrations by hand, before
+you deploy the commit that needs them.**
 
-Two things follow from this. A revision reaches the database as soon as its
-commit deploys, so review revisions at merge time. And a destructive revision
-needs no separate approval step to take effect - if one should not run yet, keep
-it out of the deployed branch.
-
-You still run them by hand for the first deploy (the service does not exist yet)
-and any time you want to migrate ahead of a deploy:
+`render.yaml` sets `preDeployCommand: alembic upgrade head`, but that field is
+paid-plan only; on `free` it is locked and silently inert. The deploy still goes
+green, and the new code then answers against a schema missing its tables -
+`relation "..." does not exist`, on a live route. Nothing in the app's startup
+path migrates either, by design.
 
 ```bash
 uv sync
 DATABASE_URL="postgresql+asyncpg://postgres:<pw>@db.<ref>.supabase.co:5432/postgres" uv run alembic upgrade head
 ```
 
-`migrations/env.py` reads `DATABASE_URL` from the environment, overriding
-`alembic.ini`. Confirm where you're pointed before running it — this writes to a
-real database.
+PowerShell has no inline env prefix, so there it is two statements:
 
-To go back to migrating only by hand, comment out `preDeployCommand` in
-`render.yaml`.
+```powershell
+$env:DATABASE_URL = "postgresql+asyncpg://postgres:<pw>@db.<ref>.supabase.co:5432/postgres"
+uv run alembic upgrade head
+```
+
+`migrations/env.py` reads `DATABASE_URL` from the environment and ignores
+`.env`, falling back to the localhost URL in `alembic.ini` when it is unset -
+so an unset variable migrates your own machine, quietly. Check where you point
+before running, and read the applied revision rather than inferring it from a
+green deploy:
+
+```bash
+uv run alembic current
+```
+
+`pytest` cannot catch a missing migration: the harness builds its schema with
+`Base.metadata.create_all`, so a table can exist for every test and still be
+absent from a real database.
 
 ---
 
