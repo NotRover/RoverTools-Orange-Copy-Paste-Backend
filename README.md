@@ -158,11 +158,12 @@ src/
 ├─ settings/            # encrypted per-user settings blob
 ├─ groups/              # pool groups, sharing.py (Live Share), invites.py (addressed invites)
 ├─ blobs/               # presigned upload/download (s3.py), quota accounting
+├─ announcements/       # server-authored messages to users
 └─ admin/               # probes and the versioned management API
 
-migrations/versions/    # Alembic 0001…0010
-tests/                  # pytest: auth, sync, blobs, group invites
-docs/                   # ARCHITECTURE.md, DEPLOY.md
+migrations/versions/    # Alembic 0001…0012
+tests/                  # pytest: auth, sync, blobs, space invites, announcements
+docs/                   # ARCHITECTURE.md, DEPLOY.md, ANNOUNCEMENTS.md
 ```
 
 Routers stay thin — HTTP concerns in the route, logic in the domain service beside it.
@@ -204,5 +205,6 @@ Production runs against Supabase (Postgres + Auth), managed Redis, and Cloudflar
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview, service boundaries, data models, full API and WebSocket event reference. The source of truth for the wire contract.
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — production deployment and ongoing operations.
+- [`docs/ANNOUNCEMENTS.md`](docs/ANNOUNCEMENTS.md) — sending a message to users from the server: the calls, the fields, and how to word one.
 - [`TODO.md`](TODO.md) — planned work and known gaps.
 - Client repo `docs/ARCHITECTURE.md` — how the desktop app consumes this API.

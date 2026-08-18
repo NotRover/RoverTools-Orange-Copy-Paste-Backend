@@ -693,3 +693,108 @@ async def test_owner_can_remove_a_members_entry(client: AsyncClient):
         f"/api/v1/spaces/{sid}/entries/posted?entry_type=clipboard", headers=clean(owner)
     )
     assert resp.status_code == 204, resp.text
+
+
+# ── Authorship: one entry, one author ──────────────────────────────────────────
+#
+# Rows are keyed `(user_id, client_id, entry_type)`, so a member pushing an entry
+# they did not write cannot overwrite the author's row - it inserts a second one
+# carrying the same `client_id`, and both fan out. Clients collapse the two onto
+# one item, so the practical result was the author's text and name being replaced
+# by whoever pushed last (client bug #8). The client refuses to make such a push
+# and refuses to merge one; this is the half that holds when the client does not.
+
+
+async def _push_raw(client: AsyncClient, headers: dict, sid: str | None, client_id: str) -> dict:
+    entry = {
+        "client_id": client_id,
+        "entry_type": "clipboard",
+        "kind": "text",
+        "encrypted_content": "ciphertext",
+        "created_at": 1,
+        "updated_at": 2,
+        "space_ids": [sid] if sid else [],
+    }
+    resp = await client.post("/api/v1/sync/push", json={"entries": [entry]}, headers=clean(headers))
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+@pytest.mark.asyncio
+async def test_a_member_cannot_plant_a_rival_copy_of_someone_elses_entry(client: AsyncClient):
+    owner = await make_user(client, "auth1-owner@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+
+    author = await make_user(client, "auth1-author@example.com")
+    impostor = await make_user(client, "auth1-impostor@example.com")
+    for who in (author, impostor):
+        await client.post(
+            "/api/v1/spaces/join", json={"invite_code": created["invite_code"]}, headers=clean(who)
+        )
+    await _push_into_space(client, author, sid, "shared-note")
+
+    body = await _push_raw(client, impostor, sid, "shared-note")
+    assert body["accepted"] == []
+    assert [c["reason"] for c in body["conflicts"]] == ["not_your_entry"]
+
+    # And nothing reached the space: the owner still pulls exactly one row for
+    # that client_id, the author's.
+    pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(owner))
+    rows = [e for e in pulled.json()["entries"] if e["client_id"] == "shared-note"]
+    assert len(rows) == 1
+    assert rows[0]["user_id"] == author["_user_id"]
+
+
+@pytest.mark.asyncio
+async def test_the_author_can_still_update_their_own_entry(client: AsyncClient):
+    """The guard must not cost the author their own edits."""
+    owner = await make_user(client, "auth2-owner@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+
+    author = await make_user(client, "auth2-author@example.com")
+    await client.post(
+        "/api/v1/spaces/join", json={"invite_code": created["invite_code"]}, headers=clean(author)
+    )
+    await _push_into_space(client, author, sid, "mine-to-edit")
+
+    body = await _push_raw(client, author, sid, "mine-to-edit")
+    assert body["conflicts"] == []
+    assert len(body["accepted"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_same_client_id_outside_a_shared_space_is_left_alone(client: AsyncClient):
+    """One person, two accounts, the same local history: their entries collide by
+    construction and neither impersonates anyone. Only a collision *inside a
+    shared space* is refused."""
+    first = await make_user(client, "auth3-first@example.com")
+    second = await make_user(client, "auth3-second@example.com")
+
+    assert len((await _push_raw(client, first, None, "same-id"))["accepted"]) == 1
+    body = await _push_raw(client, second, None, "same-id")
+    assert body["conflicts"] == []
+    assert len(body["accepted"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_collision_in_a_space_the_pusher_is_not_sharing_into_is_left_alone(
+    client: AsyncClient,
+):
+    """The refusal keys on the spaces the push actually targets, not on the
+    client_id alone - a personal entry cannot impersonate anything."""
+    owner = await make_user(client, "auth4-owner@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+
+    author = await make_user(client, "auth4-author@example.com")
+    await client.post(
+        "/api/v1/spaces/join", json={"invite_code": created["invite_code"]}, headers=clean(author)
+    )
+    await _push_into_space(client, author, sid, "collides")
+
+    outsider = await make_user(client, "auth4-outsider@example.com")
+    body = await _push_raw(client, outsider, None, "collides")
+    assert body["conflicts"] == []
+    assert len(body["accepted"]) == 1
