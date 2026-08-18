@@ -97,9 +97,8 @@ services:
     # Every deploy migrates the database first. Render runs this once, before any
     # traffic moves to the new version, and a non-zero exit aborts the deploy — so
     # the app never boots against a schema it does not match.
-    # Consequence to keep in mind: a destructive revision lands the moment its
-    # commit deploys, so revisions get reviewed before merge, not before deploy.
-    # See docs/DEPLOY.md §5.
+    # Paid instances only: on `free` this is locked and inert, and the deploy
+    # goes green without migrating. Migrate by hand there. See docs/DEPLOY.md §5.
     preDeployCommand: alembic upgrade head
 
   - name: rovertools-clipboard-keyvalue
