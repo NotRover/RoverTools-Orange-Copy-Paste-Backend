@@ -18,6 +18,7 @@ from src.spaces.schemas import (
     JoinRequest,
     JoinResponse,
     SpaceOut,
+    UpdateSpaceRequest,
 )
 
 router = APIRouter(prefix="/spaces", tags=["spaces"])
@@ -64,6 +65,28 @@ async def get_space(
     Requires: Bearer token + X-Device-Id header.
     """
     user_id, _ = current
+    return await service.get_space(db, redis, space_id, user_id)
+
+
+@router.patch("/{space_id}", response_model=SpaceOut)
+async def update_space(
+    space_id: uuid.UUID,
+    body: UpdateSpaceRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Change a space's history policy (owner action).
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `space:history_opened` when the change gave members access to entries
+    from before they joined - their pull cursor is past those rows, so nothing
+    would fetch them otherwise.
+    """
+    user_id, _ = current
+    _, opened = await service.set_share_history(db, space_id, user_id, body)
+    if opened:
+        await rt.publish_space_history_opened(redis, str(space_id))
     return await service.get_space(db, redis, space_id, user_id)
 
 

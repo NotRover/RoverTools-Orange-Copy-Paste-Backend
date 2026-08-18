@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, status
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import realtime as rt
@@ -16,6 +16,7 @@ from src.spaces.schemas import (
     DistributeKeysRequest,
     MemberOut,
     SpaceOut,
+    UpdateSpaceRequest,
 )
 from src.sync.models import SyncEntry
 
@@ -161,6 +162,53 @@ async def _space_to_out(
         members=members,
         my_wrapped_space_keys=my_wrapped,
     )
+
+
+async def set_share_history(
+    db: AsyncSession, space_id: uuid.UUID, requesting_user_id: str, req: UpdateSpaceRequest
+) -> tuple[Space, bool]:
+    """Change a space's history policy. Owner only.
+
+    Returns the space and whether this call opened the back catalogue, which the
+    caller uses to decide whether members need to be told to go and fetch it.
+
+    Turning it on clears every current member's floor as well as setting the
+    policy for future joiners: an owner who says "share the history" means the
+    people already in the space, and they are the only ones who were stuck.
+    Turning it off leaves existing floors alone - a member who can already read
+    the history keeps it, and revoking that is not something a pull filter could
+    enforce anyway once the entries are on their device.
+    """
+    s = await db.scalar(select(Space).where(Space.id == space_id))
+    if not s:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Space not found")
+    if s.owner_id != uuid.UUID(requesting_user_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the owner can change this")
+
+    s.share_history = req.share_history
+    # Whether a floor actually comes off, not whether the flag changed: only then
+    # does anyone have older entries to go and fetch. Read first so the answer is
+    # a plain list rather than a driver-specific row count.
+    floored = []
+    if req.share_history:
+        floored = list(
+            await db.scalars(
+                select(SpaceMembership.user_id).where(
+                    SpaceMembership.space_id == space_id,
+                    SpaceMembership.history_from_ts.is_not(None),
+                )
+            )
+        )
+        if floored:
+            await db.execute(
+                update(SpaceMembership)
+                .where(SpaceMembership.space_id == space_id, SpaceMembership.history_from_ts.is_not(None))
+                .values(history_from_ts=None)
+            )
+    opened = bool(floored)
+    await db.commit()
+    await db.refresh(s)
+    return s, opened
 
 
 async def add_membership(db: AsyncSession, s: Space, uid: uuid.UUID) -> None:
