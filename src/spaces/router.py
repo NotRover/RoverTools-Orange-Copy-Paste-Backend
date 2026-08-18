@@ -160,7 +160,13 @@ async def remove_space_entry(
     author_id = await service.remove_entry_from_space(db, space_id, client_id, entry_type, user_id)
     # This device already dropped its copy when it issued the call.
     await rt.publish_space_entry_removed(
-        redis, str(space_id), client_id, entry_type, author_id, origin_device=device_id
+        redis,
+        str(space_id),
+        client_id,
+        entry_type,
+        author_id,
+        removed_by=user_id,
+        origin_device=device_id,
     )
 
 

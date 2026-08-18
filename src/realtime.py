@@ -168,6 +168,7 @@ async def publish_space_entry_removed(
     client_id: str,
     entry_type: str,
     author_id: str,
+    removed_by: str,
     origin_device: str | None = None,
 ) -> None:
     """Tell a space that one of its entries is no longer in it — taken down by
@@ -176,12 +177,18 @@ async def publish_space_entry_removed(
     Pull only matches rows that still carry the space id, so once the id is
     gone the row is invisible: a member already holding a copy would never
     learn it was withdrawn.
+
+    `removed_by` is what separates the two cases. Without it a member can only
+    guess, and the client guessed "the owner took it down" every time — so an
+    author withdrawing their own post was reported to everyone else as
+    moderation.
     """
     payload = {
         "space_id": space_id,
         "client_id": client_id,
         "entry_type": entry_type,
         "author_id": author_id,
+        "removed_by": removed_by,
     }
     await publish(redis, f"space:{space_id}", "space:entry_removed", payload, origin_device=origin_device)
 
@@ -277,15 +284,18 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
     channels = await _resolve_channels()
     await _register(websocket, device_id, channels)
 
-    # Presence: mark online + set the TTL key the sweeper watches. Resolved
-    # before the write, so "was the user already reachable" isn't answered by
-    # this very connection.
-    was_online = await user_is_online(redis, user_id)
+    # Presence: mark online + set the TTL key the sweeper watches.
+    #
+    # Announced on every connect, not only on the offline→online edge. A socket
+    # that dies without a close leaves its TTL key behind for up to PRESENCE_TTL,
+    # so a client that reconnects inside that window looks like it was never
+    # away and an edge-triggered publish says nothing — leaving every member's
+    # list showing them offline until something else refreshes it. Repeats are
+    # free: the client drops a presence update that changes nothing.
     await cast(Awaitable[int], redis.sadd(devices_set_key(user_id), device_id))
     await redis.set(presence_key(user_id, device_id), "1", ex=PRESENCE_TTL)
     await publish(redis, f"user:{user_id}", "device:online", {"device_id": device_id})
-    if not was_online:
-        await publish_user_presence(redis, _space_channels(channels), user_id, True)
+    await publish_user_presence(redis, _space_channels(channels), user_id, True)
 
     try:
         while True:

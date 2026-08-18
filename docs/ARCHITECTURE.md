@@ -668,6 +668,7 @@ demand (see `resubscribe` below).
 { "event": "device:online",  "payload": { "device_id": "..." } }   // user: channel; own devices
 { "event": "device:offline", "payload": { "device_id": "..." } }
 { "event": "user:presence",  "payload": { "user_id": "...", "online": true } }   // space: channels
+{ "event": "space:entry_removed", "payload": { "space_id": "...", "client_id": "...", "entry_type": "clipboard|note", "author_id": "...", "removed_by": "..." } }
 { "event": "space:membership_changed", "payload": { "space_id": "...", "action": "joined|left|deleted", "user_id": "..." } }
 { "event": "space:rekey",  "payload": { "space_id": "...", "wrapped_space_keys": "[...]" } }
 { "event": "invite:received",      "payload": { ...InviteOut } }
@@ -685,9 +686,17 @@ Routing rules worth knowing when implementing a client:
   `(client_id, entry_type)`.
 - There is no `sync:delete`. A delete arrives as `sync:entry` with `deleted_at` set.
 - `device:online` / `device:offline` are per-device and go only to the user's own
-  channel. `user:presence` is the per-user fact addressed to that user's spaces, and it
-  fires only on the transition (first device connecting, last device leaving), so other
-  members' lists stay current without polling REST.
+  channel. `user:presence` is the per-user fact addressed to that user's spaces, so
+  other members' lists stay current without polling REST. `online: true` is published on
+  **every** connect rather than only on the offline→online edge: a socket that dies
+  without a close leaves its presence key alive for up to `PRESENCE_TTL`, so a client
+  reconnecting inside that window looks like it never left and an edge-triggered publish
+  would say nothing. `online: false` comes from the clean-close path and, for sockets
+  that died without one, from the presence sweeper. Repeats are expected — a client
+  drops an update that changes nothing.
+- `space:entry_removed` carries both `author_id` and `removed_by`. They are equal when
+  the author withdrew their own post and differ when the space owner took it down, and
+  that is the only way a member can tell the two apart.
 - `space:membership_changed` is published to the space channel **and** to the affected
   user's own channel, because the joiner is not on the space channel yet and a removed
   member may already be off it. `action: "deleted"` is published *before* the row is
