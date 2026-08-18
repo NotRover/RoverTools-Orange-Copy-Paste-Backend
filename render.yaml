@@ -94,9 +94,13 @@ services:
       - key: ADMIN_API_KEY
         sync: false
 
-    # Migrations are deliberately NOT applied automatically — see docs/DEPLOY.md.
-    # Uncomment only if you consciously want every deploy to migrate the database:
-    # preDeployCommand: alembic upgrade head
+    # Every deploy migrates the database first. Render runs this once, before any
+    # traffic moves to the new version, and a non-zero exit aborts the deploy — so
+    # the app never boots against a schema it does not match.
+    # Consequence to keep in mind: a destructive revision lands the moment its
+    # commit deploys, so revisions get reviewed before merge, not before deploy.
+    # See docs/DEPLOY.md §5.
+    preDeployCommand: alembic upgrade head
 
   - name: rovertools-clipboard-keyvalue
     type: keyvalue

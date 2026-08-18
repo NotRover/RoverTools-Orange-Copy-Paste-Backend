@@ -133,11 +133,19 @@ attachments need it.
 
 ## 5. Apply Database Migrations
 
-**Migrations are never applied automatically.** Nothing in the app's startup path
-runs them, and `render.yaml` ships with `preDeployCommand` commented out
-deliberately. Applying schema changes is an explicit, reviewed action.
+**Render applies migrations on every deploy.** `render.yaml` sets
+`preDeployCommand: alembic upgrade head`, which runs once before any traffic
+moves to the new version; a failure aborts the deploy, so the app never boots
+against a schema it does not match. Nothing in the app's *startup* path runs
+migrations - a restarting replica never migrates.
 
-Run them from your machine against Supabase, before the first deploy:
+Two things follow from this. A revision reaches the database as soon as its
+commit deploys, so review revisions at merge time. And a destructive revision
+needs no separate approval step to take effect - if one should not run yet, keep
+it out of the deployed branch.
+
+You still run them by hand for the first deploy (the service does not exist yet)
+and any time you want to migrate ahead of a deploy:
 
 ```bash
 uv sync
@@ -148,8 +156,8 @@ DATABASE_URL="postgresql+asyncpg://postgres:<pw>@db.<ref>.supabase.co:5432/postg
 `alembic.ini`. Confirm where you're pointed before running it — this writes to a
 real database.
 
-To let Render migrate on every deploy instead, uncomment `preDeployCommand` in
-`render.yaml`. Only do that if you accept schema changes landing automatically.
+To go back to migrating only by hand, comment out `preDeployCommand` in
+`render.yaml`.
 
 ---
 
@@ -229,10 +237,11 @@ default).
 
 ## 9. Ongoing Operations
 
-**Schema changes.** Author the Alembic revision, review it, then apply it
-explicitly (§5). Deploy the code *after* the migration when the change is
-additive; for destructive changes, plan an expand/contract sequence so the
-running replicas tolerate both shapes.
+**Schema changes.** Author the Alembic revision and review it before merging -
+the deploy applies it (§5). The migration runs before the new code, so an
+additive change is safe as written; for a destructive one, plan an
+expand/contract sequence across two deploys so the replicas still running the
+old code tolerate the new shape.
 
 **Supabase key rotation.** Rotating an asymmetric signing key needs no action —
 the JWKS is re-fetched (cached ~5 minutes). Rotating a *legacy* HS256 secret
