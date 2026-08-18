@@ -43,7 +43,13 @@ async def push(
     for w in withdrawals:
         for space_id in w.space_ids:
             await rt.publish_space_entry_removed(
-                redis, space_id, w.client_id, w.entry_type, user_id, origin_device=device_id
+                redis,
+                space_id,
+                w.client_id,
+                w.entry_type,
+                user_id,
+                removed_by=user_id,
+                origin_device=device_id,
             )
 
     # Fan-out accepted entries to connected devices via WebSocket

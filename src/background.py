@@ -14,16 +14,20 @@ Two jobs:
 import asyncio
 import json
 import logging
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Awaitable, cast
 
+from redis.asyncio import Redis
 from sqlalchemy import and_, exists, select, text, update
 
+from src import realtime as rt
 from src.blobs import s3
 from src.blobs.models import Blob
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database import AsyncSessionLocal, engine
+from src.spaces.models import SpaceMembership
 from src.sync.models import SyncEntry
 from src.redis_client import get_redis_pool
 
@@ -105,6 +109,7 @@ async def _sweep_presence() -> None:
             continue
         uid = parts[1]
         members: set[str] = await cast("Awaitable[set[str]]", redis.smembers(set_key))
+        evicted = False
         for did in members:
             if not await redis.exists(f"presence:{uid}:{did}"):
                 await cast("Awaitable[int]", redis.srem(set_key, did))
@@ -113,8 +118,28 @@ async def _sweep_presence() -> None:
                     json.dumps({"event": "device:offline", "payload": {"device_id": did}}),
                 )
                 offline += 1
+                evicted = True
+        # A socket that died without a close never ran the per-user half of the
+        # goodbye, so the people who can see this user were never told. The
+        # device-level event above only reaches their own channel.
+        if evicted and not await rt.user_is_online(redis, uid):
+            await _announce_user_offline(redis, uid)
     if offline:
         logger.info("presence sweep: evicted %d stale device(s)", offline)
+
+
+async def _announce_user_offline(redis: Redis, user_id: str) -> None:
+    """Tell every space this user belongs to that they are gone."""
+    try:
+        async with AsyncSessionLocal() as db:
+            space_ids = (
+                await db.scalars(
+                    select(SpaceMembership.space_id).where(SpaceMembership.user_id == uuid.UUID(user_id))
+                )
+            ).all()
+    except ValueError:
+        return  # key held something that is not a user id
+    await rt.publish_user_presence(redis, [f"space:{sid}" for sid in space_ids], user_id, False)
 
 
 async def _release_unreferenced_blobs(db: AsyncSession) -> None:
