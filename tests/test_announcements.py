@@ -7,6 +7,7 @@ import pytest
 from httpx import AsyncClient
 
 from src.config import settings
+from tests.conftest import make_token
 
 ADMIN = {"X-Admin-Key": "test-admin-key"}
 
@@ -45,14 +46,17 @@ async def test_broadcast_reaches_a_user(client: AsyncClient, auth_headers: dict)
 
 
 async def test_addressed_announcement_is_not_shared(client: AsyncClient, auth_headers: dict):
-    # Addressed to somebody else: this user must not see it.
-    other = await client.post(
+    # A real second account, not the same token again - addressing one user has
+    # nothing to prove unless somebody else exists to be excluded.
+    other_id = str(uuid.uuid4())
+    boot = await client.post(
         "/api/v1/auth/bootstrap",
         json={"display_name": "Other"},
-        headers={"Authorization": auth_headers["Authorization"]},
+        headers={"Authorization": f"Bearer {make_token(other_id)}"},
     )
-    assert other.status_code == 200
-    await _post(client, title="Just for you", user_id=str(uuid.uuid4()), kind="reminder")
+    assert boot.status_code == 200, boot.text
+
+    await _post(client, title="Just for them", user_id=other_id, kind="reminder")
     assert await _list(client, auth_headers) == []
 
     await _post(client, title="Yours", user_id=auth_headers["_user_id"])

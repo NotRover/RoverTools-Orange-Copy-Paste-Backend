@@ -7,7 +7,6 @@ Auth is Supabase-issued in production; here we mint HS256 tokens with the same
 secret the app verifies against. Redis is replaced by fakeredis.
 """
 
-import asyncio
 import os
 import time
 import uuid
@@ -31,13 +30,6 @@ TEST_DB_URL = os.getenv(
     "postgresql+asyncpg://postgres:postgres@localhost:5432/clipboard_test",
 )
 _TEST_JWT_SECRET = "test-supabase-jwt-secret"
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest.fixture(scope="session", autouse=True)

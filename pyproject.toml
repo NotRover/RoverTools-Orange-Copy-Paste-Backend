@@ -40,4 +40,12 @@ packages = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# The engine fixture is session-scoped and every test binds a connection from
+# it, so fixtures and tests have to share one event loop. pytest-asyncio used to
+# allow that by redefining the `event_loop` fixture; 1.0 removed it, and the
+# replacement is these two settings. Without them the shared engine is created
+# on a loop nothing else runs on, and every database call fails with "another
+# operation is in progress".
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
