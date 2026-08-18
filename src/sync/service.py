@@ -116,6 +116,9 @@ async def _upsert_entry(
         await db.commit()
         return AcceptedEntry(client_id=entry.client_id, server_id=existing.id, server_ts=server_ts), dropped
 
+    if await _belongs_to_someone_else(db, user_id, entry):
+        return ConflictEntry(client_id=entry.client_id, reason="not_your_entry"), []
+
     new_entry = SyncEntry(
         client_id=entry.client_id,
         user_id=user_id,
@@ -138,6 +141,38 @@ async def _upsert_entry(
     await db.commit()
     await db.refresh(new_entry)
     return AcceptedEntry(client_id=entry.client_id, server_id=new_entry.id, server_ts=server_ts), []
+
+
+async def _belongs_to_someone_else(db: AsyncSession, user_id: uuid.UUID, entry: PushEntry) -> bool:
+    """Whether this push would plant a rival copy of somebody else's entry.
+
+    Rows are keyed `(user_id, client_id, entry_type)`, so a push of an entry the
+    caller did not write cannot overwrite the author's row - it inserts a second
+    one carrying the same `client_id`. Both then fan out to the space, and every
+    member has two rows claiming to be the same entry. Clients collapse them onto
+    one item, so the practical result is that the author's text and name are
+    replaced by whoever pushed last (client bug #8).
+
+    Only checked when inserting: an existing row under this account means the
+    caller already owns the entry.
+
+    The space overlap is what keeps this from rejecting honest pushes. Client ids
+    are UUIDv4, so two accounts holding one is not chance - but one *person* with
+    two accounts and the same local history is real, and their entries collide by
+    construction. Nobody is impersonated unless the two rows meet in a space, so
+    that is exactly where this refuses.
+    """
+    if not entry.space_ids:
+        return False
+    rival = await db.scalar(
+        select(SyncEntry.id).where(
+            SyncEntry.client_id == entry.client_id,
+            SyncEntry.entry_type == entry.entry_type,
+            SyncEntry.user_id != user_id,
+            SyncEntry.space_ids.overlap(entry.space_ids),
+        )
+    )
+    return rival is not None
 
 
 # ── Pull ──────────────────────────────────────────────────────────────────────

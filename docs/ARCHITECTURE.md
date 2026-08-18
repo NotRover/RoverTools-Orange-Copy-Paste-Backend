@@ -497,7 +497,7 @@ POST /api/v1/sync/push
              encrypted_metadata?, created_at, updated_at, pinned, deleted_at?,
              blob_key?, blob_size?, space_ids?, wrapped_keys? }] }
      Returns: { accepted: [{ client_id, server_id, server_ts }],
-                conflicts: [{ client_id, reason: 'stale_update' }] }
+                conflicts: [{ client_id, reason: 'stale_update' | 'not_your_entry' }] }
      space_ids  — fan-out targets; default []. wrapped_keys — the CEK envelope as a
      JSON string, default "{}". Both are stored verbatim and never interpreted.
 
@@ -511,6 +511,24 @@ POST /api/v1/sync/cursor        Body: { last_server_ts }
 
 There is no `GET /sync/status` and no delete route: the cursor is client-held (and
 advanced with `POST /sync/cursor`), and a delete is a push with `deleted_at` set.
+
+**`not_your_entry` — one entry, one author.** Rows are keyed
+`(user_id, client_id, entry_type)`, so pushing an entry somebody else wrote does not
+update their row: it inserts a *second* row carrying the same `client_id`, and both
+fan out to the space. Clients collapse the two onto one item, so the practical
+result is the author's text and name replaced by whoever pushed last — a real bug
+that cost attribution outright (client `docs/BUGFIX_HISTORY.md` #8).
+
+So push refuses to insert a row for a `client_id` another account already holds in a
+space this push targets (`_belongs_to_someone_else`). It is the rare rule the server
+*can* enforce without reading anything: it is about which account owns a key, not
+about what the content says. Enforced here rather than only in the client because
+old builds keep running, and every one of them writes through this route.
+
+The space-overlap condition is what keeps it from refusing honest pushes: one person
+with two accounts and the same local history holds colliding `client_id`s by
+construction. Only when both rows land in the same space is one claiming to be the
+other.
 
 ### 5.3 Settings Routes
 
