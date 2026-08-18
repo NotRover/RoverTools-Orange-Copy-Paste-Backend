@@ -1200,6 +1200,10 @@ of client-side storage, not a gap to be closed server-side.
 
 ## 16. Announcements
 
+Operator's guide - how to actually send one, and how to word it:
+[`ANNOUNCEMENTS.md`](ANNOUNCEMENTS.md). Nothing sends one automatically yet; the
+machinery is in place and waiting for a reason to use it.
+
 The one table holding plaintext, and deliberately: an announcement is the
 *service* talking - a maintenance window, a quota change, a note to one account.
 Nothing in it derives from an entry, a note, or a space name, so there is nothing
