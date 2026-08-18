@@ -12,6 +12,9 @@ from src.spaces import invites as invites_module
 from src.spaces import service
 from src.spaces.models import Space
 from src.spaces.schemas import (
+    CommentCountOut,
+    CommentOut,
+    CreateCommentRequest,
     CreateSpaceRequest,
     CreateSpaceResponse,
     DistributeKeysRequest,
@@ -230,3 +233,94 @@ async def distribute_keys(
     await service.distribute_keys(db, space_id, user_id, body)
     for entry in body.wrapped_keyrings:
         await rt.publish_space_rekey(redis, str(space_id), str(entry.user_id), entry.wrapped_space_keys)
+
+
+# ── Comments ──────────────────────────────────────────────────────────────────
+
+
+@router.post("/{space_id}/comments", response_model=CommentOut, status_code=201)
+async def add_space_comment(
+    space_id: uuid.UUID,
+    body: CreateCommentRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Comment on an entry shared into a space. Any member may comment.
+
+    The body arrives encrypted and leaves encrypted: it is stored as given and
+    echoed to the space channel as given, so the fan-out costs no extra fetch
+    and the server learns nothing either way.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `space:comment` (action `created`) to the space channel.
+    """
+    user_id, device_id = current
+    row = await service.add_comment(db, space_id, user_id, body)
+    out = CommentOut.model_validate(row)
+    # The posting device already has it on screen.
+    await rt.publish_space_comment(redis, str(space_id), "created", out.model_dump(mode="json"), device_id)
+    return out
+
+
+@router.get("/{space_id}/comments", response_model=list[CommentOut])
+async def list_space_comments(
+    space_id: uuid.UUID,
+    client_id: str,
+    entry_type: str = "clipboard",
+    db: AsyncSession = Depends(get_db),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """One entry's thread, oldest first.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
+    user_id, _ = current
+    rows = await service.list_comments(db, space_id, user_id, client_id, entry_type)
+    return [CommentOut.model_validate(r) for r in rows]
+
+
+@router.get("/{space_id}/comments/counts", response_model=list[CommentCountOut])
+async def list_space_comment_counts(
+    space_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Comment tallies for every commented-on entry in the space, so a feed can
+    draw its chips in one request instead of one per card.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
+    user_id, _ = current
+    return await service.comment_counts(db, space_id, user_id)
+
+
+@router.delete("/{space_id}/comments/{comment_id}", status_code=204)
+async def delete_space_comment(
+    space_id: uuid.UUID,
+    comment_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Delete a comment: its author, or the space owner as moderator.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `space:comment` (action `deleted`) to the space channel.
+    """
+    user_id, device_id = current
+    row = await service.delete_comment(db, space_id, comment_id, user_id)
+    await rt.publish_space_comment(
+        redis,
+        str(space_id),
+        "deleted",
+        {
+            "id": str(row.id),
+            "space_id": str(row.space_id),
+            "client_id": row.client_id,
+            "entry_type": row.entry_type,
+            "author_id": str(row.author_id),
+            "deleted_by": user_id,
+        },
+        device_id,
+    )
