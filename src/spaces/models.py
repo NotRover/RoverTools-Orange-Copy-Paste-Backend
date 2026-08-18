@@ -2,6 +2,7 @@ import uuid
 
 from sqlalchemy import BigInteger, Boolean, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy import Index
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.database import Base
@@ -72,3 +73,43 @@ class SpaceMembership(Base):
     # `share_history` at join time. NULL = no floor (full history).
     history_from_ts: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     joined_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class SpaceComment(Base):
+    """One comment written by a member on one entry shared into a space.
+
+    Scoped to the space, not to the entry: the same clipboard item can sit in
+    two spaces, and a remark meant for one team should not surface in the other.
+    The entry is addressed the way every other space route addresses it, by
+    `(client_id, entry_type)`, rather than by a foreign key — a `sync_entries`
+    row is per-account, so there is no single row to point at.
+
+    Encrypted the way entries are: the body is sealed under a random per-comment
+    key, and that key is wrapped under the Space Key. The server stores both and
+    can read neither. Mentions are inside the ciphertext, so who was tagged is
+    invisible here too.
+    """
+
+    __tablename__ = "space_comments"
+
+    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    space_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    client_id: Mapped[str] = mapped_column(Text, nullable=False)
+    entry_type: Mapped[str] = mapped_column(String(16), nullable=False)  # 'clipboard' | 'note'
+    author_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
+
+    # E2E encrypted — ciphertext and an opaque wrapped key, never plaintext.
+    encrypted_body: Mapped[str] = mapped_column(Text, nullable=False)
+    # The per-comment content key, wrapped under the Space Key current at write
+    # time. A member who joined after a rekey still holds the older key in their
+    # keyring, so every comment stays readable across rotations.
+    wrapped_key: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+# Threads are read per entry and counted per space, and both go through the
+# space id first, so one composite index serves them together.
+Index("ix_space_comments_thread", SpaceComment.space_id, SpaceComment.client_id, SpaceComment.entry_type)

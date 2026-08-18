@@ -196,6 +196,22 @@ async def publish_space_entry_removed(
     await publish(redis, f"space:{space_id}", "space:entry_removed", payload, origin_device=origin_device)
 
 
+async def publish_space_comment(
+    redis: Redis,
+    space_id: str,
+    action: str,
+    payload: dict,
+    origin_device: str | None = None,
+) -> None:
+    """Fan a comment out to the space it was written in.
+
+    Carries the ciphertext rather than a "go and fetch it" nudge: every member
+    on the channel can already unwrap it, and a thread that is open on screen
+    should fill in without a round trip. `action` is `created` or `deleted`.
+    """
+    await publish(redis, f"space:{space_id}", "space:comment", {"action": action, **payload}, origin_device)
+
+
 async def publish_space_membership_changed(redis: Redis, space_id: str, action: str, affected_user_id: str) -> None:
     payload = {"space_id": space_id, "action": action, "user_id": affected_user_id}
     await publish(redis, f"space:{space_id}", "space:membership_changed", payload)

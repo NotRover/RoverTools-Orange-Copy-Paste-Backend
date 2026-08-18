@@ -5,13 +5,16 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, status
 from redis.asyncio import Redis
-from sqlalchemy import select, update
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import realtime as rt
 from src.auth.models import Profile
-from src.spaces.models import Space, SpaceMembership
+from src.spaces.models import Space, SpaceComment, SpaceMembership
 from src.spaces.schemas import (
+    CommentCountOut,
+    CreateCommentRequest,
     CreateSpaceRequest,
     DistributeKeysRequest,
     MemberOut,
@@ -375,3 +378,133 @@ async def remove_entry_from_space(
         row.server_ts = server_ts
     await db.commit()
     return author_id
+
+
+# ── Comments ──────────────────────────────────────────────────────────────────
+
+
+async def _require_member(db: AsyncSession, space_id: uuid.UUID, uid: uuid.UUID) -> Space:
+    """The gate every comment route shares: the space exists and this user is in it.
+
+    Membership is the whole permission model for reading and writing comments —
+    a space is a room, and everyone in it can talk. Who may *delete* is narrower
+    and lives in `delete_comment`.
+    """
+    s = await db.scalar(select(Space).where(Space.id == space_id))
+    if not s:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Space not found")
+    member = await db.scalar(
+        select(SpaceMembership).where(SpaceMembership.space_id == space_id, SpaceMembership.user_id == uid)
+    )
+    if not member:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member")
+    return s
+
+
+async def add_comment(
+    db: AsyncSession, space_id: uuid.UUID, user_id: str, req: CreateCommentRequest
+) -> SpaceComment:
+    """Post a comment on an entry in a space.
+
+    The entry itself is not checked. A member can hold a copy of something that
+    has since been taken down, and rejecting the comment then would fail the one
+    person who still has the item on screen. An orphaned thread is harmless: it
+    is only ever read by asking for that entry's comments.
+    """
+    uid = uuid.UUID(user_id)
+    await _require_member(db, space_id, uid)
+
+    row = SpaceComment(
+        space_id=space_id,
+        client_id=req.client_id,
+        entry_type=req.entry_type,
+        author_id=uid,
+        encrypted_body=req.encrypted_body,
+        wrapped_key=req.wrapped_key,
+        created_at=_now_ms(),
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def list_comments(
+    db: AsyncSession, space_id: uuid.UUID, user_id: str, client_id: str, entry_type: str
+) -> list[SpaceComment]:
+    """One entry's thread, oldest first — the order it is read in."""
+    uid = uuid.UUID(user_id)
+    await _require_member(db, space_id, uid)
+    rows = await db.scalars(
+        select(SpaceComment)
+        .where(
+            SpaceComment.space_id == space_id,
+            SpaceComment.client_id == client_id,
+            SpaceComment.entry_type == entry_type,
+        )
+        .order_by(SpaceComment.created_at)
+    )
+    return list(rows.all())
+
+
+async def comment_counts(db: AsyncSession, space_id: uuid.UUID, user_id: str) -> list[CommentCountOut]:
+    """Every commented-on entry in the space, with its tally and newest comment.
+
+    One request per space rather than one per card: a feed of a hundred items
+    would otherwise open a hundred threads just to draw the chips.
+    """
+    uid = uuid.UUID(user_id)
+    await _require_member(db, space_id, uid)
+    rows = await db.execute(
+        select(
+            SpaceComment.client_id,
+            SpaceComment.entry_type,
+            func.count().label("n"),
+            func.max(SpaceComment.created_at).label("latest"),
+        )
+        .where(SpaceComment.space_id == space_id)
+        .group_by(SpaceComment.client_id, SpaceComment.entry_type)
+    )
+    return [
+        CommentCountOut(client_id=cid, entry_type=et, count=n, latest_at=latest)
+        for cid, et, n, latest in rows.all()
+    ]
+
+
+async def delete_comment(
+    db: AsyncSession, space_id: uuid.UUID, comment_id: uuid.UUID, user_id: str
+) -> SpaceComment:
+    """Delete a comment. Returns the row as it was, for the fan-out event.
+
+    Same two callers as taking an entry down: its author, and the space owner as
+    moderator. A hard delete rather than a tombstone — comments are never stored
+    locally, so a client that was offline simply never sees it again.
+    """
+    uid = uuid.UUID(user_id)
+    s = await _require_member(db, space_id, uid)
+
+    row = await db.scalar(
+        select(SpaceComment).where(SpaceComment.id == comment_id, SpaceComment.space_id == space_id)
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found")
+    if row.author_id != uid and s.owner_id != uid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the space owner or the member who wrote it can delete this comment",
+        )
+
+    # Detached copy: the caller needs the fields after the row is gone.
+    snapshot = SpaceComment(
+        id=row.id,
+        space_id=row.space_id,
+        client_id=row.client_id,
+        entry_type=row.entry_type,
+        author_id=row.author_id,
+        encrypted_body=row.encrypted_body,
+        wrapped_key=row.wrapped_key,
+        created_at=row.created_at,
+    )
+    await db.execute(sa_delete(SpaceComment).where(SpaceComment.id == comment_id))
+    await db.commit()
+    return snapshot

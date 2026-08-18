@@ -1,4 +1,5 @@
 import uuid
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -89,3 +90,45 @@ class WrappedKeyringEntry(BaseModel):
 
 class DistributeKeysRequest(BaseModel):
     wrapped_keyrings: list[WrappedKeyringEntry]
+
+
+# ── Comments ──────────────────────────────────────────────────────────────────
+
+
+class CreateCommentRequest(BaseModel):
+    # The entry being commented on, addressed the way every space route
+    # addresses one.
+    client_id: str = Field(min_length=1, max_length=128)
+    entry_type: Literal["clipboard", "note"] = "clipboard"
+    # Sealed under a random per-comment key; the server never sees the text or
+    # who was mentioned in it.
+    encrypted_body: str = Field(min_length=1, max_length=16384)
+    # That key, X25519-wrapped under the Space Key. Opaque to the server.
+    wrapped_key: str = Field(min_length=1, max_length=1024)
+
+
+class CommentOut(BaseModel):
+    id: uuid.UUID
+    space_id: uuid.UUID
+    client_id: str
+    entry_type: str
+    author_id: uuid.UUID
+    encrypted_body: str
+    wrapped_key: str
+    created_at: int
+
+    model_config = {"from_attributes": True}
+
+
+class CommentCountOut(BaseModel):
+    """One entry's comment tally, for the chips on the feed.
+
+    `latest_at` is what lets a client show an unread marker without pulling
+    every thread: it compares the newest comment against the last time this
+    device opened that entry.
+    """
+
+    client_id: str
+    entry_type: str
+    count: int
+    latest_at: int
