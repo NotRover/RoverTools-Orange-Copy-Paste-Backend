@@ -34,6 +34,12 @@ class Profile(Base):
     # None until first setup; the client unwraps it on login. Decouples the key from
     # the password so a password change only re-wraps this blob.
     pw_wrapped_umk: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The same UMK wrapped under a key derived from a recovery code the user
+    # holds. Password-independent, so it is the only way back in on a machine
+    # that has never signed in. Same kdf_salt as above, distinct AAD. Opaque
+    # here: the server holds a blob it cannot open, and no server-decryptable
+    # recovery path exists - that would end the end-to-end guarantee.
+    recovery_wrapped_umk: Mapped[str | None] = mapped_column(Text, nullable=True)
     blob_bytes_quota: Mapped[int] = mapped_column(BigInteger, nullable=False, default=52_428_800)  # 50 MB
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

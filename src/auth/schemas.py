@@ -22,11 +22,21 @@ class BootstrapResponse(BaseModel):
     # stores it via PUT /auth/umk. On return, the client unwraps this to recover
     # the key; a GCM auth failure means the wrong password was entered.
     wrapped_umk: str | None = None
+    # Whether the account has a recovery envelope, and the blob itself. None
+    # means no recovery code has been saved - the client asks the user to save
+    # one at sign-in, because without it a forgotten password is unrecoverable
+    # on any machine that has not registered.
+    recovery_wrapped_umk: str | None = None
 
 
 class SetWrappedUmkRequest(BaseModel):
     # base64 AES-GCM envelope: the random UMK wrapped under the password-derived key.
     wrapped_umk: str = Field(max_length=512)
+
+
+class SetRecoveryUmkRequest(BaseModel):
+    # base64 AES-GCM envelope: the same UMK wrapped under the recovery-code key.
+    recovery_wrapped_umk: str = Field(max_length=512)
 
 
 # ── Device registration ─────────────────────────────────────────────────────────

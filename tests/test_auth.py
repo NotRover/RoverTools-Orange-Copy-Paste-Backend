@@ -32,6 +32,47 @@ async def test_bootstrap_is_idempotent_and_salt_stable(client: AsyncClient):
     assert first.json()["kdf_salt"] == second.json()["kdf_salt"]
 
 
+async def test_recovery_envelope_round_trips_and_starts_absent(client: AsyncClient):
+    """The client keys the forced save-your-code panel on this being null."""
+    token = make_token(str(uuid.uuid4()))
+    headers = {"Authorization": f"Bearer {token}"}
+    first = await client.post("/api/v1/auth/bootstrap", json={}, headers=headers)
+    assert first.json()["recovery_wrapped_umk"] is None
+
+    stored = await client.put(
+        "/api/v1/auth/umk/recovery",
+        json={"recovery_wrapped_umk": "recovery-envelope-blob"},
+        headers=headers,
+    )
+    assert stored.status_code == 204
+
+    again = await client.post("/api/v1/auth/bootstrap", json={}, headers=headers)
+    assert again.json()["recovery_wrapped_umk"] == "recovery-envelope-blob"
+
+
+async def test_regenerating_replaces_the_previous_recovery_envelope(client: AsyncClient):
+    """One code is live at a time - a regenerated code must revoke the old one."""
+    token = make_token(str(uuid.uuid4()))
+    headers = {"Authorization": f"Bearer {token}"}
+    await client.post("/api/v1/auth/bootstrap", json={}, headers=headers)
+    for blob in ("first", "second"):
+        resp = await client.put(
+            "/api/v1/auth/umk/recovery",
+            json={"recovery_wrapped_umk": blob},
+            headers=headers,
+        )
+        assert resp.status_code == 204
+    boot = await client.post("/api/v1/auth/bootstrap", json={}, headers=headers)
+    assert boot.json()["recovery_wrapped_umk"] == "second"
+
+
+async def test_recovery_envelope_requires_a_token(client: AsyncClient):
+    resp = await client.put(
+        "/api/v1/auth/umk/recovery", json={"recovery_wrapped_umk": "blob"}
+    )
+    assert resp.status_code in (401, 403)
+
+
 # ── Devices ─────────────────────────────────────────────────────────────────────
 
 

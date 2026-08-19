@@ -87,7 +87,13 @@ handled by **Supabase Auth** — the client talks to Supabase directly. This mod
 owns only what the app itself must store:
 
 - **Profile bootstrap** — get-or-create the app profile for a Supabase user and
-  return the KDF salt + wrapped-UMK envelope the client unwraps to recover its key.
+  return the KDF salt + both UMK envelopes the client can unwrap to recover its key.
+- **Recovery envelope** — the same UMK wrapped a second time, under a key derived
+  from a recovery code the user holds instead of a password they remember. Same
+  `kdf_salt` as the password envelope, distinct AAD (`umk-recovery-v1` against
+  `umk-envelope-v1`), so the two can never be mistaken for one another. The server
+  holds an opaque blob it cannot open, exactly like `pw_wrapped_umk`; there is no
+  server-decryptable recovery path and there must never be one.
 - **Device registration** — each install registers a device row (carries the device
   public key and, later, the wrapped UMK); returns a `device_id` the client sends
   back as `X-Device-Id`.
@@ -271,6 +277,7 @@ CREATE TABLE profiles (
     kdf_salt         TEXT NOT NULL,               -- base64; Argon2id salt for the wrapping key
     identity_pubkey  TEXT,                        -- base64 X25519 public key (E2E)
     pw_wrapped_umk   TEXT,                        -- base64; random UMK wrapped under the KEK
+    recovery_wrapped_umk TEXT,                    -- base64; the same UMK wrapped under the recovery code
     blob_bytes_quota BIGINT NOT NULL DEFAULT 52428800,  -- 50 MB
     created_at       BIGINT NOT NULL,
     updated_at       BIGINT NOT NULL
@@ -512,15 +519,21 @@ Source of truth: `src/version.py` (`API_VERSION`, `SERVICE_VERSION`).
 ```
 POST   /api/v1/auth/bootstrap
        Body: { display_name? }
-       Returns: { user_id, kdf_salt, display_name, wrapped_umk? }
+       Returns: { user_id, kdf_salt, display_name, wrapped_umk?, recovery_wrapped_umk? }
        Idempotent: creates the profile on first call, generates the stable KDF salt,
-       and returns it plus the wrapped-UMK envelope (null on a brand-new account).
-       Call right after Supabase login.
+       and returns it plus both envelopes (null on a brand-new account).
+       Call right after Supabase login. A null recovery_wrapped_umk is what makes
+       the client ask the user to save a recovery code.
 
 PUT    /api/v1/auth/umk
        Body: { wrapped_umk }     -- random UMK wrapped under the password-derived key
        Stores the envelope on first setup (and on password change). Server holds only
        the wrapped blob, never the key.
+
+PUT    /api/v1/auth/umk/recovery
+       Body: { recovery_wrapped_umk }   -- the same UMK wrapped under the recovery code
+       Replacing it revokes the previous recovery code, which is what regenerating
+       one does. One code is live at a time.
 
 POST   /api/v1/auth/devices
        Body: { device_name?, platform?, app_version?, device_pubkey? }
@@ -894,9 +907,38 @@ UMK          = AES-256-GCM-open(KEK, wrapped_umk)   -- recovered on login
   the KEK from the entered password, and unwraps. A GCM auth failure = wrong password.
 
 Decoupling the key from the password means a **password change only re-wraps the
-UMK** (one `PUT /auth/umk`) instead of re-encrypting all data — and the same random
-UMK can later be wrapped additional ways (per-device transfer, recovery code) without
-re-keying. The server holds only the wrapped envelope; the UMK lives in memory only.
+UMK** (one `PUT /auth/umk`) instead of re-encrypting all data. The server holds only
+the wrapped envelope; the UMK lives in memory only.
+
+The same random UMK is wrapped three ways, which is what makes it recoverable
+without ever being recoverable *by the server*:
+
+| Envelope | Wrapped under | AAD | Stored |
+|---|---|---|---|
+| Password | `Argon2id(password, kdf_salt)` | `umk-envelope-v1` | `profiles.pw_wrapped_umk` |
+| Recovery code | `Argon2id(recovery_code, kdf_salt)` | `umk-recovery-v1` | `profiles.recovery_wrapped_umk` |
+| Per device | `x25519(device_priv, device_pub)` | key-wrap, no AAD | `devices.wrapped_umk` |
+
+The first two are account-wide and open on any machine; the third is local to one
+install and needs nothing typed. The recovery and password envelopes share
+`kdf_salt` deliberately - same salt, different secret - and the distinct AADs are
+what stop one being fed to the other.
+
+#### Recovery ladder
+
+What a client tries, cheapest first, when it needs the UMK:
+
+| Step | Needs | Prompt |
+|---|---|---|
+| In memory | already signed in | none |
+| Device wrap | this machine's keychain key | none, silent |
+| Password envelope | the password | normal sign-in |
+| Recovery envelope | the recovery code | only when the above cannot be used |
+| Start over | nothing | explicit, and says plainly that older synced items become unreadable |
+
+**Hard boundary:** every step above needs a secret the user holds. A recovery path
+that needs none means the server can decrypt, which ends the end-to-end guarantee.
+That option does not exist here and must not be added.
 
 ### 7.2 Content Encryption — the per-entry CEK envelope
 
