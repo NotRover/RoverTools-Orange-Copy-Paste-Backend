@@ -535,6 +535,10 @@ PUT    /api/v1/auth/umk/recovery
        Replacing it revokes the previous recovery code, which is what regenerating
        one does. One code is live at a time.
 
+DELETE /api/v1/auth/umk/recovery
+       Drops the envelope. An account that starts over with a fresh UMK must clear
+       it, or the old code would hand a recovering client a dead key. Idempotent.
+
 POST   /api/v1/auth/devices
        Body: { device_name?, platform?, app_version?, device_pubkey? }
        Returns: 201 { device_id }     -- store and send back as X-Device-Id
