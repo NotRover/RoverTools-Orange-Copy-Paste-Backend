@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     # ── App ─────────────────────────────────────────────────────────────────────
     app_env: str = "development"
     app_cors_origins: str = "tauri://localhost,http://localhost:1420"
+    # Origin the human-facing pages are reached at, and the base of every link
+    # this service puts in front of a person (space invites, the password-reset
+    # redirect). Single source, so pointing a domain at the deployment is an env
+    # change rather than a code change. No trailing slash.
+    public_base_url: str = "https://rovertools-smart-clipboard-app-backend.onrender.com"
     # Default per-user blob quota. Configurable globally here and per-user via the admin API.
     default_blob_quota_bytes: int = 52_428_800  # 50 MB
 

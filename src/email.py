@@ -1,7 +1,7 @@
 """Transactional email — sharing invites only.
 
 Account emails (verification, password reset) are sent by Supabase Auth. The one
-message the app sends itself is the Live Share invite. Provider is chosen by the
+message the app sends itself is the space invite. Provider is chosen by the
 `EMAIL_PROVIDER` setting; both send paths are synchronous and are meant to run
 via FastAPI `BackgroundTasks` (which executes them in a threadpool).
 """
@@ -10,10 +10,12 @@ import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape
 
 import httpx
 
 from src.config import settings
+from src.web import router as web
 
 logger = logging.getLogger(__name__)
 
@@ -83,24 +85,30 @@ def send_sharing_invite(
     invitee_name: str,
     from_name: str,
     invite_code: str,
-    app_url: str = "orange://join",
 ) -> None:
-    """Best-effort delivery — logs and swallows failures so a background send
-    never surfaces as a request error to the inviter."""
-    subject = f"{from_name or 'Someone'} invited you to Orange Clipboard Live Share"
-    join_url = f"{app_url}?code={invite_code}"
+    """Best-effort delivery - logs and swallows failures so a background send
+    never surfaces as a request error to the inviter.
+
+    The link is https rather than `orange://`: mail clients strip or refuse to
+    linkify a custom scheme, so the one thing the recipient is meant to click was
+    often not clickable at all. The page it lands on hands the invite to the app.
+    """
+    subject = f"{from_name or 'Someone'} invited you to a space in Orange Copy Paste"
+    join_url = web.join_url(invite_code)
+    invitee = escape(invitee_name) or "there"
+    inviter = escape(from_name) or "A user"
+    code = escape(invite_code)
     html = f"""
-<p>Hi {invitee_name or "there"},</p>
-<p><strong>{from_name or "A user"}</strong> invited you to join their Orange Clipboard Live Share session.</p>
-<p>Open the app and enter this code, or use the link below:</p>
-<p><a href="{join_url}">{join_url}</a></p>
-<p>Invite code: <strong>{invite_code}</strong></p>
+<p>Hi {invitee},</p>
+<p><strong>{inviter}</strong> invited you to a space in Orange Copy Paste, where clipboard items and notes are shared end to end encrypted.</p>
+<p><a href="{join_url}">Join the space</a></p>
+<p>Or open the app and enter this code: <strong>{code}</strong></p>
 <p>This invite expires in 24 hours.</p>
-<p>Orange Clipboard</p>
+<p>Orange Copy Paste</p>
 """
     text = (
         f"Hi {invitee_name or 'there'},\n\n"
-        f"{from_name or 'A user'} invited you to their Orange Clipboard Live Share session.\n\n"
+        f"{from_name or 'A user'} invited you to a space in Orange Copy Paste.\n\n"
         f"Join: {join_url}\nInvite code: {invite_code}\n\nThis invite expires in 24 hours.\n"
     )
     try:

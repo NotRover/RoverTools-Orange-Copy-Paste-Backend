@@ -184,6 +184,40 @@ the public `/internal/healthz`.
   to the Supabase Admin API (`src/supabase_admin.py`); those calls require
   `SUPABASE_SERVICE_ROLE_KEY`.
 
+### 2.8 Web pages (`src/web/`)
+
+The only HTML this service serves. Two links have to survive being pasted into an
+email or a chat window, where an `orange://` URL is stripped or silently ignored:
+
+- `GET /join/{code}` - a space invite. Shows the code, hands it to the app as
+  `orange://join?code=<code>`, and links the latest release when the app is not
+  installed.
+- `GET /reset` - where the Supabase recovery mail lands. Carries `?code=` across to
+  the app as `orange://reset?code=<code>`.
+
+Four decisions worth keeping:
+
+- **Unversioned**, alongside the infra probes (see section 5.0). `version.py` versions
+  the product API because the desktop app negotiates a contract with it; a URL a
+  person clicks in an email cannot be re-versioned without breaking every link
+  already sent.
+- **No database call.** `/join` validates the code's shape only
+  (`spaces.service.normalize_invite_code`). The service cold-starts on the free tier
+  and the page must paint on the first response; a lookup would also confirm to
+  anyone whether a given code exists.
+- **CSP carve-out.** The global header is `default-src 'none'; connect-src 'self'`,
+  which would blank a self-contained page, so `middleware.py` sets it with
+  `setdefault` and these routes set their own: inline style and script allowed,
+  everything remote still denied. The header is now overridable, never absent.
+- **HTML lives in `templates/*.html`**, read once at import and rendered by
+  replacing `__PLACEHOLDER__` tokens - no Jinja2 dependency, and the pages stay
+  openable and diffable as pages. Every interpolated value goes through
+  `html.escape`.
+
+`settings.public_base_url` is the single source for every link this service hands
+out, and `web.join_url()` the single builder. Pointing a domain at the service is an
+env change.
+
 ---
 
 ## 3. Tech Stack
@@ -757,6 +791,16 @@ Routing rules worth knowing when implementing a client:
 the presence TTL), and `{ "event": "resubscribe" }` — re-resolves the socket's
 channel set after a membership change, so space fan-out starts (or stops)
 without a reconnect.
+
+### 5.9 Web Page Routes (unversioned, no auth)
+
+```
+GET /join/{code}          HTML - space invite landing page
+GET /reset?code=<code>    HTML - password-reset landing page
+```
+
+Both answer 200 for any well-formed input, set their own Content-Security-Policy,
+and are excluded from OpenAPI. See section 2.8.
 
 ---
 
