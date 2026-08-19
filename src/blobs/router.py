@@ -6,6 +6,7 @@ from src.blobs.schemas import (
     ConfirmUploadBody,
     DownloadUrlResponse,
     QuotaResponse,
+    ReleaseUploadBody,
     RequestUploadBody,
     RequestUploadResponse,
 )
@@ -41,6 +42,23 @@ async def confirm_upload(
     """
     user_id, _ = current
     await service.confirm_upload(db, user_id, body)
+
+
+@router.post("/release", status_code=204)
+async def release_upload(
+    body: ReleaseUploadBody,
+    db: AsyncSession = Depends(get_db),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Give back an upload whose entry never reached the server.
+
+    409 while a live entry still references the blob. Declared before the
+    catch-all download route so `/release` is not read as a blob key.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
+    user_id, _ = current
+    await service.release_upload(db, user_id, body)
 
 
 @router.get("/{blob_key:path}/download-url", response_model=DownloadUrlResponse)

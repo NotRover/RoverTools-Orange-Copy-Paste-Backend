@@ -176,3 +176,72 @@ async def test_sweep_spares_blobs_still_in_use(client: AsyncClient, auth_headers
     await _release_unreferenced_blobs(db)
 
     assert await _used_bytes(client, headers) == 4096
+
+
+async def test_releasing_an_upload_whose_entry_never_landed_frees_the_quota(
+    client: AsyncClient, auth_headers: dict
+):
+    """The compensating action for a push that ended without a row.
+
+    Confirming an upload starts the meter; nothing else stops it until the
+    7-day sweep, which is meant for a queued push that may still arrive.
+    """
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    key = await _upload_blob(client, headers, 4096)
+
+    resp = await client.get("/api/v1/blobs/quota", headers=headers)
+    assert resp.json()["used_bytes"] == 4096
+
+    resp = await client.post("/api/v1/blobs/release", headers=headers, json={"blob_key": key})
+    assert resp.status_code == 204
+
+    resp = await client.get("/api/v1/blobs/quota", headers=headers)
+    assert resp.json()["used_bytes"] == 0
+
+    # Idempotent: a retry after a dropped response must not be an error.
+    resp = await client.post("/api/v1/blobs/release", headers=headers, json={"blob_key": key})
+    assert resp.status_code == 204
+
+
+async def test_releasing_a_blob_a_live_entry_uses_is_refused(client: AsyncClient, auth_headers: dict):
+    """An entry doing its job must not lose its image to someone else's cleanup."""
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    key = await _upload_blob(client, headers, 2048)
+
+    resp = await client.post(
+        "/api/v1/sync/push",
+        headers=headers,
+        json={
+            "entries": [
+                {
+                    "client_id": "img-1",
+                    "entry_type": "clipboard",
+                    "kind": "image",
+                    "encrypted_content": "ciphertext",
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "pinned": False,
+                    "blob_key": key,
+                    "blob_size": 2048,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["accepted"]
+
+    resp = await client.post("/api/v1/blobs/release", headers=headers, json={"blob_key": key})
+    assert resp.status_code == 409
+
+    resp = await client.get("/api/v1/blobs/quota", headers=headers)
+    assert resp.json()["used_bytes"] == 2048
+
+
+async def test_releasing_someone_elses_blob_is_a_404(client: AsyncClient, auth_headers: dict):
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    resp = await client.post(
+        "/api/v1/blobs/release",
+        headers=headers,
+        json={"blob_key": "00000000-0000-0000-0000-000000000000/deadbeef"},
+    )
+    assert resp.status_code == 404
