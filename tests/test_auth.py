@@ -44,6 +44,62 @@ async def test_register_and_list_devices(client: AsyncClient, auth_headers: dict
     assert any(str(d["id"]) == headers["X-Device-Id"] for d in devices)
 
 
+async def test_registering_the_same_pubkey_twice_reuses_one_row(client: AsyncClient):
+    """Re-login must not mint a second row for a device that already exists.
+
+    The device keypair is the identity: the private half is in that machine's
+    keychain and is what decrypts its wrapped UMK. Registering used to insert
+    unconditionally, so one laptop accumulated a row per sign-in.
+    """
+    token = make_token(str(uuid.uuid4()))
+    headers = {"Authorization": f"Bearer {token}"}
+    await client.post("/api/v1/auth/bootstrap", json={}, headers=headers)
+
+    body = {"device_name": "Desk", "platform": "windows", "device_pubkey": "pubkey-aaa"}
+    first = await client.post("/api/v1/auth/devices", json=body, headers=headers)
+    second = await client.post(
+        "/api/v1/auth/devices",
+        json={**body, "device_name": "Desk renamed", "app_version": "9.9.9"},
+        headers=headers,
+    )
+    assert first.status_code == second.status_code == 200
+    assert first.json()["device_id"] == second.json()["device_id"]
+
+    listed = await client.get("/api/v1/auth/devices", headers=headers)
+    rows = [d for d in listed.json() if d["device_name"].startswith("Desk")]
+    assert len(rows) == 1
+    # The second call is an update, not a no-op.
+    assert rows[0]["device_name"] == "Desk renamed"
+    assert rows[0]["app_version"] == "9.9.9"
+
+
+async def test_same_fingerprint_different_pubkey_is_a_separate_device(client: AsyncClient):
+    """Machines imaged from one base share a machine id, so they share a
+    fingerprint. They must still get their own rows - matching on the
+    fingerprint would let a clone claim the original's wrapped UMK."""
+    token = make_token(str(uuid.uuid4()))
+    headers = {"Authorization": f"Bearer {token}"}
+    await client.post("/api/v1/auth/bootstrap", json={}, headers=headers)
+
+    shared = "f" * 64
+    one = await client.post(
+        "/api/v1/auth/devices",
+        json={"device_name": "Clone A", "device_pubkey": "pubkey-a", "fingerprint": shared},
+        headers=headers,
+    )
+    two = await client.post(
+        "/api/v1/auth/devices",
+        json={"device_name": "Clone B", "device_pubkey": "pubkey-b", "fingerprint": shared},
+        headers=headers,
+    )
+    assert one.json()["device_id"] != two.json()["device_id"]
+
+    listed = await client.get("/api/v1/auth/devices", headers=headers)
+    clones = [d for d in listed.json() if d["device_name"].startswith("Clone")]
+    assert len(clones) == 2
+    assert {d["fingerprint"] for d in clones} == {shared}
+
+
 # ── JWT gating ───────────────────────────────────────────────────────────────
 
 

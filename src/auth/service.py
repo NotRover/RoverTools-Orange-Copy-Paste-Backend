@@ -96,14 +96,50 @@ async def set_wrapped_umk(db: AsyncSession, user_id: str, wrapped_umk: str) -> N
 
 
 async def register_device(db: AsyncSession, user_id: str, req) -> Device:
+    """Register this device, or return the row it already has.
+
+    Idempotent on `(user_id, device_pubkey)`. That key is the device's real
+    identity: the matching private key lives in its OS keychain and is what
+    decrypts its `wrapped_umk`. Registering used to insert unconditionally, so
+    every re-login minted another row and one laptop appeared in the device list
+    many times over.
+
+    `fingerprint` is deliberately *not* part of the match. Machines imaged from
+    one base share a machine id, and matching on it would let a clone take over
+    the original's row - and with it the wrap the original still needs. A
+    fingerprint collision with a different pubkey is a different device.
+    """
+    now = _now_ms()
+    existing = None
+    if req.device_pubkey:
+        existing = await db.scalar(
+            select(Device).where(
+                Device.user_id == uuid.UUID(user_id),
+                Device.device_pubkey == req.device_pubkey,
+                Device.revoked.is_(False),
+            )
+        )
+    if existing is not None:
+        existing.device_name = req.device_name
+        existing.platform = req.platform
+        existing.app_version = req.app_version
+        existing.last_seen_at = now
+        # Backfills rows registered before fingerprints existed.
+        if getattr(req, "fingerprint", None):
+            existing.fingerprint = req.fingerprint
+        await db.commit()
+        await db.refresh(existing)
+        return existing
+
     device = Device(
         user_id=uuid.UUID(user_id),
         device_name=req.device_name,
         platform=req.platform,
         app_version=req.app_version,
         device_pubkey=req.device_pubkey,
-        created_at=_now_ms(),
-        last_seen_at=_now_ms(),
+        fingerprint=getattr(req, "fingerprint", None),
+        created_at=now,
+        last_seen_at=now,
     )
     db.add(device)
     await db.commit()

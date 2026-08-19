@@ -66,6 +66,12 @@ class Device(Base):
     platform: Mapped[str] = mapped_column(String(32), nullable=False)  # windows | linux | macos
     app_version: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     device_pubkey: Mapped[str | None] = mapped_column(Text, nullable=True)  # base64 X25519
+    # Salted hash of a machine id, computed client-side as
+    # SHA256("rovertools-device-v1" || machine_uid || user_id). The raw machine
+    # id never leaves the device, and the per-user salt keeps the same machine
+    # from being linkable across accounts. A hint for grouping one machine's
+    # registrations - never proof of identity; `device_pubkey` is that.
+    fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     wrapped_umk: Mapped[str | None] = mapped_column(Text, nullable=True)  # AES-GCM(shared_secret, UMK)
     revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
