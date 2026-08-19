@@ -76,7 +76,10 @@ Then check it's alive:
 curl http://localhost:8000/internal/healthz
 ```
 
-Interactive docs are at `/api/docs` (Swagger) and `/api/redoc`, with the schema at `/api/openapi.json`.
+Interactive docs are at `/api/docs` (Swagger) and `/api/redoc`, with the schema at
+`/api/openapi.json`. All three need `DOCS_ENABLED=true` (already set in
+`.env.example`); without it they return 404, so a deployment never publishes them
+by accident.
 
 > **Blob testing gotcha:** inside Compose the API signs URLs pointing at the `minio` hostname, which a desktop client on your host cannot resolve. To exercise uploads end-to-end from the real app, run the API on the host with `S3_ENDPOINT_URL=http://localhost:9000`.
 

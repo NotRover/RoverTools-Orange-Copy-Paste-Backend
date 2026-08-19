@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # redirect). Single source, so pointing a domain at the deployment is an env
     # change rather than a code change. No trailing slash.
     public_base_url: str = "https://rovertools-smart-clipboard-app-backend.onrender.com"
+    # The interactive API docs and the OpenAPI schema. Off by default, so a
+    # deployment that configures nothing keeps them private: the schema is a full
+    # map of the surface, including the `/internal` admin routes, and publishing
+    # that buys nothing in production. Set `DOCS_ENABLED=true` locally when you
+    # want the UI.
+    docs_enabled: bool = False
     # Default per-user blob quota. Configurable globally here and per-user via the admin API.
     default_blob_quota_bytes: int = 52_428_800  # 50 MB
 

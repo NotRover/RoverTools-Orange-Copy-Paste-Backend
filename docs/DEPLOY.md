@@ -218,7 +218,9 @@ Check, in order:
 
 - **`/internal/healthz`** returns 200 with Postgres and Redis both healthy.
 - An **`X-API-Version`** header is present on every response.
-- **`/api/docs`** loads the Swagger UI.
+- **`/api/docs`** returns 404 unless `DOCS_ENABLED=true` is set on the service.
+  Leave it off in production; the schema maps the admin surface as well as the
+  client one.
 - **Auth works end to end** — sign in via Supabase, then call an authenticated
   route with `Authorization: Bearer <jwt>` and `X-Device-Id: <id>`. A 401 here
   almost always means a JWT config mismatch (section 10).

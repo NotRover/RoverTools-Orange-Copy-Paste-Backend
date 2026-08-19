@@ -79,9 +79,10 @@ app = FastAPI(
     ),
     openapi_tags=OPENAPI_TAGS,
     lifespan=lifespan,
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
+    # `None` removes the route entirely, so these 404 unless DOCS_ENABLED=true.
+    docs_url="/api/docs" if settings.docs_enabled else None,
+    redoc_url="/api/redoc" if settings.docs_enabled else None,
+    openapi_url="/api/openapi.json" if settings.docs_enabled else None,
 )
 
 
