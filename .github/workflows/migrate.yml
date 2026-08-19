@@ -10,6 +10,10 @@ name: Migrate database
 # stays deliberate, because a migration that goes wrong unattended goes wrong
 # against production, and the downgrades here are not written to be relied on.
 #
+# The automatic half never fails for having nothing to do. If the database is
+# already at the repository head, the preview says so and succeeds: a commit that
+# touches migrations/ without adding a revision must not turn the branch red.
+#
 # Needs one repository secret, DATABASE_URL, holding the Supabase connection
 # string in the same `postgresql+asyncpg://` form the app uses. Use the session
 # pooler (port 5432), not the transaction pooler (6543) - `migrations/env.py`
@@ -95,19 +99,44 @@ jobs:
       - name: Install
         run: uv sync --frozen --no-dev
 
+      # Parsed from the plain output, not `--verbose`: the verbose form opens with
+      # a "Current revision(s) for ..." header, and taking its first field gave
+      # the literal word `Current`, which every preview then failed on. Plain
+      # output is one line, `<rev> (head)`, and empty when the database has no
+      # alembic_version row at all. Alembic's own logging goes to stderr (see
+      # alembic.ini), so stdout is only the answer.
       - name: Where the database is now
         id: current
         run: |
-          uv run alembic current --verbose | tee current.txt
-          echo "revision=$(head -1 current.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          CURRENT=$(uv run alembic current | awk 'NF {print $1; exit}')
+          HEAD=$(uv run alembic heads | awk 'NF {print $1; exit}')
+          echo "revision=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "head=${HEAD}" >> "$GITHUB_OUTPUT"
+          echo "database: ${CURRENT:-<no alembic_version row>}, repository head: ${HEAD}"
 
+      # Nothing pending is the normal case for a push, so it is a notice and a
+      # success, never a failure. A commit that touches migrations/ without
+      # adding a revision - a docstring, a comment, this file's own siblings -
+      # must not turn the branch red.
       - name: Preview the SQL
         if: env.ACTION == 'preview-sql'
         run: |
-          FROM="${{ steps.current.outputs.revision }}"
+          FROM='${{ steps.current.outputs.revision }}'
+          HEAD='${{ steps.current.outputs.head }}'
           if [ -z "$FROM" ]; then
-            echo "::error::The database has no alembic_version row. Run an upgrade from base deliberately, not from a preview."
-            exit 1
+            echo "::notice::The database has no alembic_version row, so there is nothing to diff from. Run an upgrade from base deliberately, not from a preview."
+            echo '### No preview' >> "$GITHUB_STEP_SUMMARY"
+            echo 'The database has no `alembic_version` row yet.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$FROM" = "$HEAD" ]; then
+            echo "::notice::Database is already at ${FROM}. No migration pending."
+            {
+              echo '### No migration pending'
+              echo ''
+              echo 'The database is already at `'"$FROM"'`.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           {
             echo '### SQL for `'"$FROM"'` -> `'"$REVISION"'`'
