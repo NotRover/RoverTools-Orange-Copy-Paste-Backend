@@ -59,3 +59,26 @@ class StatsResponse(BaseModel):
     blobs_confirmed: int
     storage_bytes_used: int
     redis_memory_bytes: int | None
+
+
+class EmailConfigResponse(BaseModel):
+    """How the deployment is set up to send mail. No secret is echoed - only
+    whether each one is present."""
+
+    provider: str
+    configured: bool
+    email_from: str
+    brevo_api_key_set: bool
+    smtp_host: str
+    smtp_port: int
+    smtp_credentials_set: bool
+
+
+class EmailTestRequest(BaseModel):
+    to: str = Field(min_length=3, max_length=320)
+
+
+class EmailTestResponse(BaseModel):
+    sent: bool
+    provider: str
+    error: str | None = None

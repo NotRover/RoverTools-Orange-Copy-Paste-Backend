@@ -1,0 +1,64 @@
+<!--
+  Shared frame for every email this service sends, and the source the pasted-in
+  Supabase templates were built from, so account mail and app mail look like the
+  same product.
+
+  Placeholder names are never written out in these comments - the renderer
+  replaces every occurrence in the file, comments included.
+
+  Why this looks nothing like the pages next to it, despite sharing their palette:
+  mail clients are not browsers. Gmail strips a <style> block on some surfaces,
+  Outlook renders through Word, and neither supports CSS variables, so every rule
+  here is an inline attribute on the element it applies to, and layout is nested
+  tables rather than flex or grid. No media query, no custom property, no web
+  font - just the system stack, which is what the app uses too.
+
+  Dark on purpose, to match the pages these mails link to. A client in light mode
+  leaves it alone; Gmail dark mode may shift the greys slightly, and every colour
+  here holds contrast either way.
+-->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0;padding:0;background:#0e0e0e;">
+  <tr>
+    <td align="center" style="padding:28px 12px;">
+
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:440px;background:#181818;border:1px solid #272727;border-radius:12px;">
+        <tr>
+          <td style="padding:26px 26px 22px;font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;color:#f0f0f0;">
+
+            <!-- A text wordmark, not an image: remote images are blocked by
+                 default in most clients, and an empty box is a worse first line. -->
+            <p style="margin:0 0 20px;font-size:12px;font-weight:600;letter-spacing:0.4px;color:#ff5535;text-transform:uppercase;">
+              Orange Copy Paste
+            </p>
+
+            <h1 style="margin:0 0 8px;font-size:17px;font-weight:650;line-height:1.3;color:#f0f0f0;">
+              Confirm your email
+            </h1>
+
+            <p style="margin:0 0 18px;font-size:13px;line-height:1.5;color:#a0a0a0;">
+              You signed up for Orange Copy Paste. Confirm this address and your clipboard and notes start syncing between your devices, end to end encrypted.
+            </p>
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;">
+              <tr>
+                <td align="center" bgcolor="#ff5535" style="border-radius:8px;">
+                  <a href="{{ .ConfirmationURL }}" style="display:inline-block;padding:11px 20px;font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;font-size:13px;font-weight:600;color:#ffffff;text-decoration:none;">
+                    Confirm email
+                  </a>
+                </td>
+              </tr>
+            </table>
+            <p style="margin:0;padding-top:18px;border-top:1px solid #272727;font-size:11px;line-height:1.5;color:#606060;">
+              The link works once and expires in 24 hours. If you did not sign up, ignore this message and no account is created.
+            </p>
+
+          </td>
+        </tr>
+      </table>
+
+      <p style="margin:14px 0 0;font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;font-size:11px;color:#606060;">
+        Sent by Orange Copy Paste. You can ignore this message if it was not meant for you.
+      </p>
+
+    </td>
+  </tr>
+</table>
