@@ -1,8 +1,14 @@
 name: Migrate database
 
-# Manual only. Render's pre-deploy hook is a paid feature, so this is how a
-# merged Alembic revision reaches the database: someone dispatches it and says
-# which revision, on purpose.
+# Render's pre-deploy hook is a paid feature, so this is how a merged Alembic
+# revision reaches the database. Applying is manual: someone dispatches it and
+# says which revision, on purpose.
+#
+# A push to main that touches migrations/ runs the preview by itself. That is
+# the half worth automating - it says "a migration is pending, here is the exact
+# DDL" the moment one merges, without anything reaching the database. Applying
+# stays deliberate, because a migration that goes wrong unattended goes wrong
+# against production, and the downgrades here are not written to be relied on.
 #
 # Needs one repository secret, DATABASE_URL, holding the Supabase connection
 # string in the same `postgresql+asyncpg://` form the app uses. Use the session
@@ -10,6 +16,10 @@ name: Migrate database
 # builds its engine without the prepared-statement workaround that 6543 needs,
 # so the guard below refuses that port rather than failing halfway through DDL.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "migrations/**"
   workflow_dispatch:
     inputs:
       action:
@@ -44,6 +54,11 @@ jobs:
     timeout-minutes: 10
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # A push carries no inputs, so it resolves to the one action that changes
+      # nothing. Every step below reads these rather than `inputs.*`, so the two
+      # triggers cannot drift apart.
+      ACTION: ${{ github.event_name == 'push' && 'preview-sql' || inputs.action }}
+      REVISION: ${{ github.event_name == 'push' && 'head' || inputs.revision }}
 
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +78,7 @@ jobs:
               echo "::error::That is the transaction pooler. Use the session pooler on port 5432."
               exit 1 ;;
           esac
-          if [ "${{ inputs.action }}" = "upgrade" ] && [ "${{ inputs.confirm }}" != "migrate" ]; then
+          if [ "${ACTION}" = "upgrade" ] && [ "${{ inputs.confirm }}" != "migrate" ]; then
             echo "::error::Upgrade needs confirm=migrate. Nothing has been run."
             exit 1
           fi
@@ -85,7 +100,7 @@ jobs:
           echo "revision=$(head -1 current.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Preview the SQL
-        if: inputs.action == 'preview-sql'
+        if: env.ACTION == 'preview-sql'
         run: |
           FROM="${{ steps.current.outputs.revision }}"
           if [ -z "$FROM" ]; then
@@ -93,18 +108,18 @@ jobs:
             exit 1
           fi
           {
-            echo '### SQL for `'"$FROM"'` -> `${{ inputs.revision }}`'
+            echo '### SQL for `'"$FROM"'` -> `'"$REVISION"'`'
             echo '```sql'
-            uv run alembic upgrade "$FROM:${{ inputs.revision }}" --sql
+            uv run alembic upgrade "$FROM:${REVISION}" --sql
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upgrade
-        if: inputs.action == 'upgrade'
-        run: uv run alembic upgrade "${{ inputs.revision }}"
+        if: env.ACTION == 'upgrade'
+        run: uv run alembic upgrade "${REVISION}"
 
       - name: Where the database is now
-        if: inputs.action == 'upgrade'
+        if: env.ACTION == 'upgrade'
         run: |
           {
             echo '### Applied'
