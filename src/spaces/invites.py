@@ -1,10 +1,12 @@
 """Addressed space invites — the persistent counterpart to bearer invite codes.
 
-An invite targets one email, survives the invitee being offline, and gives the
-inviter visibility into its fate. Creating one publishes `invite:received` to
-the invitee (when their profile is known) and sends a best-effort email carrying
-the space's short code as the fallback join path. Accepting joins the space
-directly by invite id.
+An invite targets one email that already belongs to an account - an address
+nobody has signed up with is rejected, since the invite has nowhere to appear
+and no device key to wrap the space key to. It survives the invitee being
+offline and gives the inviter visibility into its fate. Creating one publishes
+`invite:received` to the invitee and sends a best-effort email carrying the
+space's short code as the fallback join path. Accepting joins the space directly
+by invite id.
 
 Status lifecycle: pending → accepted | declined (invitee) | revoked (inviter).
 Expiry is judged against `expires_at` at read/accept time rather than by a
@@ -101,17 +103,25 @@ async def create_invite(
     inviter_uuid = uuid.UUID(inviter_id)
 
     invitee = await db.scalar(select(Profile).where(Profile.email == normalized))
-    if invitee and invitee.id == inviter_uuid:
+    if invitee is None:
+        # An invite is an addressed offer: it has to reach an inbox in the app,
+        # and the space key has to be wrapped to a real device key. Neither is
+        # possible for an address nobody has signed up with, so the row would
+        # sit pending until it expired.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No RoverTools account uses that email",
+        )
+    if invitee.id == inviter_uuid:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That's your own email")
 
-    if invitee:
-        already_member = await db.scalar(
-            select(SpaceMembership).where(
-                SpaceMembership.space_id == space.id, SpaceMembership.user_id == invitee.id
-            )
+    already_member = await db.scalar(
+        select(SpaceMembership).where(
+            SpaceMembership.space_id == space.id, SpaceMembership.user_id == invitee.id
         )
-        if already_member:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already a member")
+    )
+    if already_member:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already a member")
 
     # One live invite per (space, email): refresh the pending row instead of
     # stacking duplicates the invitee would see as repeated notifications.
@@ -125,13 +135,13 @@ async def create_invite(
     expires_at = int((datetime.now(UTC) + timedelta(hours=_INVITE_TTL_HOURS)).timestamp() * 1000)
     if invite:
         invite.expires_at = expires_at
-        invite.invitee_user_id = invitee.id if invitee else None
+        invite.invitee_user_id = invitee.id
     else:
         invite = SpaceInvite(
             space_id=space.id,
             inviter_id=inviter_uuid,
             invitee_email=normalized,
-            invitee_user_id=invitee.id if invitee else None,
+            invitee_user_id=invitee.id,
             status="pending",
             created_at=now,
             expires_at=expires_at,
@@ -142,8 +152,7 @@ async def create_invite(
 
     out = await _invite_to_out(db, invite, space)
 
-    if invitee:
-        await rt.publish_invite_received(redis, str(invitee.id), out.model_dump(mode="json"))
+    await rt.publish_invite_received(redis, str(invitee.id), out.model_dump(mode="json"))
 
     inviter = await db.scalar(select(Profile).where(Profile.id == inviter_uuid))
     code = spaces_service.format_invite_code(space.invite_code or "")

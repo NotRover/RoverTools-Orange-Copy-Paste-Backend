@@ -166,6 +166,22 @@ async def test_invite_to_existing_member_conflicts(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_invite_to_an_address_with_no_account_is_rejected(client: AsyncClient):
+    owner = await make_user(client, "owner-noacct@example.com")
+    created = await create_space(client, owner)
+
+    resp = await client.post(
+        f"/api/v1/spaces/{created['space_id']}/invites",
+        json={"email": "nobody-here@example.com"},
+        headers=clean(owner),
+    )
+    assert resp.status_code == 404
+
+    listed = await client.get("/api/v1/invites", headers=clean(owner))
+    assert listed.json()["sent"] == []
+
+
+@pytest.mark.asyncio
 async def test_invite_only_owner_can_send(client: AsyncClient):
     owner = await make_user(client, "owner4@example.com")
     member = await make_user(client, "member4@example.com")
