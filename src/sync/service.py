@@ -101,6 +101,13 @@ async def _upsert_entry(
         # way to reclaim it.
         superseded_blob = existing.blob_key if existing.blob_key != entry.blob_key else None
 
+        # The device that wrote it *last*, not the one that created it. Clients
+        # suppress their own echo by comparing this to their device id, and a
+        # row that kept its creator forever came back attributed to whichever
+        # device first pushed it - so a tombstone pushed today by a device that
+        # signed in since was not recognised as its own, and the client applied
+        # its own deletion to its own local copy.
+        existing.device_id = device_id
         existing.encrypted_content = entry.encrypted_content
         existing.encrypted_metadata = entry.encrypted_metadata
         existing.updated_at = entry.updated_at
