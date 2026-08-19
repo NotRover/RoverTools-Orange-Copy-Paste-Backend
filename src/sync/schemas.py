@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from src.config import settings
+
 
 # ── Push ──────────────────────────────────────────────────────────────────────
 
@@ -25,7 +27,9 @@ class PushEntry(BaseModel):
 
 
 class PushRequest(BaseModel):
-    entries: list[PushEntry]
+    # A hard 422 rather than per-entry conflicts: the client pushes one entry per
+    # request, so anything near this is not the app asking.
+    entries: list[PushEntry] = Field(default_factory=list, max_length=settings.max_push_batch)
 
 
 class AcceptedEntry(BaseModel):
