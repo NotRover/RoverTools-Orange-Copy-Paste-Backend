@@ -328,6 +328,15 @@ hiding it. Two causes cover nearly every case:
   affected. Account emails (verification, password reset) come from Supabase and
   are unaffected either way.
 
+**Account mail looks nothing like the invite.** Supabase renders its own templates
+from its dashboard, and out of the box they are its stock ones. `docs/supabase-email/`
+holds copies built from this repo's mail shell - paste them into Authentication ->
+Emails -> Templates, subjects included, and re-run
+`uv run python scripts/render_supabase_emails.py` after any change to the shell.
+While you are in there: the built-in Supabase mailer is rate limited to a couple of
+messages an hour, so configuring custom SMTP is what makes signup and reset mail
+dependable.
+
 **Blob upload fails, everything else works.** R2 misconfiguration. Verify the
 bucket exists, `AWS_REGION=auto`, and the endpoint is the account-level R2 URL.
 Presigned PUTs expire in 5 minutes and GETs in 1 hour, so a badly skewed client

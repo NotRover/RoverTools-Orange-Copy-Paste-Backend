@@ -1,0 +1,42 @@
+<!--
+  Body of the space-invite mail. Fragment only - the frame, wordmark and footer
+  come from the shared email shell.
+
+  Placeholder names are never written out in these comments - the renderer
+  replaces every occurrence in the file, comments included.
+-->
+            <p style="margin:0 0 18px;font-size:13px;line-height:1.5;color:#a0a0a0;">
+              Hi __INVITEE__, a space shares clipboard items and notes between people in
+              real time, end to end encrypted. Nobody but the members can read what is in
+              it.
+            </p>
+
+            <!-- The button is a padded table cell, not a styled anchor: Outlook
+                 ignores padding on an inline element and the target collapses to
+                 the width of the text. -->
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;">
+              <tr>
+                <td align="center" bgcolor="#ff5535" style="border-radius:8px;">
+                  <a href="__JOIN_URL__" style="display:inline-block;padding:11px 20px;font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;font-size:13px;font-weight:600;color:#ffffff;text-decoration:none;">
+                    Join the space
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:0 0 8px;font-size:12px;line-height:1.5;color:#a0a0a0;">
+              Or open the app and enter this code:
+            </p>
+
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;">
+              <tr>
+                <td align="center" style="padding:11px 14px;background:#0e0e0e;border:1px solid #272727;border-radius:8px;font-family:Consolas,'Cascadia Mono',Menlo,monospace;font-size:15px;font-weight:600;letter-spacing:1.5px;color:#f0f0f0;">
+                  __CODE__
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:0;padding-top:18px;border-top:1px solid #272727;font-size:11px;line-height:1.5;color:#606060;">
+              This invite expires in 24 hours. If you were not expecting it, ignore this
+              message - nothing is shared with you until you join.
+            </p>

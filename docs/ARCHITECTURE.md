@@ -1178,6 +1178,13 @@ Two jobs:
 Email (space invites) is sent separately via FastAPI `BackgroundTasks` (best-effort;
 failures are logged, not surfaced to the request).
 
+Every message is rendered from `src/web/templates/email_shell.html` plus a body
+fragment, so the invite and the admin test mail share one frame. Supabase sends
+account mail from templates held in its own dashboard, which cannot import from
+here: `scripts/render_supabase_emails.py` renders paste-ready copies off the same
+shell into `docs/supabase-email/`, and has to be re-run and re-pasted when the
+shell changes.
+
 ---
 
 ## 11. Deployment Model & Cost
@@ -1260,7 +1267,8 @@ orange-copy-paste-clipboard-backend/
 │   ├── dependencies.py       # get_current_claims / get_current_user_only / get_current_user_id / get_redis
 │   ├── realtime.py           # WS endpoint + hub + Redis bridge + presence + publishers
 │   ├── background.py         # advisory-lock maintenance loop (presence sweep, blob cleanup)
-│   ├── email.py              # space-invite email (Brevo | SMTP), via BackgroundTasks
+│   ├── email.py              # invite + test mail (Brevo | SMTP), via BackgroundTasks
+│   ├── web/                  # /join and /reset pages, and the mail templates
 │   ├── supabase_admin.py     # Supabase Auth Admin API client (get/ban/delete user)
 │   ├── middleware.py         # security headers
 │   ├── limiter.py            # slowapi limiter instance

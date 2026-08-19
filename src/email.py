@@ -16,11 +16,33 @@ from html import escape
 import httpx
 
 from src.config import settings
+from src.spaces import service as spaces_service
 from src.web import router as web
 
 logger = logging.getLogger(__name__)
 
 _BREVO_ENDPOINT = "https://api.brevo.com/v3/smtp/email"
+
+# Mail markup. Real .html files rather than string literals, so they can be opened
+# in a browser and diffed as pages - the same arrangement as the pages this
+# service serves. One shell wraps every message, so account mail sent by Supabase
+# (whose templates are pasted copies of this same frame) and mail sent from here
+# look like one product.
+_MAIL_SHELL = web.read_template("email_shell.html")
+_MAIL_INVITE = web.read_template("email_invite.html")
+_MAIL_TEST = web.read_template("email_test.html")
+
+_DEFAULT_FOOTER = "Sent by Orange Copy Paste. You can ignore this message if it was not meant for you."
+
+
+def _render_mail(heading: str, body: str, footer: str = _DEFAULT_FOOTER) -> str:
+    """Wrap a body fragment in the shared frame. Callers escape their own
+    interpolations before substituting them into the fragment."""
+    return (
+        _MAIL_SHELL.replace("__HEADING__", heading)
+        .replace("__BODY__", body)
+        .replace("__FOOTER__", footer)
+    )
 
 # A blocked SMTP port does not refuse the connection, it swallows it, so an
 # unbounded `smtplib.SMTP()` parks a threadpool worker until the OS gives up
@@ -155,7 +177,7 @@ def send_test_email(to_address: str) -> None:
     _send(
         to_address,
         "Orange Copy Paste: email test",
-        "<p>Email from this deployment works. Nothing else to do.</p>",
+        _render_mail("Email works", _MAIL_TEST, "Sent by Orange Copy Paste as a delivery test."),
         "Email from this deployment works. Nothing else to do.\n",
     )
 
@@ -177,19 +199,24 @@ def send_sharing_invite(
     join_url = web.join_url(invite_code)
     invitee = escape(invitee_name) or "there"
     inviter = escape(from_name) or "A user"
-    code = escape(invite_code)
-    html = f"""
-<p>Hi {invitee},</p>
-<p><strong>{inviter}</strong> invited you to a space in Orange Copy Paste, where clipboard items and notes are shared end to end encrypted.</p>
-<p><a href="{join_url}">Join the space</a></p>
-<p>Or open the app and enter this code: <strong>{code}</strong></p>
-<p>This invite expires in 24 hours.</p>
-<p>Orange Copy Paste</p>
-"""
+    # One display form everywhere: the app, the join page and this mail all show
+    # the dashed code, so the recipient types back exactly what they read.
+    display_code = spaces_service.format_invite_code(invite_code)
+    code = escape(display_code)
+    body = (
+        _MAIL_INVITE.replace("__INVITEE__", invitee)
+        .replace("__CODE__", code)
+        .replace("__JOIN_URL__", escape(join_url, quote=True))
+    )
+    html = _render_mail(
+        f"{inviter} invited you to a space",
+        body,
+        "Sent by Orange Copy Paste because someone entered your email address.",
+    )
     text = (
         f"Hi {invitee_name or 'there'},\n\n"
         f"{from_name or 'A user'} invited you to a space in Orange Copy Paste.\n\n"
-        f"Join: {join_url}\nInvite code: {invite_code}\n\nThis invite expires in 24 hours.\n"
+        f"Join: {join_url}\nInvite code: {display_code}\n\nThis invite expires in 24 hours.\n"
     )
     try:
         _send(invitee_email, subject, html, text)

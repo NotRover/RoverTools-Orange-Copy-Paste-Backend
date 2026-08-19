@@ -31,11 +31,20 @@ router = APIRouter(tags=["web"], include_in_schema=False)
 
 _TEMPLATES = Path(__file__).parent / "templates"
 
-# Read once at import. These are shipped assets, not user content, and re-reading
-# them per request would add file IO to a path whose whole point is being fast.
-_SHELL = (_TEMPLATES / "shell.html").read_text(encoding="utf-8")
-_JOIN = (_TEMPLATES / "join.html").read_text(encoding="utf-8")
-_RESET = (_TEMPLATES / "reset.html").read_text(encoding="utf-8")
+def read_template(name: str) -> str:
+    """Load a shipped template by file name.
+
+    Callers read at import time, not per request: these are shipped assets, not
+    user content, and re-reading them would add file IO to a path whose whole
+    point is being fast. `email.py` uses this for the invite mail, which is not a
+    served page but is the same kind of file and lives in the same directory.
+    """
+    return (_TEMPLATES / name).read_text(encoding="utf-8")
+
+
+_SHELL = read_template("shell.html")
+_JOIN = read_template("join.html")
+_RESET = read_template("reset.html")
 
 # The page's own policy. The global one is `default-src 'none'`, which would block
 # the inline style and script these pages are built from; this stays as tight as a
