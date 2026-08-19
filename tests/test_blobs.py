@@ -4,6 +4,8 @@ from unittest.mock import patch
 
 from httpx import AsyncClient
 
+from src.config import settings
+
 
 async def test_request_upload(client: AsyncClient, auth_headers: dict):
     headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
@@ -37,6 +39,10 @@ async def test_quota(client: AsyncClient, auth_headers: dict):
     body = resp.json()
     assert body["used_bytes"] == 0
     assert body["quota_bytes"] == 52_428_800  # 50 MB default
+    # The ceilings the account screen shows beside the storage bar.
+    assert body["entry_count"] == 0
+    assert body["entry_limit"] == settings.max_entries_per_user
+    assert body["max_entry_bytes"] == settings.max_entry_bytes
 
 
 async def _upload_blob(client: AsyncClient, headers: dict, size: int) -> str:

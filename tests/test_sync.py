@@ -152,3 +152,79 @@ async def test_update_cursor(client: AsyncClient, auth_headers: dict):
         headers=headers,
     )
     assert resp.status_code == 204
+
+
+# ── Limits ────────────────────────────────────────────────────────────────────
+
+
+async def test_an_oversized_entry_is_refused_with_a_reason(
+    client: AsyncClient, auth_headers: dict, monkeypatch
+):
+    """Refused as a conflict, not a 422: the client turns the reason into a line
+    the user reads, and the rest of the push still goes through."""
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "max_entry_bytes", 16)
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+
+    big = _entry("cid-big")
+    big["encrypted_content"] = "A" * 64
+
+    resp = await client.post(
+        "/api/v1/sync/push",
+        json={"entries": [big, _entry("cid-small")]},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [c["reason"] for c in body["conflicts"]] == ["entry_too_large"]
+    assert [a["client_id"] for a in body["accepted"]] == ["cid-small"]
+
+
+async def test_a_full_account_refuses_new_rows_but_still_accepts_deletes(
+    client: AsyncClient, auth_headers: dict, monkeypatch
+):
+    """The important half is the second one. An account that could not be
+    emptied once it filled would be a trap, so the cap only ever blocks an
+    insert - a tombstone for a row that exists is an update and gets through."""
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "max_entries_per_user", 1)
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+
+    first = await client.post(
+        "/api/v1/sync/push", json={"entries": [_entry("cid-1")]}, headers=headers
+    )
+    assert len(first.json()["accepted"]) == 1
+
+    second = await client.post(
+        "/api/v1/sync/push", json={"entries": [_entry("cid-2")]}, headers=headers
+    )
+    assert [c["reason"] for c in second.json()["conflicts"]] == ["account_full"]
+
+    gone = await client.post(
+        "/api/v1/sync/push",
+        json={"entries": [_entry("cid-1", deleted=True)]},
+        headers=headers,
+    )
+    assert len(gone.json()["accepted"]) == 1
+
+    # And the room it freed is usable again.
+    again = await client.post(
+        "/api/v1/sync/push", json={"entries": [_entry("cid-3")]}, headers=headers
+    )
+    assert len(again.json()["accepted"]) == 1
+
+
+async def test_an_oversized_batch_is_rejected_outright(
+    client: AsyncClient, auth_headers: dict
+):
+    """No per-entry reasons here: the client pushes one entry per request, so a
+    batch this size is not the app asking."""
+    from src.config import settings
+
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    entries = [_entry(f"cid-{i}") for i in range(settings.max_push_batch + 1)]
+
+    resp = await client.post("/api/v1/sync/push", json={"entries": entries}, headers=headers)
+    assert resp.status_code == 422

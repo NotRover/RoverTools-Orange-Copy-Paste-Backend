@@ -2,11 +2,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.blobs import service as blobs_service
+from src.config import settings
 from src.spaces.models import SpaceMembership
 from src.sync.models import SyncCursor, SyncEntry
 from src.sync.schemas import (
@@ -50,8 +51,19 @@ async def push_entries(
     uid = uuid.UUID(user_id)
     did = uuid.UUID(device_id)
 
+    # Counted once per push, not once per entry: the number only moves by what
+    # this loop inserts, which it tracks itself.
+    held = await db.scalar(
+        select(func.count())
+        .select_from(SyncEntry)
+        .where(SyncEntry.user_id == uid, SyncEntry.deleted_at.is_(None))
+    )
+    room = settings.max_entries_per_user - (held or 0)
+
     for entry in entries:
-        result, dropped = await _upsert_entry(db, uid, did, entry)
+        result, dropped, inserted = await _upsert_entry(db, uid, did, entry, room)
+        if inserted:
+            room -= 1
         if isinstance(result, AcceptedEntry):
             accepted.append(result)
             if dropped:
@@ -73,7 +85,15 @@ async def _upsert_entry(
     user_id: uuid.UUID,
     device_id: uuid.UUID,
     entry: PushEntry,
-) -> tuple[AcceptedEntry | ConflictEntry, list[uuid.UUID]]:
+    room: int,
+) -> tuple[AcceptedEntry | ConflictEntry, list[uuid.UUID], bool]:
+    """Third return value: whether this created a row, so the caller can keep
+    ``room`` honest across a batch without counting the table again."""
+    # Checked before the lookup: an oversized row is refused whether it would be
+    # an insert or an update, and refusing costs nothing.
+    if len(entry.encrypted_content) > settings.max_entry_bytes:
+        return ConflictEntry(client_id=entry.client_id, reason="entry_too_large"), [], False
+
     existing = await db.scalar(
         select(SyncEntry).where(
             SyncEntry.user_id == user_id,
@@ -88,7 +108,7 @@ async def _upsert_entry(
         # Tombstone always wins
         incoming_tombstone = entry.deleted_at is not None and existing.deleted_at is None
         if not incoming_tombstone and entry.updated_at <= existing.updated_at:
-            return ConflictEntry(client_id=entry.client_id, reason="stale_update"), []
+            return ConflictEntry(client_id=entry.client_id, reason="stale_update"), [], False
 
         # Spaces this push takes the entry out of. A tombstone keeps its spaces
         # so it can fan out as a delete, so this only ever fires on un-share.
@@ -121,10 +141,16 @@ async def _upsert_entry(
         if superseded_blob:
             await blobs_service.release_blob(db, user_id, superseded_blob)
         await db.commit()
-        return AcceptedEntry(client_id=entry.client_id, server_id=existing.id, server_ts=server_ts), dropped
+        return AcceptedEntry(client_id=entry.client_id, server_id=existing.id, server_ts=server_ts), dropped, False
 
     if await _belongs_to_someone_else(db, user_id, entry):
-        return ConflictEntry(client_id=entry.client_id, reason="not_your_entry"), []
+        return ConflictEntry(client_id=entry.client_id, reason="not_your_entry"), [], False
+
+    # A full account can still be edited and emptied - the update path above is
+    # already past this point, so tombstones and changes to rows that exist keep
+    # working. Only a new row is refused.
+    if room <= 0:
+        return ConflictEntry(client_id=entry.client_id, reason="account_full"), [], False
 
     new_entry = SyncEntry(
         client_id=entry.client_id,
@@ -147,7 +173,7 @@ async def _upsert_entry(
     db.add(new_entry)
     await db.commit()
     await db.refresh(new_entry)
-    return AcceptedEntry(client_id=entry.client_id, server_id=new_entry.id, server_ts=server_ts), []
+    return AcceptedEntry(client_id=entry.client_id, server_id=new_entry.id, server_ts=server_ts), [], True
 
 
 async def _belongs_to_someone_else(db: AsyncSession, user_id: uuid.UUID, entry: PushEntry) -> bool:

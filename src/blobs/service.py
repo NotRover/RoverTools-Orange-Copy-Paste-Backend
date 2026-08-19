@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.models import Profile
+from src.config import settings
 from src.blobs import s3
 from src.blobs.models import Blob
 from src.spaces.models import SpaceMembership
@@ -134,6 +135,25 @@ async def _shares_space_with_blob(db: AsyncSession, uid: uuid.UUID, blob_key: st
     return membership is not None
 
 
+async def _entry_count(db: AsyncSession, uid: uuid.UUID) -> int:
+    """Live rows against ``max_entries_per_user`` - tombstones are not rows the
+    account is charged for, so they are excluded here exactly as they are in
+    the push path that enforces the cap."""
+    return (
+        await db.scalar(
+            select(func.count())
+            .select_from(SyncEntry)
+            .where(SyncEntry.user_id == uid, SyncEntry.deleted_at.is_(None))
+        )
+    ) or 0
+
+
 async def get_quota(db: AsyncSession, user_id: str) -> QuotaResponse:
     uid = uuid.UUID(user_id)
-    return QuotaResponse(used_bytes=await _used_bytes(db, uid), quota_bytes=await _quota_bytes(db, uid))
+    return QuotaResponse(
+        used_bytes=await _used_bytes(db, uid),
+        quota_bytes=await _quota_bytes(db, uid),
+        entry_count=await _entry_count(db, uid),
+        entry_limit=settings.max_entries_per_user,
+        max_entry_bytes=settings.max_entry_bytes,
+    )

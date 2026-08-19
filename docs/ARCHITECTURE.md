@@ -123,9 +123,24 @@ Brokers direct-to-object-store uploads.
 - `confirm-upload` → marks the blob confirmed.
 - `{blob_key}/download-url` → presigned GET URL.
 - `quota` → usage (computed on demand: `SUM(size_bytes)` over confirmed blobs) and
-  the per-user quota.
+  the per-user quota, plus the two sync ceilings the client cannot see on its own
+  (`entry_count` / `entry_limit`, and `max_entry_bytes`; §6.3).
 - **5 MB per-entry hard cap**; per-user quota default **50 MB** (configurable
   globally and per-user via the admin API).
+
+**Every byte is charged to whoever uploaded it, and to nobody else.** `_used_bytes`
+sums `blobs` rows `WHERE user_id = <caller> AND confirmed`, and a `blobs` row is only
+ever created by `request-upload`, for the uploader. Receiving a shared image creates
+no row: `download-url` hands the reader a presigned GET on the *owner's* key
+(`{owner_id}/{hex}`) after `_shares_space_with_blob` confirms a live entry carries it
+into a space they belong to, and answers 404 rather than 403 to everyone else so the
+key's existence is not confirmed. One bucket, namespaced by owner - not a bucket per
+user, and never a copy per reader.
+
+The consequence, which is deliberate: **the owner deleting the entry breaks it for
+every member.** `release_blob` marks the blob unconfirmed (so the quota stops
+counting it immediately), the hourly orphan sweep deletes the object, and any member
+who had not already fetched it gets a 404. The bytes were never theirs to keep.
 
 ### 2.5 Spaces (`src/spaces/`)
 
@@ -497,7 +512,9 @@ POST /api/v1/sync/push
              encrypted_metadata?, created_at, updated_at, pinned, deleted_at?,
              blob_key?, blob_size?, space_ids?, wrapped_keys? }] }
      Returns: { accepted: [{ client_id, server_id, server_ts }],
-                conflicts: [{ client_id, reason: 'stale_update' | 'not_your_entry' }] }
+                conflicts: [{ client_id, reason: 'stale_update' | 'not_your_entry'
+                              | 'entry_too_large' | 'account_full' }] }
+     At most `max_push_batch` entries per call (422 beyond it, before any work).
      space_ids  — fan-out targets; default []. wrapped_keys — the CEK envelope as a
      JSON string, default "{}". Both are stored verbatim and never interpreted.
 
@@ -548,7 +565,9 @@ POST /api/v1/blobs/request-upload
 
 POST /api/v1/blobs/confirm-upload         Body: { blob_key }
 GET  /api/v1/blobs/{blob_key}/download-url  Returns: { presigned_get_url, expires_in_seconds }
-GET  /api/v1/blobs/quota                    Returns: { used_bytes, quota_bytes }
+GET  /api/v1/blobs/quota                    Returns: { used_bytes, quota_bytes,
+                                                       entry_count, entry_limit,
+                                                       max_entry_bytes }
 ```
 
 ### 5.5 Spaces Routes  (require `X-Device-Id`)
@@ -764,7 +783,31 @@ caller may have full history in one space and post-join-only in another.
 not share one timestamp. Cursor comparisons are strict (`>`) on pull and the cursor
 write only moves forward (`POST /sync/cursor` ignores a lower value).
 
-### 6.3 Offline Operation
+### 6.3 Size and Row Limits
+
+Three ceilings, all in `src/config.py`, all enforced in `push_entries`:
+
+| Setting | Default | Refusal |
+|---|---|---|
+| `max_entry_bytes` | 512 KB | `entry_too_large`, checked before the row lookup |
+| `max_entries_per_user` | 3,000 live rows | `account_full` |
+| `max_push_batch` | 200 entries | 422 on the request body, before any work |
+
+`account_full` counts live rows only (`deleted_at IS NULL`) and is checked *after* the
+update path, so a full account can still be emptied - a cap that blocks its own
+remedy is a cap the user cannot get out from under.
+
+Both per-account limits count rows by `user_id`, which means an entry somebody else
+shared into your space is **their** row on **their** account and does not count
+against you. Same rule as the storage quota (§2.4): you are charged for what you
+uploaded, nothing else. The account screen shows both as bars beside each other for
+that reason.
+
+Note that `max_entry_bytes` bounds `encrypted_content`, which lives in Postgres, not
+R2 - it is the only thing that bounds it. A row cap bounds total bytes only at
+typical entry sizes.
+
+### 6.4 Offline Operation
 
 Local `history.bin` / `notes.bin` are the source of truth. The sync client pulls on
 startup/reconnect, queues pushes while offline, and applies WS events as they arrive.

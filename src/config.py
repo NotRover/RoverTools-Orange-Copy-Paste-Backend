@@ -41,6 +41,27 @@ class Settings(BaseSettings):
     # Default per-user blob quota. Configurable globally here and per-user via the admin API.
     default_blob_quota_bytes: int = 52_428_800  # 50 MB
 
+    # ── Sync limits ───────────────────────────────────────────────────────────────
+    # Ceilings, not tiers: ordinary use is nowhere near any of them. They live
+    # here rather than in code so they can be moved without a release.
+    #
+    # One row's ciphertext. 512 KB is roughly 380 KB of plaintext - longer than
+    # any real copied text or note. Images are externalised to blob storage and
+    # are bounded by the blob quota instead, so this does not apply to them.
+    max_entry_bytes: int = 524_288
+    # Rows one account may hold. Sized from a 5 MB per-account budget: a typical
+    # row measures about 1.5 KB (fixed columns, base64 ciphertext, metadata, the
+    # wrapped content key and five index entries), so 5 MB is ~3,400 rows and
+    # this keeps headroom. It bounds bytes only at typical row sizes -
+    # `max_entry_bytes` is what stops any single row being large, and 3,000 rows
+    # at that ceiling would be far more than 5 MB. A byte-accurate cap needs a
+    # running per-account total, which is deliberately not built.
+    max_entries_per_user: int = 3_000
+    # Entries one push may carry, matching the pull page default (its hard cap
+    # is 500). The client pushes one entry per request, so this only ever stops
+    # an abusive body.
+    max_push_batch: int = 200
+
     # ── Admin ─────────────────────────────────────────────────────────────────────
     admin_api_key: str = ""  # Required for /internal/* admin endpoints; empty disables them (503)
 

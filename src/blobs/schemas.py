@@ -26,3 +26,9 @@ class DownloadUrlResponse(BaseModel):
 class QuotaResponse(BaseModel):
     used_bytes: int
     quota_bytes: int
+    # Two more ceilings the client cannot see on its own. Storage is only one of
+    # the ways a push gets refused, and a limit the user meets for the first
+    # time as an error is a limit they were never told about.
+    entry_count: int
+    entry_limit: int
+    max_entry_bytes: int
