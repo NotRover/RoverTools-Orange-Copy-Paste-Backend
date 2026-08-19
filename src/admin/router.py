@@ -15,6 +15,8 @@ Two routers with deliberately different versioning (see ``src/version.py``):
     - ``PATCH /internal/v1/admin/users/{id}/quota``
     - ``POST  /internal/v1/admin/users/{id}/suspend``
     - ``DELETE /internal/v1/admin/users/{id}``
+    - ``GET  /internal/v1/admin/email``       mail provider and whether it is configured
+    - ``POST /internal/v1/admin/email/test``  send one test message and report the error
     - ``POST  /internal/v1/admin/announcements``       post a message to a user or everyone
     - ``DELETE /internal/v1/admin/announcements/{id}``
   All require the ``X-Admin-Key`` header.
@@ -23,10 +25,12 @@ Set ``ADMIN_API_KEY`` in the environment to enable the admin/metrics/stats
 endpoints; when it is unset they all return ``503 Service Unavailable``.
 """
 
+import logging
 import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
 from redis.asyncio import Redis
 from sqlalchemy import text
@@ -36,6 +40,9 @@ from src.admin import service
 from src.announcements import router as announcements_router
 from src.announcements.schemas import AnnouncementCreateResponse
 from src.admin.schemas import (
+    EmailConfigResponse,
+    EmailTestRequest,
+    EmailTestResponse,
     HealthResponse,
     QuotaUpdateRequest,
     StatsResponse,
@@ -43,10 +50,13 @@ from src.admin.schemas import (
     UserAdminDetail,
     UserListResponse,
 )
+from src import email
 from src.config import settings
 from src.database import get_db
 from src.dependencies import get_redis
 from src.version import INTERNAL_VERSIONED_PREFIX
+
+logger = logging.getLogger(__name__)
 
 # Unversioned infrastructure probes.
 probe_router = APIRouter(prefix="/internal", tags=["ops"])
@@ -202,6 +212,39 @@ async def delete_user(user_id: uuid.UUID, db: AsyncSession = Depends(get_db)) ->
     Requires: ``X-Admin-Key``.
     """
     await service.delete_user(db, user_id)
+
+
+# ── Email ──────────────────────────────────────────────────────────────────────
+#
+# Invite delivery is best-effort and failures are swallowed (see
+# `email.send_sharing_invite`), so from the outside a misconfigured provider
+# looks exactly like a working one. These two routes are the way to tell.
+
+
+@admin_router.get("/admin/email", response_model=EmailConfigResponse, dependencies=[Depends(require_admin_key)])
+async def email_config() -> EmailConfigResponse:
+    """Report the mail provider this deployment would use and whether its
+    credentials are present. No secret is returned.
+
+    Requires: ``X-Admin-Key``.
+    """
+    return EmailConfigResponse(**email.describe_config())
+
+
+@admin_router.post("/admin/email/test", response_model=EmailTestResponse, dependencies=[Depends(require_admin_key)])
+async def email_test(body: EmailTestRequest) -> EmailTestResponse:
+    """Send a test message to one address and report what happened. Runs in a
+    threadpool because both send paths are synchronous.
+
+    Requires: ``X-Admin-Key``.
+    """
+    provider = settings.email_provider.lower()
+    try:
+        await run_in_threadpool(email.send_test_email, body.to)
+    except Exception as exc:
+        logger.warning("Admin email test to %s failed: %s", body.to, exc)
+        return EmailTestResponse(sent=False, provider=provider, error=f"{type(exc).__name__}: {exc}")
+    return EmailTestResponse(sent=True, provider=provider)
 
 
 # ── Announcements ──────────────────────────────────────────────────────────────

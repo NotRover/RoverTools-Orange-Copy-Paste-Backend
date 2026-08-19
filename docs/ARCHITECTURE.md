@@ -748,7 +748,15 @@ GET  /internal/v1/admin/users/{user_id}      -- enriched with email/verified/ban
 PATCH /internal/v1/admin/users/{user_id}/quota   Body: { blob_bytes_quota }
 POST  /internal/v1/admin/users/{user_id}/suspend Body: { suspend: bool }   -- delegates to Supabase (ban/unban)
 DELETE /internal/v1/admin/users/{user_id}        -- deletes profile (cascade) + Supabase user
+GET  /internal/v1/admin/email       Returns: provider, configured, email_from, *_set flags -- no secret
+POST /internal/v1/admin/email/test  Body: { to }  Returns: { sent, provider, error? }
 ```
+
+Invite delivery is best-effort and its failures are swallowed (see
+`email.send_sharing_invite`), so a broken mail config is invisible from the
+client. The two email routes are how you tell: the first reports what the
+deployment would use and whether its credentials are present, the second sends one
+message and returns the real error. Neither returns a key or a password.
 
 Metrics: `orange_users_total`, `orange_devices_total`, `orange_devices_active_total`,
 `orange_devices_online`, `orange_sync_entries_total`, `orange_sync_entries_deleted_total`,

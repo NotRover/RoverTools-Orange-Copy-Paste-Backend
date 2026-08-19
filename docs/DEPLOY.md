@@ -304,6 +304,30 @@ that the Key Value instance provisioned.
 (section 6). Confirm the token is passed as the `token` query parameter, since browsers
 and Tauri can't set headers on a WebSocket handshake.
 
+**Invite emails never arrive.** Delivery is best-effort: `send_sharing_invite`
+logs the failure and swallows it so the inviter's request still succeeds, which
+means a broken mail config looks exactly like a working one from the client. Ask
+the deployment what it thinks it is doing:
+
+```bash
+curl -s -H "X-Admin-Key: $ADMIN_API_KEY" <base>/internal/v1/admin/email
+curl -s -X POST -H "X-Admin-Key: $ADMIN_API_KEY" -H 'Content-Type: application/json'   -d '{"to":"you@example.com"}' <base>/internal/v1/admin/email/test
+```
+
+The first reports the provider and whether its credentials are present (no secret
+is echoed); the second sends one message and returns the actual error instead of
+hiding it. Two causes cover nearly every case:
+
+- `provider: brevo, brevo_api_key_set: false` - `BREVO_API_KEY` is a
+  `sync: false` variable, so a Blueprint apply leaves it blank unless you paste
+  it. Sends raise before touching the network.
+- `provider: smtp` on a **free** Render instance - free web services are blocked
+  from outbound SMTP ports 25, 465 and 587, and port 25 is blocked on every plan,
+  so the connection times out rather than being refused. Either upgrade the
+  instance or set `EMAIL_PROVIDER=brevo`, which sends over HTTPS and is not
+  affected. Account emails (verification, password reset) come from Supabase and
+  are unaffected either way.
+
 **Blob upload fails, everything else works.** R2 misconfiguration. Verify the
 bucket exists, `AWS_REGION=auto`, and the endpoint is the account-level R2 URL.
 Presigned PUTs expire in 5 minutes and GETs in 1 hour, so a badly skewed client
