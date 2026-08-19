@@ -15,6 +15,7 @@ from src.blobs.schemas import (
     ConfirmUploadBody,
     DownloadUrlResponse,
     QuotaResponse,
+    ReleaseUploadBody,
     RequestUploadBody,
     RequestUploadResponse,
 )
@@ -82,6 +83,41 @@ async def confirm_upload(db: AsyncSession, user_id: str, body: ConfirmUploadBody
     if blob.confirmed:
         return  # idempotent
     blob.confirmed = True
+    await db.commit()
+
+
+async def release_upload(db: AsyncSession, user_id: str, body: ReleaseUploadBody) -> None:
+    """Give back an upload whose entry never landed.
+
+    A blob starts costing quota at confirm-upload, but the row that owns it is
+    only created by the push that follows. When that push ends without a row -
+    refused by the server, or dropped on an error path - the object is charged to
+    an account that cannot reach it. The client calls this instead of leaving it
+    for the 7-day unreferenced sweep, which exists for a queued push that may
+    still arrive, not for one that never will.
+
+    Refuses while a live entry references the blob: an entry that is doing its
+    job must not lose its image because some other push decided to tidy up.
+    Idempotent, and silent about blobs that are not the caller's - the same 404
+    reasoning as ``get_download_url``.
+    """
+    uid = uuid.UUID(user_id)
+    blob = await db.scalar(select(Blob).where(Blob.key == body.blob_key, Blob.user_id == uid))
+    if blob is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blob not found")
+    if not blob.confirmed:
+        return  # already released, or never confirmed
+    referenced = await db.scalar(
+        select(SyncEntry.id)
+        .where(SyncEntry.blob_key == body.blob_key, SyncEntry.deleted_at.is_(None))
+        .limit(1)
+    )
+    if referenced is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A live entry still references this blob",
+        )
+    blob.confirmed = False
     await db.commit()
 
 

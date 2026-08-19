@@ -120,7 +120,15 @@ client-wins write, publishes `settings:updated` so other devices pull.
 Brokers direct-to-object-store uploads.
 
 - `request-upload` → presigned PUT URL + `blob_key` (server never buffers bytes).
-- `confirm-upload` → marks the blob confirmed.
+- `confirm-upload` → marks the blob confirmed. **This is where the meter starts:** a
+  confirmed blob counts against the quota whether or not an entry references it yet.
+- `release` → un-confirms a blob whose entry never landed, giving the bytes straight
+  back. The client uploads and confirms *before* it pushes the entry, so a push that
+  the server refuses (or that fails locally after the upload) leaves an object nothing
+  points at. Without this the only collector is the 7-day unreferenced sweep, and a
+  retry loop mints a fresh object per attempt. Refuses with 409 while a live entry
+  still references the key, so it can never take an image away from an entry using it;
+  404 if the key is not the caller's; a no-op (204) if it is already unconfirmed.
 - `{blob_key}/download-url` → presigned GET URL.
 - `quota` → usage (computed on demand: `SUM(size_bytes)` over confirmed blobs) and
   the per-user quota, plus the two sync ceilings the client cannot see on its own
@@ -564,6 +572,9 @@ POST /api/v1/blobs/request-upload
                402 if over quota)
 
 POST /api/v1/blobs/confirm-upload         Body: { blob_key }
+POST /api/v1/blobs/release                Body: { blob_key }   → 204
+                                          (409 while a live entry references it,
+                                           404 if it is not the caller's)
 GET  /api/v1/blobs/{blob_key}/download-url  Returns: { presigned_get_url, expires_in_seconds }
 GET  /api/v1/blobs/quota                    Returns: { used_bytes, quota_bytes,
                                                        entry_count, entry_limit,

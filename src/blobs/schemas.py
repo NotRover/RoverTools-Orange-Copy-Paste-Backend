@@ -18,6 +18,10 @@ class ConfirmUploadBody(BaseModel):
     blob_key: str
 
 
+class ReleaseUploadBody(BaseModel):
+    blob_key: str
+
+
 class DownloadUrlResponse(BaseModel):
     presigned_get_url: str
     expires_in_seconds: int
