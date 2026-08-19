@@ -509,7 +509,10 @@ Source of truth: `src/version.py` (`API_VERSION`, `SERVICE_VERSION`).
   the OpenAPI `version`; it changes freely per release without implying a contract break.
 - Every HTTP response carries an **`X-API-Version`** header (= `API_VERSION`).
 - **Live schema:** Swagger UI at `/api/docs`, ReDoc at `/api/redoc`, raw spec at
-  `/api/openapi.json`. Every route declares a Pydantic `response_model` and a
+  `/api/openapi.json` - all three **off unless `DOCS_ENABLED=true`**, and 404 when
+  it is not set. The schema is a complete map of the surface, `/internal` admin
+  routes included, so it fails closed: a deployment that configures nothing keeps
+  it private, and `.env.example` turns it on for local work. Every route declares a Pydantic `response_model` and a
   docstring (surfaced as OpenAPI summary/description); tags group the surface
   (auth, sync, settings, blobs, spaces, invites, realtime, ops, admin). The WebSocket `/ws`
   contract is documented in section 5.8 (FastAPI does not emit WebSockets into OpenAPI).
@@ -534,6 +537,10 @@ PUT    /api/v1/auth/umk/recovery
        Body: { recovery_wrapped_umk }   -- the same UMK wrapped under the recovery code
        Replacing it revokes the previous recovery code, which is what regenerating
        one does. One code is live at a time.
+
+DELETE /api/v1/auth/umk/recovery
+       Drops the envelope. An account that starts over with a fresh UMK must clear
+       it, or the old code would hand a recovering client a dead key. Idempotent.
 
 POST   /api/v1/auth/devices
        Body: { device_name?, platform?, app_version?, device_pubkey? }

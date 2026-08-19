@@ -92,6 +92,22 @@ async def set_wrapped_umk(db: AsyncSession, user_id: str, wrapped_umk: str) -> N
     await db.commit()
 
 
+async def clear_recovery_wrapped_umk(db: AsyncSession, user_id: str) -> None:
+    """Drop the recovery envelope.
+
+    Needed because an envelope can outlive the key it holds: an account that
+    starts over gets a brand-new UMK, and the old envelope would then hand a
+    recovering client a key that decrypts nothing. Clearing it is also what makes
+    the client ask for a fresh code at the next sign-in.
+    """
+    profile = await db.scalar(select(Profile).where(Profile.id == uuid.UUID(user_id)))
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    profile.recovery_wrapped_umk = None
+    profile.updated_at = _now_ms()
+    await db.commit()
+
+
 async def set_recovery_wrapped_umk(db: AsyncSession, user_id: str, recovery_wrapped_umk: str) -> None:
     """Store (or replace) the recovery-code envelope for the account.
 

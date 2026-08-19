@@ -96,6 +96,24 @@ async def set_recovery_wrapped_umk(
     await service.set_recovery_wrapped_umk(db, user_id, body.recovery_wrapped_umk)
 
 
+@router.delete("/umk/recovery", status_code=204)
+async def clear_recovery_wrapped_umk(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_only),
+):
+    """Drop the recovery envelope for the current account.
+
+    An envelope can outlive the key inside it: an account that starts over with a
+    fresh UMK leaves one that would hand a recovering client a dead key. Clearing
+    it is also how the client is told to ask for a new code.
+
+    Idempotent - clearing an account that has none is still a 204.
+
+    Requires: Bearer token (Supabase JWT).
+    """
+    await service.clear_recovery_wrapped_umk(db, user_id)
+
+
 # ── Device management ─────────────────────────────────────────────────────────
 
 

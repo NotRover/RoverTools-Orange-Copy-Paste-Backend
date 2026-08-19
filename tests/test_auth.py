@@ -66,6 +66,23 @@ async def test_regenerating_replaces_the_previous_recovery_envelope(client: Asyn
     assert boot.json()["recovery_wrapped_umk"] == "second"
 
 
+async def test_clearing_the_recovery_envelope_is_idempotent(client: AsyncClient):
+    """Starting over with a new key must be able to drop a stale envelope."""
+    token = make_token(str(uuid.uuid4()))
+    headers = {"Authorization": f"Bearer {token}"}
+    await client.post("/api/v1/auth/bootstrap", json={}, headers=headers)
+    await client.put(
+        "/api/v1/auth/umk/recovery",
+        json={"recovery_wrapped_umk": "stale"},
+        headers=headers,
+    )
+    for _ in range(2):
+        resp = await client.delete("/api/v1/auth/umk/recovery", headers=headers)
+        assert resp.status_code == 204
+    boot = await client.post("/api/v1/auth/bootstrap", json={}, headers=headers)
+    assert boot.json()["recovery_wrapped_umk"] is None
+
+
 async def test_recovery_envelope_requires_a_token(client: AsyncClient):
     resp = await client.put(
         "/api/v1/auth/umk/recovery", json={"recovery_wrapped_umk": "blob"}
