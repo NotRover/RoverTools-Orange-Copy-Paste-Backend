@@ -1,0 +1,118 @@
+name: Migrate database
+
+# Manual only. Render's pre-deploy hook is a paid feature, so this is how a
+# merged Alembic revision reaches the database: someone dispatches it and says
+# which revision, on purpose.
+#
+# Needs one repository secret, DATABASE_URL, holding the Supabase connection
+# string in the same `postgresql+asyncpg://` form the app uses. Use the session
+# pooler (port 5432), not the transaction pooler (6543) - `migrations/env.py`
+# builds its engine without the prepared-statement workaround that 6543 needs,
+# so the guard below refuses that port rather than failing halfway through DDL.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to do
+        type: choice
+        default: current
+        options:
+          - current      # print the revision the database is on, change nothing
+          - preview-sql  # print the SQL an upgrade would run, change nothing
+          - upgrade      # apply it
+      revision:
+        description: Target revision (head, or a specific one like 0015)
+        type: string
+        default: head
+      confirm:
+        description: Type "migrate" to allow the upgrade action. Ignored otherwise.
+        type: string
+        default: ""
+
+# Two migrations at once would race for the alembic_version row. Queue instead,
+# and never cancel a run that may be mid-DDL.
+concurrency:
+  group: migrate-database
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the inputs before touching anything
+        run: |
+          if [ -z "${DATABASE_URL}" ]; then
+            echo "::error::DATABASE_URL secret is not set on this repository."
+            exit 1
+          fi
+          case "${DATABASE_URL}" in
+            postgresql+asyncpg://*) ;;
+            *) echo "::error::DATABASE_URL must start with postgresql+asyncpg://"; exit 1 ;;
+          esac
+          case "${DATABASE_URL}" in
+            *:6543/*)
+              echo "::error::That is the transaction pooler. Use the session pooler on port 5432."
+              exit 1 ;;
+          esac
+          if [ "${{ inputs.action }}" = "upgrade" ] && [ "${{ inputs.confirm }}" != "migrate" ]; then
+            echo "::error::Upgrade needs confirm=migrate. Nothing has been run."
+            exit 1
+          fi
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      # --frozen so a resolver nudge in CI cannot quietly install something the
+      # lockfile does not name. --no-dev: migrations need no test dependencies.
+      - name: Install
+        run: uv sync --frozen --no-dev
+
+      - name: Where the database is now
+        id: current
+        run: |
+          uv run alembic current --verbose | tee current.txt
+          echo "revision=$(head -1 current.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Preview the SQL
+        if: inputs.action == 'preview-sql'
+        run: |
+          FROM="${{ steps.current.outputs.revision }}"
+          if [ -z "$FROM" ]; then
+            echo "::error::The database has no alembic_version row. Run an upgrade from base deliberately, not from a preview."
+            exit 1
+          fi
+          {
+            echo '### SQL for `'"$FROM"'` -> `${{ inputs.revision }}`'
+            echo '```sql'
+            uv run alembic upgrade "$FROM:${{ inputs.revision }}" --sql
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upgrade
+        if: inputs.action == 'upgrade'
+        run: uv run alembic upgrade "${{ inputs.revision }}"
+
+      - name: Where the database is now
+        if: inputs.action == 'upgrade'
+        run: |
+          {
+            echo '### Applied'
+            echo ''
+            echo 'Was: `${{ steps.current.outputs.revision }}`'
+            echo ''
+            echo 'Now:'
+            echo '```'
+            uv run alembic current --verbose
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
