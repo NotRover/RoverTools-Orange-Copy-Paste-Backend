@@ -1,7 +1,7 @@
 # Orange Clipboard — Backend Deployment
 
 Production runbook for the sync backend. For *why* the system is shaped this way,
-see [ARCHITECTURE.md](ARCHITECTURE.md) (§11 Deployment Model & Cost).
+see [ARCHITECTURE.md](ARCHITECTURE.md) (section 11 Deployment Model & Cost).
 
 ## Table of Contents
 
@@ -179,7 +179,7 @@ deploy is reproducible rather than hand-clicked.
 2. Render reads `render.yaml` and shows the two services:
    `rovertools-clipboard-api` (web) and `rovertools-clipboard-keyvalue` (Valkey).
 3. You'll be prompted for every `sync: false` variable — paste the values from
-   §3 and §4. Leave blank any you're not using (`SUPABASE_JWT_SECRET` on a new
+   section 3 and section 4. Leave blank any you're not using (`SUPABASE_JWT_SECRET` on a new
    project, `BREVO_API_KEY` if you don't use sharing invites, `ADMIN_API_KEY` to
    keep the admin surface disabled).
 4. Apply.
@@ -221,7 +221,7 @@ Check, in order:
 - **`/api/docs`** loads the Swagger UI.
 - **Auth works end to end** — sign in via Supabase, then call an authenticated
   route with `Authorization: Bearer <jwt>` and `X-Device-Id: <id>`. A 401 here
-  almost always means a JWT config mismatch (§10).
+  almost always means a JWT config mismatch (section 10).
 - **WebSocket connects and stays open**:
   `wss://<service>/ws?token=<jwt>&device_id=<id>`.
 - If `ADMIN_API_KEY` is set, `/internal/metrics` with `X-Admin-Key` returns 200
@@ -237,7 +237,7 @@ for sign-in.
 
 The client authenticates against Supabase directly and forwards the resulting
 access token as an opaque string — it never inspects or verifies the JWT. **The
-asymmetric-key change in §3 therefore requires no client change.**
+asymmetric-key change in section 3 therefore requires no client change.**
 
 Make sure `APP_CORS_ORIGINS` includes the app's origin (`tauri://localhost` by
 default).
@@ -247,7 +247,7 @@ default).
 ## 9. Ongoing Operations
 
 **Schema changes.** Author the Alembic revision and review it before merging -
-the deploy applies it (§5). The migration runs before the new code, so an
+the deploy applies it (section 5). The migration runs before the new code, so an
 additive change is safe as written; for a destructive one, plan an
 expand/contract sequence across two deploys so the replicas still running the
 old code tolerate the new shape.
@@ -284,7 +284,7 @@ token arrived on a deployment configured only for asymmetric keys.
 
 **`OSError: [Errno 101] Network is unreachable` on every DB call.** You're using
 the direct `db.<ref>.supabase.co` host, which is IPv6-only, from a platform with
-no outbound IPv6. Switch `DATABASE_URL` to the Supavisor pooler (§3). The symptom
+no outbound IPv6. Switch `DATABASE_URL` to the Supavisor pooler (section 3). The symptom
 is a service that starts fine, logs `maintenance loop error; retrying` in a loop,
 and fails its health check — the API is up but every request touching Postgres
 fails.
@@ -299,7 +299,7 @@ Check `DATABASE_URL` (pooler host? asyncpg driver? password URL-encoded?) and
 that the Key Value instance provisioned.
 
 **WebSocket connects then drops.** Usually a free-plan instance idling out
-(§6). Confirm the token is passed as the `token` query parameter, since browsers
+(section 6). Confirm the token is passed as the `token` query parameter, since browsers
 and Tauri can't set headers on a WebSocket handshake.
 
 **Blob upload fails, everything else works.** R2 misconfiguration. Verify the

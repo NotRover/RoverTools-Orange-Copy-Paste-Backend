@@ -68,7 +68,7 @@ Two moving parts you operate (FastAPI + Redis); the rest is managed:
 - **Redis** does exactly two things: realtime pub/sub fan-out and device presence.
 - **R2** (or any S3-compatible store) holds encrypted binary blobs. Vendor-neutral.
 - **No Celery / no worker service.** Background jobs run in-process under a Postgres
-  advisory lock (see §10). Email is sent via FastAPI `BackgroundTasks`.
+  advisory lock (see section 10). Email is sent via FastAPI `BackgroundTasks`.
 
 The desktop app remains fully functional offline; sync is opportunistic and resumes
 on reconnect.
@@ -108,7 +108,7 @@ Owns `sync_entries` (clipboard + notes) and per-device `sync_cursors`.
   and once to each `space:` channel named in the entry's `space_ids`. There is no
   `sync:delete`: a tombstone is a normal `sync:entry` with `deleted_at` set.
 - Carries two server-visible routing/key columns it never interprets:
-  `space_ids` (fan-out targets) and `wrapped_keys` (the per-entry CEK envelope, §7.2).
+  `space_ids` (fan-out targets) and `wrapped_keys` (the per-entry CEK envelope, section 7.2).
 
 ### 2.3 Settings (`src/settings/`)
 
@@ -124,7 +124,7 @@ Brokers direct-to-object-store uploads.
 - `{blob_key}/download-url` → presigned GET URL.
 - `quota` → usage (computed on demand: `SUM(size_bytes)` over confirmed blobs) and
   the per-user quota, plus the two sync ceilings the client cannot see on its own
-  (`entry_count` / `entry_limit`, and `max_entry_bytes`; §6.3).
+  (`entry_count` / `entry_limit`, and `max_entry_bytes`; section 6.3).
 - **5 MB per-entry hard cap**; per-user quota default **50 MB** (configurable
   globally and per-user via the admin API).
 
@@ -146,7 +146,7 @@ who had not already fetched it gets a 404. The bytes were never theirs to keep.
 
 A **space** is the single sharing primitive: a named, persistent, realtime room whose
 entries are encrypted under a Space Key the server never sees. There is no space *type*,
-no member cap, and no server-side scope. See §15.
+no member cap, and no server-side scope. See section 15.
 
 - **Spaces** (`router.py` / `service.py` / `models.py` / `schemas.py`) — create, list,
   get, join by invite code, remove member / leave, delete, and per-member Space Key
@@ -162,7 +162,7 @@ blob. The server only routes ciphertext.
 ### 2.6 Realtime (`src/realtime.py`)
 
 Single module: the WebSocket endpoint, an in-process connection hub, the Redis
-pub/sub bridge, the publish helpers, and device presence. See §8.
+pub/sub bridge, the publish helpers, and device presence. See section 8.
 
 ### 2.7 Admin (`src/admin/`)
 
@@ -276,7 +276,7 @@ CREATE TABLE sync_entries (
     deleted_at         BIGINT,             -- tombstone (NULL = alive)
     pinned             BOOLEAN NOT NULL DEFAULT false,
     space_ids          UUID[] NOT NULL DEFAULT '{}',   -- server-visible; the fan-out targets
-    wrapped_keys       TEXT NOT NULL DEFAULT '{}',     -- CEK envelope; opaque JSON map (§7.2)
+    wrapped_keys       TEXT NOT NULL DEFAULT '{}',     -- CEK envelope; opaque JSON map (section 7.2)
     blob_key           TEXT,               -- object key; NULL for text
     blob_size          BIGINT,
     CONSTRAINT uniq_client_entry UNIQUE (user_id, client_id, entry_type)
@@ -344,7 +344,7 @@ CREATE TABLE space_memberships (
     space_id           UUID NOT NULL,     -- CASCADE on space delete
     user_id            UUID NOT NULL,
     role               TEXT NOT NULL DEFAULT 'member',  -- 'owner' | 'member'
-    wrapped_space_keys TEXT,      -- JSON array of X25519-wrapped Space Keys, newest first (§7.4)
+    wrapped_space_keys TEXT,      -- JSON array of X25519-wrapped Space Keys, newest first (section 7.4)
     history_from_ts    BIGINT,    -- pull floor; NULL = full history
     joined_at          BIGINT NOT NULL,
     PRIMARY KEY (space_id, user_id)
@@ -360,7 +360,7 @@ newest key first, each element an X25519-wrapped copy for this member. It is an 
 because a rekey must not make older entries unreadable: previous Space Keys exist
 nowhere else, so a member who restarts after a rekey recovers the whole ring and can
 still decrypt entries written under earlier keys. `NULL` is meaningful — it is the
-signal that this member needs a (re)distribution (§7.4).
+signal that this member needs a (re)distribution (section 7.4).
 
 ### 4.8 `blobs`
 
@@ -463,7 +463,7 @@ Source of truth: `src/version.py` (`API_VERSION`, `SERVICE_VERSION`).
   `/api/openapi.json`. Every route declares a Pydantic `response_model` and a
   docstring (surfaced as OpenAPI summary/description); tags group the surface
   (auth, sync, settings, blobs, spaces, invites, realtime, ops, admin). The WebSocket `/ws`
-  contract is documented in §5.8 (FastAPI does not emit WebSockets into OpenAPI).
+  contract is documented in section 5.8 (FastAPI does not emit WebSockets into OpenAPI).
 
 ### 5.1 Auth Routes
 
@@ -582,9 +582,9 @@ POST   /api/v1/spaces/join               Body: { invite_code } → { space_id, n
 DELETE /api/v1/spaces/{space_id}/members/{member_user_id}
        Owner removes a member, or a member removes themselves. 400 if the target is
        the owner (delete the space instead). Clears every remaining member's
-       wrapped keyring to trigger a rekey (§7.4).
+       wrapped keyring to trigger a rekey (section 7.4).
 DELETE /api/v1/spaces/{space_id}         -- owner only; cascades memberships + invites
-POST   /api/v1/spaces/{space_id}/invites Body: { email }   -- owner only; see §5.6
+POST   /api/v1/spaces/{space_id}/invites Body: { email }   -- owner only; see section 5.6
 POST   /api/v1/spaces/{space_id}/keys    -- owner only
        Body: { wrapped_keyrings: [{ user_id, wrapped_space_keys }] }
        wrapped_space_keys is a JSON array string; stored verbatim on the membership.
@@ -644,7 +644,7 @@ they do **not** require `X-Device-Id`. Revoke does, since it goes through the sh
 device-scoped dependency.
 
 Invitee resolution uses `profiles.email`, a lowercased mirror of the Supabase
-JWT email claim captured at bootstrap (§4.9) — no Admin API round-trip.
+JWT email claim captured at bootstrap (section 4.9) — no Admin API round-trip.
 
 ```mermaid
 sequenceDiagram
@@ -664,12 +664,12 @@ sequenceDiagram
     API->>API: add membership (history floor), status=accepted
     API->>R: space:{id} + user:{invitee} space:membership_changed
     API->>R: user:{inviter} invite:updated
-    R-->>O: wrap Space Key for new member (§7.4)
+    R-->>O: wrap Space Key for new member (section 7.4)
 ```
 
 ### 5.7 Internal Routes
 
-Split into **unversioned infra probes** and the **versioned admin API** (see §5.0).
+Split into **unversioned infra probes** and the **versioned admin API** (see section 5.0).
 
 ```
 -- Unversioned probes (paths are stable across API versions)
@@ -799,7 +799,7 @@ remedy is a cap the user cannot get out from under.
 
 Both per-account limits count rows by `user_id`, which means an entry somebody else
 shared into your space is **their** row on **their** account and does not count
-against you. Same rule as the storage quota (§2.4): you are charged for what you
+against you. Same rule as the storage quota (section 2.4): you are charged for what you
 uploaded, nothing else. The account screen shows both as bars beside each other for
 that reason.
 
@@ -820,7 +820,7 @@ The invariant: entry payloads reach the server (and Supabase) as **ciphertext on
 never plaintext content, note titles, or labels. All key material is generated, wrapped,
 and unwrapped on the client. Space *names* are the deliberate exception: `spaces.name` is
 plaintext, because an invitee is shown the space name before they join and therefore
-before they hold any key that could decrypt it. See §7.5 for the full visibility list.
+before they hold any key that could decrypt it. See section 7.5 for the full visibility list.
 
 ### 7.1 User Master Key (UMK) — envelope model
 
@@ -896,7 +896,7 @@ at all.
 
 Every space has a **Space Key**: a random 32-byte key held in client memory, minted and
 distributed by the **owner**. It never encrypts content directly — it only wraps per-entry
-CEKs (§7.2). A member's copy is wrapped for their identity key:
+CEKs (section 7.2). A member's copy is wrapped for their identity key:
 
 ```
 shared  = X25519(owner_identity_priv, member_identity_pubkey)
@@ -972,7 +972,7 @@ Server sees: entry type/kind, timestamps, `pinned`, blob keys and sizes, which s
 entry was shared into (`space_ids`), space membership (user ↔ space), space names, invitee
 emails, and public keys.
 
-The one plaintext exception is `announcements` (§ 16) — rows the *server itself*
+The one plaintext exception is `announcements` (section 16) — rows the *server itself*
 wrote, so there was never a plaintext of the user's to protect.
 
 Server never sees: `encrypted_content`, `encrypted_metadata`,
@@ -1011,7 +1011,7 @@ the event.
 - **Heartbeat** — server pings every 25 s; any client message/`pong` refreshes the
   presence TTL.
 - **Crash backstop** — a socket that dies without a clean close leaves its presence
-  key to expire; the maintenance sweeper (§10) then emits `device:offline`. So the
+  key to expire; the maintenance sweeper (section 10) then emits `device:offline`. So the
   instant path is primary and the sweep is a safety net, not a 60 s-latency primary.
 
 ---
@@ -1123,11 +1123,11 @@ is largely unchanged. What the client must adopt for this backend:
    reaches the members who received the entry.
 6. **Every push carries a CEK envelope.** Mint a per-entry key, encrypt content and
    metadata under it with `aad=client_id`, and send `wrapped_keys` with a `"personal"` wrap
-   plus one wrap per space id in `space_ids` (§7.2). An entry with an empty envelope is
+   plus one wrap per space id in `space_ids` (section 7.2). An entry with an empty envelope is
    accepted by the server and readable by nobody.
 7. **Reconcile space keys, don't trust the event.** `space:rekey` is fire-and-forget;
    `GET /spaces` → `my_wrapped_space_keys` is the authoritative recovery path, and the
-   whole keyring must be kept so older entries stay readable (§7.4).
+   whole keyring must be kept so older entries stay readable (section 7.4).
 
 Image/file blobs still upload directly to R2 via presigned PUT (`request-upload` →
 PUT → `confirm-upload`), subject to the 5 MB per-entry cap; text/metadata ride inside
@@ -1179,7 +1179,7 @@ There is no `worker/`, `realtime/` package, `email/` package, `groups/` package,
 ## 14. Client / Backend Contract Drift
 
 No known drift. The Rust client (`src-tauri/src/sync/client.rs`) calls exactly the routes
-in §5.1–5.6 — auth, sync push/pull/cursor, settings, blobs, `/spaces*`, `/invites*` — and
+in sections 5.1–5.6 — auth, sync push/pull/cursor, settings, blobs, `/spaces*`, `/invites*` — and
 nothing else. The routes it used to reach for and that do not exist are gone from the
 client too: `/auth/login|refresh|logout` (Supabase Auth handles those), a delete route,
 `/sharing/*` in any form, and any rotate-invite or scope endpoint.
@@ -1214,7 +1214,7 @@ They are separate concerns on the same pipe, distinguished by one field:
   personally, whether or not any space exists.
 - **A space** — an entry with one or more `space_ids`. Still reaches the author's own
   devices, *and* every member of each listed space. The same row serves both, because the
-  CEK envelope carries a `"personal"` wrap alongside the per-space wraps (§7.2).
+  CEK envelope carries a `"personal"` wrap alongside the per-space wraps (section 7.2).
 
 Nothing enters a space implicitly. The client decides per entry, from its own send filters,
 and the server has no view into that decision.
@@ -1225,9 +1225,9 @@ and the server has no view into that decision.
 Owner   → POST /api/v1/spaces { name, share_history }
           → { space_id, invite_code }; owner membership with history_from_ts = NULL
 Invitee → POST /api/v1/spaces/join { invite_code }            -- bearer secret path
-       or POST /api/v1/invites/{id}/accept                    -- addressed path (§5.6)
+       or POST /api/v1/invites/{id}/accept                    -- addressed path (section 5.6)
           → membership added, history floor resolved from share_history at join time
-Owner   → reconciles and posts the wrapped keyring (§7.4)
+Owner   → reconciles and posts the wrapped keyring (section 7.4)
 ```
 
 Two invitation paths, one membership model. The invite code is a bearer secret usable by
@@ -1240,13 +1240,13 @@ A client sends an entry into a space by listing the space in `space_ids` and add
 space's wrap to `wrapped_keys`, then pushing as normal. The server stores the row and
 publishes `sync:entry` to `user:{author}` and to each `space:{id}`; every member's socket
 receives it and unwraps the CEK locally. Members who were offline pick the same row up on
-their next `GET /sync/pull` through the space arm (§6.2), subject to their history floor.
+their next `GET /sync/pull` through the space arm (section 6.2), subject to their history floor.
 
 ### 15.4 Leaving, Removal, and Deletion
 
 - `DELETE /spaces/{id}/members/{uid}` — the owner removing a member, or a member removing
   themselves. Both clear every remaining member's wrapped keyring, which is what drives the
-  rekey (§7.4). The owner cannot leave their own space.
+  rekey (section 7.4). The owner cannot leave their own space.
 - `DELETE /spaces/{id}` — owner only. `space:membership_changed` with `action: "deleted"`
   is published first, while the channel still has subscribers; then the row goes and
   memberships and invites cascade.
@@ -1322,7 +1322,7 @@ this is the server forgetting rather than a recall.
       key's existence is not confirmed).
 - [ ] Space Key revocation is **best-effort**: removal clears the server-side keyrings and
       the owner's client rekeys, but a departed member keeps whatever they already
-      decrypted, and no new key exists until the owner is next online (§7.4).
+      decrypted, and no new key exists until the owner is next online (section 7.4).
 - [x] Presigned R2 PUT URLs expire in 5 min; GET in 1 h.
 - [x] Per-entry 5 MB cap + per-user quota (default 50 MB) enforced server-side.
 - [x] `SUPABASE_SERVICE_ROLE_KEY` is server-only and never returned to clients.
