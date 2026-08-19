@@ -558,6 +558,10 @@ GET    /api/v1/auth/umk/device                  -- requires X-Device-Id
        Returns: { wrapped_umk }   -- the UMK wrapped for the calling device;
        the silent session-restore path. 404 when no wrap is stored or the device
        was revoked, which is what makes revocation cut a device off for real.
+       That 404 carries X-Wrap-Absent: 1, and the header is part of the contract:
+       a client acts on it by ending the session and asking for a password, so it
+       must be able to tell this answer from a 404 produced by a proxy, a
+       rewritten path, or a deployment older than the route.
 
 POST   /api/v1/auth/devices/{device_id}/key-wrap
        Body: { wrapped_umk }    -- an existing device wraps the UMK for another device

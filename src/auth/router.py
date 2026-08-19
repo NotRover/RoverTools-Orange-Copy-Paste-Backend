@@ -191,12 +191,23 @@ async def get_device_wrapped_umk(
     is what makes revocation actually cut a device off: its keychain state
     alone can no longer recover the master key.
 
+    That 404 carries `X-Wrap-Absent: 1`, and the header is part of the contract.
+    A client that gets this answer signs the user out and asks for a password,
+    so it must not act on a 404 that came from somewhere else — a proxy, a
+    rewritten path, or a deployment predating this route. The header is the only
+    thing that separates "this device is cut off" from "nobody answered the
+    question", and the status alone cannot.
+
     Requires: Bearer token + X-Device-Id header.
     """
     user_id, device_id = current
     wrapped = await service.get_device_wrapped_umk(db, device_id, user_id)
     if not wrapped:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No device key wrap")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No device key wrap",
+            headers={"X-Wrap-Absent": "1"},
+        )
     return schemas.DeviceWrappedUmkResponse(wrapped_umk=wrapped)
 
 
