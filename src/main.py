@@ -21,6 +21,7 @@ from src.middleware import SecurityHeadersMiddleware
 from src.redis_client import close_redis_pool, get_redis_pool
 from src.settings.router import router as settings_router
 from src.sync.router import router as sync_router
+from src.web.router import router as web_router
 from src.version import API_PREFIX, SERVICE_VERSION
 
 
@@ -118,6 +119,9 @@ app.include_router(announcements_router, prefix=API_PREFIX)
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 app.include_router(realtime.router)
+
+# ── Human-facing pages (unversioned: people paste these links) ──────────────────
+app.include_router(web_router)
 
 # ── Internal: unversioned probes + versioned admin API ──────────────────────────
 app.include_router(probe_router)

@@ -56,6 +56,7 @@ async def bootstrap(
         display_name=profile.display_name,
         avatar_url=profile.avatar_url,
         wrapped_umk=profile.pw_wrapped_umk,
+        recovery_wrapped_umk=profile.recovery_wrapped_umk,
     )
 
 
@@ -73,6 +74,26 @@ async def set_wrapped_umk(
     Requires: Bearer token (Supabase JWT).
     """
     await service.set_wrapped_umk(db, user_id, body.wrapped_umk)
+
+
+@router.put("/umk/recovery", status_code=204)
+async def set_recovery_wrapped_umk(
+    body: schemas.SetRecoveryUmkRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_only),
+):
+    """Store the recovery-code-wrapped UMK envelope for the current account.
+
+    The second envelope holding the same key, wrapped under a secret the user
+    keeps rather than one they remember - so a forgotten password is survivable
+    on a machine that has never signed in. Replacing it revokes the previous
+    recovery code, which is what regenerating one does.
+
+    Opaque to the server, same as PUT /umk: it stores a blob it cannot open.
+
+    Requires: Bearer token (Supabase JWT).
+    """
+    await service.set_recovery_wrapped_umk(db, user_id, body.recovery_wrapped_umk)
 
 
 # ── Device management ─────────────────────────────────────────────────────────

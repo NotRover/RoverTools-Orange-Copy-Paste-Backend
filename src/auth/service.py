@@ -92,6 +92,22 @@ async def set_wrapped_umk(db: AsyncSession, user_id: str, wrapped_umk: str) -> N
     await db.commit()
 
 
+async def set_recovery_wrapped_umk(db: AsyncSession, user_id: str, recovery_wrapped_umk: str) -> None:
+    """Store (or replace) the recovery-code envelope for the account.
+
+    Replacing is how regenerating a code works: the previous code stops opening
+    anything the moment this lands, because the blob it could open is gone. Only
+    one recovery code is live at a time, on purpose - a code the user believes is
+    revoked must not still work.
+    """
+    profile = await db.scalar(select(Profile).where(Profile.id == uuid.UUID(user_id)))
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    profile.recovery_wrapped_umk = recovery_wrapped_umk
+    profile.updated_at = _now_ms()
+    await db.commit()
+
+
 # ── Device management ─────────────────────────────────────────────────────────
 
 
