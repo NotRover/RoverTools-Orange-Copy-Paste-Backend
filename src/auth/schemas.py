@@ -37,6 +37,10 @@ class RegisterDeviceRequest(BaseModel):
     platform: str = Field(default="unknown", max_length=32)
     app_version: str = Field(default="", max_length=32)
     device_pubkey: str | None = None  # base64 X25519 public key
+    # Salted hash of a machine id (see Device.fingerprint). Optional: an older
+    # client sends none, and a machine with no readable id sends one derived
+    # from a locally generated seed instead.
+    fingerprint: str | None = Field(default=None, max_length=64)
 
 
 class RegisterDeviceResponse(BaseModel):
@@ -49,6 +53,9 @@ class DeviceOut(BaseModel):
     platform: str
     app_version: str
     last_seen_at: int
+    # Lets the client tell its own machine's registrations apart from other
+    # devices in the list. Null on rows registered before fingerprints existed.
+    fingerprint: str | None = None
     # Presence snapshot at list time (Redis presence key exists). Live updates
     # still flow over WS `device:online`/`device:offline`; this seeds the UI so
     # devices don't all render offline until the next event happens to arrive.
