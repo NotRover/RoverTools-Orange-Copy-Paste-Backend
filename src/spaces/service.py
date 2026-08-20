@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import realtime as rt
 from src.auth.models import Profile
-from src.spaces.models import Space, SpaceComment, SpaceInvite, SpaceMembership
+from src.spaces.models import Space, SpaceComment, SpaceInvite, SpaceJoinRequest, SpaceMembership
 from src.spaces.schemas import (
     CommentCountOut,
     CreateCommentRequest,
@@ -60,6 +60,18 @@ def format_invite_code(code: str) -> str:
     if len(code) == _CODE_LENGTH and code.isalnum():
         return f"{code[:4]}-{code[4:]}"
     return code
+
+
+def may_approve(s: Space, role: str | None) -> bool:
+    """Who may answer the door: the owner always, members if the owner said so.
+
+    `role` is None for a caller who is not a member at all. One function, one
+    definition - `SpaceOut.i_can_approve` is this call, which is why no client
+    re-implements the rule and none of them can disagree with the server.
+    """
+    if role is None:
+        return False
+    return role == "owner" or s.members_can_approve
 
 
 async def create_space(db: AsyncSession, user_id: str, req: CreateSpaceRequest) -> tuple[Space, str]:
@@ -152,6 +164,18 @@ async def _space_to_out(
         for m, pubkey, display_name, avatar_url in rows
     ]
     mine = next((m for m, _, _, _ in rows if m.user_id == requesting_user_id), None)
+    i_can_approve = may_approve(s, mine.role if mine else None)
+    # Counted only for somebody who could act on it: a member who cannot approve
+    # has no use for the number, and it is not theirs to see.
+    pending = 0
+    if i_can_approve:
+        pending = (
+            await db.scalar(
+                select(func.count())
+                .select_from(SpaceJoinRequest)
+                .where(SpaceJoinRequest.space_id == s.id, SpaceJoinRequest.status == "pending")
+            )
+        ) or 0
     return SpaceOut(
         id=s.id,
         owner_id=s.owner_id,
@@ -165,16 +189,22 @@ async def _space_to_out(
         my_wrapped_by=mine.wrapped_by if mine else None,
         key_fingerprint=s.key_fingerprint,
         rekey_requested_at=s.rekey_requested_at,
+        members_can_approve=s.members_can_approve,
+        i_can_approve=i_can_approve,
+        pending_join_requests=pending,
     )
 
 
-async def set_share_history(
+async def update_space(
     db: AsyncSession, space_id: uuid.UUID, requesting_user_id: str, req: UpdateSpaceRequest
 ) -> tuple[Space, bool]:
-    """Change a space's history policy. Owner only.
+    """Change a space's owner-only settings: history policy, approval policy.
 
     Returns the space and whether this call opened the back catalogue, which the
     caller uses to decide whether members need to be told to go and fetch it.
+
+    Both fields are optional and applied independently, so a client can flip one
+    without having to restate the other and risk clobbering it.
 
     Turning it on clears every current member's floor as well as setting the
     policy for future joiners: an owner who says "share the history" means the
@@ -189,7 +219,10 @@ async def set_share_history(
     if s.owner_id != uuid.UUID(requesting_user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the owner can change this")
 
-    s.share_history = req.share_history
+    if req.members_can_approve is not None:
+        s.members_can_approve = req.members_can_approve
+    if req.share_history is not None:
+        s.share_history = req.share_history
     # Whether a floor actually comes off, not whether the flag changed: only then
     # does anyone have older entries to go and fetch. Read first so the answer is
     # a plain list rather than a driver-specific row count.
@@ -251,20 +284,6 @@ async def add_membership(
     )
     db.add(membership)
     await db.commit()
-
-
-async def join_space(db: AsyncSession, user_id: str, invite_code: str) -> Space:
-    uid = uuid.UUID(user_id)
-    code = normalize_invite_code(invite_code)
-    s = await db.scalar(select(Space).where(Space.invite_code == code))
-    if not s:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid invite code")
-
-    if s.invite_expires_at and s.invite_expires_at < _now_ms():
-        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Invite code expired")
-
-    await add_membership(db, s, uid)
-    return s
 
 
 async def remove_member(

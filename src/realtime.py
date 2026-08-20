@@ -233,6 +233,27 @@ async def publish_invite_updated(redis: Redis, user_id: str, invite_id: str, sta
     await publish(redis, f"user:{user_id}", "invite:updated", payload)
 
 
+async def publish_join_requested(redis: Redis, channel: str, request_payload: dict) -> None:
+    """Somebody asked to join. Addressed to whoever may approve it.
+
+    The channel is the caller's choice because the audience depends on the
+    space's policy: the whole space channel when members may approve, the
+    owner's own channel when they may not. Sending it to the space channel
+    regardless would tell every member about a decision that is not theirs.
+    """
+    await publish(redis, channel, "space:join_requested", request_payload)
+
+
+async def publish_join_decided(redis: Redis, user_id: str, space_id: str, decision: str) -> None:
+    """The answer, addressed to the requester.
+
+    They are not subscribed to the space channel - they are not in the space
+    yet - so this goes to their own channel, the way an invite update does.
+    """
+    payload = {"space_id": space_id, "status": decision}
+    await publish(redis, f"user:{user_id}", "space:join_decided", payload)
+
+
 async def publish_space_rekey(redis: Redis, space_id: str, user_id: str, wrapped_space_keys: str) -> None:
     payload = {"space_id": space_id, "wrapped_space_keys": wrapped_space_keys}
     await publish(redis, f"user:{user_id}", "space:rekey", payload)

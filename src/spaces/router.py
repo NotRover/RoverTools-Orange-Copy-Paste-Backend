@@ -9,6 +9,7 @@ from src import realtime as rt
 from src.database import get_db
 from src.dependencies import get_current_user_id, get_redis
 from src.spaces import invites as invites_module
+from src.spaces import join_requests as join_requests_module
 from src.spaces import service
 from src.spaces.models import Space
 from src.spaces.schemas import (
@@ -56,6 +57,28 @@ async def list_spaces(
     return await service.list_spaces(db, redis, user_id)
 
 
+@router.get(
+    "/my-join-requests", response_model=list[join_requests_module.MyJoinRequestOut]
+)
+async def list_my_join_requests(
+    db: AsyncSession = Depends(get_db),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Spaces the caller has asked to join and is still waiting on.
+
+    Declared above `/{space_id}` deliberately: that route takes a UUID, so a
+    literal path segment declared after it is shadowed into a 422.
+
+    A pending request is not a membership, so none of these spaces appear in
+    `GET /spaces`. This is the only thing standing between the requester and a
+    blank screen while they wait.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
+    user_id, _ = current
+    return await join_requests_module.list_my_requests(db, user_id)
+
+
 @router.get("/{space_id}", response_model=SpaceOut)
 async def get_space(
     space_id: uuid.UUID,
@@ -79,7 +102,11 @@ async def update_space(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
-    """Change a space's history policy (owner action).
+    """Change a space's owner-only settings (owner action).
+
+    Two independent switches: whether joiners see the back catalogue, and
+    whether members may approve join requests or only the owner. Both are
+    optional, so setting one never clobbers the other.
 
     Requires: Bearer token + X-Device-Id header.
     Emits `space:history_opened` when the change gave members access to entries
@@ -87,7 +114,7 @@ async def update_space(
     would fetch them otherwise.
     """
     user_id, _ = current
-    _, opened = await service.set_share_history(db, space_id, user_id, body)
+    _, opened = await service.update_space(db, space_id, user_id, body)
     if opened:
         await rt.publish_space_history_opened(redis, str(space_id))
     return await service.get_space(db, redis, space_id, user_id)
@@ -100,21 +127,114 @@ async def join_space(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
-    """Join a space using an invite code.
+    """Ask to join a space using its invite code.
+
+    The code introduces a space; it does not authorise entry to one. This raises
+    a join request that somebody already inside approves, and the approval is
+    what hands over the Space Key. Re-pasting a code you already used is a no-op,
+    and a code you were already turned down on stays turned down.
 
     Requires: Bearer token + X-Device-Id header.
-    Emits `space:membership_changed` to the space channel and to the joiner.
+    Emits `space:join_requested` to whoever may approve it.
     """
     user_id, _ = current
-    space = await service.join_space(db, user_id, body.invite_code)
+    space, row, outcome = await join_requests_module.request_join(db, user_id, body.invite_code)
 
-    await rt.publish_space_membership_changed(redis, str(space.id), "joined", user_id)
-    # The joiner's own socket isn't subscribed to the space channel yet (channel
-    # sets are resolved at connect time), so tell them directly — their client
-    # resubscribes and reconciles keys on this event.
-    await rt.publish_membership_changed_to_user(redis, user_id, str(space.id), "joined")
+    if outcome == "member":
+        # Nothing to announce: they are already in. Reported as pending because
+        # from the caller's side there is nothing left to wait for either way,
+        # and the next space list will show them the space.
+        return JoinResponse(status="pending", space_name=space.name)
+    if outcome == "declined":
+        return JoinResponse(status="declined", space_name=space.name)
 
-    return JoinResponse(space_id=space.id, name=space.name)
+    if row is not None:
+        # Only the people who can act on it, which is why the channel is chosen
+        # here rather than inside the publisher.
+        channel = (
+            f"space:{space.id}" if space.members_can_approve else f"user:{space.owner_id}"
+        )
+        await rt.publish_join_requested(
+            redis,
+            channel,
+            {
+                "space_id": str(space.id),
+                "request_id": str(row.id),
+                "user_id": str(row.user_id),
+            },
+        )
+
+    return JoinResponse(status="pending", space_name=space.name)
+
+
+@router.get("/{space_id}/join-requests", response_model=list[join_requests_module.JoinRequestOut])
+async def list_join_requests(
+    space_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Pending join requests on this space.
+
+    Anyone who may approve, which is the owner and - if the owner said so -
+    members. Each row carries the requester's identity public key, so the
+    approval can wrap the Space Key in the same action.
+
+    Requires: Bearer token + X-Device-Id header.
+    """
+    user_id, _ = current
+    return await join_requests_module.list_requests(db, space_id, user_id)
+
+
+@router.post("/{space_id}/join-requests/{request_id}/approve", status_code=204)
+async def approve_join_request(
+    space_id: uuid.UUID,
+    request_id: uuid.UUID,
+    body: join_requests_module.ApproveJoinRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Let the requester in, handing over the Space Key in the same call.
+
+    The approver is holding the keyring at this moment - they are the one
+    clicking - so the membership is created with a key already in it and the new
+    member can read the space straight away.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `space:membership_changed` to the space and the new member, and
+    `space:join_decided` to them as well.
+    """
+    user_id, _ = current
+    _, row = await join_requests_module.approve(
+        db, space_id, request_id, user_id, body.wrapped_space_keys
+    )
+    joiner = str(row.user_id)
+    await rt.publish_space_membership_changed(redis, str(space_id), "joined", joiner)
+    # Their socket isn't subscribed to the space channel yet - channel sets are
+    # resolved at connect time - so both of these go to them directly.
+    await rt.publish_membership_changed_to_user(redis, joiner, str(space_id), "joined")
+    await rt.publish_join_decided(redis, joiner, str(space_id), "approved")
+
+
+@router.post("/{space_id}/join-requests/{request_id}/decline", status_code=204)
+async def decline_join_request(
+    space_id: uuid.UUID,
+    request_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Turn a join request down.
+
+    The row is kept rather than deleted: together with the one-row-per-person
+    rule it is what stops somebody who still holds the code from knocking again.
+
+    Requires: Bearer token + X-Device-Id header.
+    Emits `space:join_decided` to the requester.
+    """
+    user_id, _ = current
+    _, row = await join_requests_module.decline(db, space_id, request_id, user_id)
+    await rt.publish_join_decided(redis, str(row.user_id), str(space_id), "declined")
 
 
 @router.delete("/{space_id}/members/{member_user_id}", status_code=204)

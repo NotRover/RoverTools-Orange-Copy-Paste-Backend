@@ -3,12 +3,7 @@
 import pytest
 from httpx import AsyncClient
 
-from tests.test_spaces_invites import clean, create_space, make_user
-
-
-async def join(client: AsyncClient, headers: dict, invite_code: str) -> None:
-    resp = await client.post("/api/v1/spaces/join", json={"invite_code": invite_code}, headers=clean(headers))
-    assert resp.status_code == 200, resp.text
+from tests.test_spaces_invites import clean, create_space, join, make_user
 
 
 async def post_comment(
@@ -38,7 +33,7 @@ async def test_any_member_can_comment_and_read_the_thread(client: AsyncClient):
     owner = await make_user(client)
     member = await make_user(client)
     space = await create_space(client, owner)
-    await join(client, member, space["invite_code"])
+    await join(client, member, space, owner)
 
     await post_comment(client, owner, space["space_id"], body="from-owner")
     await post_comment(client, member, space["space_id"], body="from-member")
@@ -112,7 +107,7 @@ async def test_author_deletes_own_comment(client: AsyncClient):
     owner = await make_user(client)
     member = await make_user(client)
     space = await create_space(client, owner)
-    await join(client, member, space["invite_code"])
+    await join(client, member, space, owner)
     comment = await post_comment(client, member, space["space_id"])
 
     resp = await client.delete(
@@ -134,8 +129,8 @@ async def test_owner_moderates_and_members_cannot(client: AsyncClient):
     author = await make_user(client)
     bystander = await make_user(client)
     space = await create_space(client, owner)
-    await join(client, author, space["invite_code"])
-    await join(client, bystander, space["invite_code"])
+    await join(client, author, space, owner)
+    await join(client, bystander, space, owner)
     comment = await post_comment(client, author, space["space_id"])
 
     refused = await client.delete(
