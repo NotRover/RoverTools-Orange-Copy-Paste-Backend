@@ -216,7 +216,7 @@ def send_sharing_invite(
     text = (
         f"Hi {invitee_name or 'there'},\n\n"
         f"{from_name or 'A user'} invited you to a space in Orange Copy Paste.\n\n"
-        f"Join: {join_url}\nInvite code: {display_code}\n\nThis invite expires in 24 hours.\n"
+        f"Join: {join_url}\nInvite code: {display_code}\n\nThis invite expires in 72 hours.\n"
     )
     try:
         _send(invitee_email, subject, html, text)

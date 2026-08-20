@@ -63,6 +63,16 @@ class SpaceOut(BaseModel):
     # who restarted could never decrypt the space again. Never exposes another
     # member's keyring.
     my_wrapped_space_keys: str | None = None
+    # Whose identity key wrapped the keyring above. None means the owner - the
+    # only possible writer before members could hand keys over.
+    my_wrapped_by: uuid.UUID | None = None
+    # Truncated hash of the newest Space Key. A client checks a keyring it just
+    # unwrapped against this before adopting it, so a member handing out a key
+    # that is not this space's is caught rather than silently breaking decryption.
+    key_fingerprint: str | None = None
+    # Set while a departure's rekey is still owed. Only the owner acts on it: it
+    # tells their client to mint a new key on top of the ring and redistribute.
+    rekey_requested_at: int | None = None
 
     model_config = {"from_attributes": True}
 
@@ -90,6 +100,11 @@ class WrappedKeyringEntry(BaseModel):
 
 class DistributeKeysRequest(BaseModel):
     wrapped_keyrings: list[WrappedKeyringEntry]
+    # Fingerprint of the newest key in the rings above. Honoured only from the
+    # owner, who is the only one that mints a key: a member relaying an existing
+    # ring has nothing new to declare, and letting it write here would let it
+    # redefine what every other member verifies against.
+    key_fingerprint: str | None = Field(default=None, max_length=64)
 
 
 # ── Comments ──────────────────────────────────────────────────────────────────

@@ -53,8 +53,21 @@ class InviteOut(BaseModel):
     status: str
     created_at: int
     expires_at: int
+    # The invitee's X25519 identity public key, so the inviter's client can wrap
+    # the Space Key for them before they are a member. Sent only to the inviter
+    # (see `list_invites`) - it is public key material either way, but there is no
+    # reason for it to travel further than the one caller that uses it.
+    invitee_identity_pubkey: str | None = None
+    # Whether a wrapped keyring is already attached, waiting for the accept.
+    has_space_key: bool = False
 
     model_config = {"from_attributes": True}
+
+
+class AttachKeyRequest(BaseModel):
+    # JSON array of X25519-wrapped Space Keys, newest first, wrapped for the
+    # invitee's identity key. Opaque to the server.
+    wrapped_space_keys: str
 
 
 class InviteListResponse(BaseModel):
@@ -70,10 +83,17 @@ class AcceptResponse(BaseModel):
 # ── Service ─────────────────────────────────────────────────────────────
 
 
-async def _invite_to_out(db: AsyncSession, inv: SpaceInvite, s: Space | None = None) -> InviteOut:
+async def _invite_to_out(
+    db: AsyncSession, inv: SpaceInvite, s: Space | None = None, *, for_inviter: bool = False
+) -> InviteOut:
     if s is None:
         s = await db.scalar(select(Space).where(Space.id == inv.space_id))
     inviter = await db.scalar(select(Profile).where(Profile.id == inv.inviter_id))
+    invitee_pubkey = None
+    if for_inviter and inv.invitee_user_id is not None:
+        invitee_pubkey = await db.scalar(
+            select(Profile.identity_pubkey).where(Profile.id == inv.invitee_user_id)
+        )
     return InviteOut(
         id=inv.id,
         space_id=inv.space_id,
@@ -84,6 +104,8 @@ async def _invite_to_out(db: AsyncSession, inv: SpaceInvite, s: Space | None = N
         status=inv.status,
         created_at=inv.created_at,
         expires_at=inv.expires_at,
+        invitee_identity_pubkey=invitee_pubkey,
+        has_space_key=inv.wrapped_space_keys is not None,
     )
 
 
@@ -136,6 +158,9 @@ async def create_invite(
     if invite:
         invite.expires_at = expires_at
         invite.invitee_user_id = invitee.id
+        # A re-invite starts the handover again: the ring may have rotated since,
+        # and attaching the new one is the inviter's next call.
+        invite.wrapped_space_keys = None
     else:
         invite = SpaceInvite(
             space_id=space.id,
@@ -150,9 +175,15 @@ async def create_invite(
     await db.commit()
     await db.refresh(invite)
 
-    out = await _invite_to_out(db, invite, space)
+    out = await _invite_to_out(db, invite, space, for_inviter=True)
 
-    await rt.publish_invite_received(redis, str(invitee.id), out.model_dump(mode="json"))
+    # The invitee's copy does not carry their own public key back to them, nor the
+    # inviter's wrap state - both are the inviter's business.
+    await rt.publish_invite_received(
+        redis,
+        str(invitee.id),
+        out.model_dump(mode="json", exclude={"invitee_identity_pubkey", "has_space_key"}),
+    )
 
     inviter = await db.scalar(select(Profile).where(Profile.id == inviter_uuid))
     code = spaces_service.format_invite_code(space.invite_code or "")
@@ -223,9 +254,43 @@ async def list_invites(
     ).all()
 
     return InviteListResponse(
-        sent=[await _invite_to_out(db, i) for i in sent_rows],
+        sent=[await _invite_to_out(db, i, for_inviter=True) for i in sent_rows],
         received=[await _invite_to_out(db, i) for i in received_rows],
     )
+
+
+@router.put("/{invite_id}/key", status_code=204)
+async def attach_invite_key(
+    invite_id: uuid.UUID,
+    body: AttachKeyRequest,
+    db: AsyncSession = Depends(get_db),
+    claims: dict = Depends(get_current_claims),
+):
+    """Attach the Space Key, wrapped for the invitee, to a pending invite.
+
+    The inviter's client calls this right after creating the invite, using the
+    `invitee_identity_pubkey` the create returned. The wrap moves into the
+    membership row when the invite is accepted, which is what lets a new member
+    read the space immediately rather than waiting for another member's app to be
+    running.
+
+    Inviter only, and only while the invite is pending: a spent invite has already
+    handed over whatever it carried.
+
+    Requires: Bearer token (Supabase JWT).
+    """
+    uid = uuid.UUID(claims["sub"])
+    inv = await db.scalar(select(SpaceInvite).where(SpaceInvite.id == invite_id))
+    if not inv:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
+    if inv.inviter_id != uid:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your invite")
+    if inv.status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=f"Invite already {inv.status}"
+        )
+    inv.wrapped_space_keys = body.wrapped_space_keys
+    await db.commit()
 
 
 @router.post("/{invite_id}/accept", response_model=AcceptResponse)
@@ -249,9 +314,17 @@ async def accept_invite(
     if not s:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Space no longer exists")
 
-    await spaces_service.add_membership(db, s, uid)
+    # The inviter may have wrapped the keyring for this account already, in which
+    # case the membership starts with a key and this member can read the space
+    # straight away - nobody else has to be online.
+    await spaces_service.add_membership(
+        db, s, uid, wrapped_space_keys=inv.wrapped_space_keys, wrapped_by=inv.inviter_id
+    )
     inv.status = "accepted"
     inv.invitee_user_id = uid
+    # The wrap has moved to the membership row; leaving a copy on a spent invite
+    # keeps key material around for no reason.
+    inv.wrapped_space_keys = None
     await db.commit()
 
     user_id = str(uid)

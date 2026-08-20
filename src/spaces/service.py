@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import realtime as rt
 from src.auth.models import Profile
-from src.spaces.models import Space, SpaceComment, SpaceMembership
+from src.spaces.models import Space, SpaceComment, SpaceInvite, SpaceMembership
 from src.spaces.schemas import (
     CommentCountOut,
     CreateCommentRequest,
@@ -151,9 +151,7 @@ async def _space_to_out(
         )
         for m, pubkey, display_name, avatar_url in rows
     ]
-    my_wrapped = next(
-        (m.wrapped_space_keys for m, _, _, _ in rows if m.user_id == requesting_user_id), None
-    )
+    mine = next((m for m, _, _, _ in rows if m.user_id == requesting_user_id), None)
     return SpaceOut(
         id=s.id,
         owner_id=s.owner_id,
@@ -163,7 +161,10 @@ async def _space_to_out(
         share_history=s.share_history,
         created_at=s.created_at,
         members=members,
-        my_wrapped_space_keys=my_wrapped,
+        my_wrapped_space_keys=mine.wrapped_space_keys if mine else None,
+        my_wrapped_by=mine.wrapped_by if mine else None,
+        key_fingerprint=s.key_fingerprint,
+        rekey_requested_at=s.rekey_requested_at,
     )
 
 
@@ -214,11 +215,23 @@ async def set_share_history(
     return s, opened
 
 
-async def add_membership(db: AsyncSession, s: Space, uid: uuid.UUID) -> None:
+async def add_membership(
+    db: AsyncSession,
+    s: Space,
+    uid: uuid.UUID,
+    wrapped_space_keys: str | None = None,
+    wrapped_by: uuid.UUID | None = None,
+) -> None:
     """Idempotently add `uid` to `s`, resolving the owner's history policy at
     join time (so later policy changes don't retroactively expand what an
     existing member sees). Shared by the invite-code join and the
-    addressed-invite accept paths."""
+    addressed-invite accept paths.
+
+    `wrapped_space_keys` is the accept path handing over a ring the inviter
+    wrapped before this member existed in the space. Setting it here is what makes
+    a new member able to read the space the moment they join, instead of waiting
+    for somebody else's app to be running.
+    """
     now = _now_ms()
 
     existing = await db.scalar(
@@ -231,6 +244,8 @@ async def add_membership(db: AsyncSession, s: Space, uid: uuid.UUID) -> None:
         space_id=s.id,
         user_id=uid,
         role="member",
+        wrapped_space_keys=wrapped_space_keys,
+        wrapped_by=wrapped_by,
         history_from_ts=None if s.share_history else now,
         joined_at=now,
     )
@@ -276,14 +291,35 @@ async def remove_member(
         return
 
     await db.delete(m)
-    # A departure invalidates the Space Key: clear every remaining member's
-    # wrapped keyring so the owner's next reconcile mints a fresh key and
-    # redistributes. Until that lands, members decrypt with the keys they hold
-    # in memory — nothing breaks, they just show `has_space_key=false` briefly.
-    # Without this, the removed member could keep reading new entries forever.
+    # A departure invalidates the Space Key: clear the other members' wrapped
+    # keyrings so the owner's next reconcile mints a fresh key and redistributes.
+    # Until that lands, members decrypt with the keys they hold in memory —
+    # nothing breaks, they just show `has_space_key=false` briefly. Without this,
+    # the removed member could keep reading new entries forever.
+    #
+    # The owner's own wrap is deliberately left alone, and `rekey_requested_at`
+    # carries the signal instead. The owner's ring lives only in memory, and this
+    # wrap is the only way it survives a restart: clearing it too meant a restart
+    # between the departure and the redistribution destroyed the previous keys,
+    # and with them every entry ever shared in the space.
     remaining = await db.scalars(select(SpaceMembership).where(SpaceMembership.space_id == space_id))
     for member in remaining.all():
-        member.wrapped_space_keys = None
+        if member.user_id != s.owner_id:
+            member.wrapped_space_keys = None
+            member.wrapped_by = None
+    s.rekey_requested_at = _now_ms()
+    # Any key already wrapped onto a pending invite is now the *previous* key, and
+    # a joiner adopting it would fail the fingerprint check the owner is about to
+    # publish. Drop it: they join without a key and the ordinary distribution path
+    # picks them up, which is the same place they were before invites carried one.
+    pending = await db.scalars(
+        select(SpaceInvite).where(
+            SpaceInvite.space_id == space_id,
+            SpaceInvite.wrapped_space_keys.is_not(None),
+        )
+    )
+    for inv in pending.all():
+        inv.wrapped_space_keys = None
     await db.commit()
 
 
@@ -300,14 +336,42 @@ async def delete_space(db: AsyncSession, space_id: uuid.UUID, user_id: str) -> N
 
 async def distribute_keys(
     db: AsyncSession, space_id: uuid.UUID, user_id: str, req: DistributeKeysRequest
-) -> None:
+) -> list[uuid.UUID]:
+    """Store per-member wrapped keyrings. Returns the members actually written.
+
+    Any member may hand the key over, not only the owner. Every member already
+    holds the Space Key in memory and could pass it on by other means, so
+    owner-only was never a boundary against a member who wanted to leak - only
+    against one who never intended to, at the cost of leaving a newcomer blocked
+    whenever the owner's app was closed.
+
+    What the caller may not do is decide what the key *is*: `key_fingerprint` is
+    honoured only from the owner, who is the only one that mints one. A member
+    relaying a ring has nothing new to declare, and writing here would let it
+    redefine what everyone else verifies against - which is the check that catches
+    a bad ring in the first place.
+
+    `wrapped_by` records the caller so the recipient knows whose public key to
+    compute its shared secret against.
+    """
     uid = uuid.UUID(user_id)
     s = await db.scalar(select(Space).where(Space.id == space_id))
     if not s:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Space not found")
-    if s.owner_id != uid:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
 
+    caller = await db.scalar(
+        select(SpaceMembership).where(
+            SpaceMembership.space_id == space_id, SpaceMembership.user_id == uid
+        )
+    )
+    if not caller:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member")
+
+    is_owner = s.owner_id == uid
+    if is_owner and req.key_fingerprint:
+        s.key_fingerprint = req.key_fingerprint
+
+    written: list[uuid.UUID] = []
     for entry in req.wrapped_keyrings:
         m = await db.scalar(
             select(SpaceMembership).where(
@@ -315,9 +379,24 @@ async def distribute_keys(
                 SpaceMembership.user_id == entry.user_id,
             )
         )
-        if m:
-            m.wrapped_space_keys = entry.wrapped_space_keys
+        if not m:
+            continue
+        m.wrapped_space_keys = entry.wrapped_space_keys
+        m.wrapped_by = uid
+        written.append(m.user_id)
+
+    # The owner has re-wrapped for whoever needed it, so the departure that owed a
+    # rekey is settled. Only the owner can settle it: a member relaying the old
+    # ring has not rotated anything.
+    if is_owner and s.rekey_requested_at is not None:
+        remaining = (
+            await db.scalars(select(SpaceMembership).where(SpaceMembership.space_id == space_id))
+        ).all()
+        if all(m.wrapped_space_keys is not None for m in remaining):
+            s.rekey_requested_at = None
+
     await db.commit()
+    return written
 
 
 async def remove_entry_from_space(
