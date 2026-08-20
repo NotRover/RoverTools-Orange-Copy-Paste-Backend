@@ -98,7 +98,12 @@ owns only what the app itself must store:
   public key and, later, the wrapped UMK); returns a `device_id` the client sends
   back as `X-Device-Id`.
 - **Public-key management** — store the user's X25519 identity key and per-device
-  wrapped UMK for multi-device E2E.
+  wrapped UMK for multi-device E2E. The identity key is **write-once**: it is derived
+  from the UMK, so every device of an account derives the same one and an honest client
+  sends the same value forever. A *different* value means the caller holds a bearer
+  token rather than the UMK, and accepting it would redirect every future Space Key
+  wrap to a key they own — so a change is refused with 409. Device keys stay writable,
+  since each only ever opens that device's own copy of the UMK.
 
 The backend never issues tokens; it only **verifies** the Supabase JWT (HS256,
 project secret) on protected routes.
@@ -167,7 +172,8 @@ no member cap, and no server-side scope. See section 15.
   distribution.
 - **Addressed invites** (`invites.py`) — one persistent row per (space, invitee email)
   with accept / decline / revoke and live `invite:*` events, alongside the bearer
-  invite code. Mounted separately under `/api/v1/invites`.
+  invite code. Mounted separately under `/api/v1/invites`. An invite can carry the
+  Space Key wrapped for the invitee, which the accept moves onto the new membership.
 
 What flows *into* a space (send filters) and what a receiving client does with an
 incoming entry (auto-copy) are client-side choices stored in the encrypted settings
@@ -371,6 +377,8 @@ CREATE TABLE spaces (
     invite_code       TEXT UNIQUE,        -- bearer secret; 8 chars, 72 h TTL
     invite_expires_at BIGINT,
     share_history     BOOLEAN NOT NULL DEFAULT true,  -- may later joiners read older entries?
+    key_fingerprint    TEXT,     -- truncated hash of the newest Space Key (section 7.4)
+    rekey_requested_at BIGINT,   -- set when a departure demands a new key (section 7.4)
     created_at        BIGINT NOT NULL
 );
 CREATE INDEX idx_spaces_owner_id ON spaces(owner_id);
@@ -386,6 +394,17 @@ retyped; the API normalizes case and strips `-`/spaces on join, and displays it 
 time**, so flipping it later does not retroactively widen what an existing member can
 pull.
 
+`key_fingerprint` is written by the owner alone, when it mints a key, and is what lets a
+recipient tell a genuine keyring from one a member made up. Any member may hand a key
+over (section 7.4), so the server -- which cannot open a wrap -- is no longer the only
+thing standing between a newcomer and a wrong key. A hash of 32 random bytes reveals
+nothing about the key it names.
+
+`rekey_requested_at` is the rekey signal. It used to be implicit: a departure cleared
+every member's wrap, and a client seeing an empty wrap while holding keys knew to mint.
+That destroyed the owner's own recovery path, so the flag now carries the request and the
+owner's wrap survives (section 7.4).
+
 ### 4.7 `space_memberships`
 
 ```sql
@@ -394,6 +413,7 @@ CREATE TABLE space_memberships (
     user_id            UUID NOT NULL,
     role               TEXT NOT NULL DEFAULT 'member',  -- 'owner' | 'member'
     wrapped_space_keys TEXT,      -- JSON array of X25519-wrapped Space Keys, newest first (section 7.4)
+    wrapped_by         UUID,      -- who wrapped it; NULL means the owner did
     history_from_ts    BIGINT,    -- pull floor; NULL = full history
     joined_at          BIGINT NOT NULL,
     PRIMARY KEY (space_id, user_id)
@@ -410,6 +430,11 @@ because a rekey must not make older entries unreadable: previous Space Keys exis
 nowhere else, so a member who restarts after a rekey recovers the whole ring and can
 still decrypt entries written under earlier keys. `NULL` is meaningful — it is the
 signal that this member needs a (re)distribution (section 7.4).
+
+`wrapped_by` names the account whose public key the recipient must compute its shared
+secret against. It exists because distribution is no longer owner-only: with several
+possible writers the recipient can no longer assume the counterparty. `NULL` keeps
+meaning "the owner", so every row written before migration 0017 still opens.
 
 ### 4.8 `blobs`
 
@@ -472,11 +497,13 @@ erDiagram
         string status "pending | accepted | declined | revoked"
         bigint created_at
         bigint expires_at "judged at read time"
+        text wrapped_space_keys "keyring pre-wrapped for the invitee, nullable"
     }
     space_memberships {
         uuid space_id PK
         uuid user_id PK
         text wrapped_space_keys "wrapped keyring JSON array, nullable"
+        uuid wrapped_by "who wrapped it; NULL = the owner"
         bigint history_from_ts "pull floor, nullable"
     }
 ```
@@ -553,6 +580,8 @@ DELETE /api/v1/auth/devices/{device_id}         -- soft-revoke; clears wrapped_u
 
 POST   /api/v1/auth/keys/register               -- requires X-Device-Id
        Body: { identity_pubkey, device_pubkey }  (base64 X25519)
+       409 when identity_pubkey differs from the one already stored: it is derived
+       from the UMK and never legitimately changes (section 2.1).
 
 GET    /api/v1/auth/umk/device                  -- requires X-Device-Id
        Returns: { wrapped_umk }   -- the UMK wrapped for the calling device;
@@ -650,13 +679,16 @@ POST   /api/v1/spaces/join               Body: { invite_code } → { space_id, n
        410 when the code has expired; idempotent if already a member.
 DELETE /api/v1/spaces/{space_id}/members/{member_user_id}
        Owner removes a member, or a member removes themselves. 400 if the target is
-       the owner (delete the space instead). Clears every remaining member's
-       wrapped keyring to trigger a rekey (section 7.4).
+       the owner (delete the space instead). Clears the remaining *non-owner* wraps
+       and stamps spaces.rekey_requested_at to ask for a new key (section 7.4).
 DELETE /api/v1/spaces/{space_id}         -- owner only; cascades memberships + invites
 POST   /api/v1/spaces/{space_id}/invites Body: { email }   -- owner only; see section 5.6
-POST   /api/v1/spaces/{space_id}/keys    -- owner only
-       Body: { wrapped_keyrings: [{ user_id, wrapped_space_keys }] }
-       wrapped_space_keys is a JSON array string; stored verbatim on the membership.
+POST   /api/v1/spaces/{space_id}/keys    -- any member holding the keyring
+       Body: { wrapped_keyrings: [{ user_id, wrapped_space_keys }], key_fingerprint? }
+       wrapped_space_keys is a JSON array string; stored verbatim on the membership,
+       alongside wrapped_by = the caller. key_fingerprint is honoured from the space
+       owner only, and clears rekey_requested_at once every member holds a wrap.
+       space:rekey is published only to members actually written.
 ```
 
 `SpaceOut`:
@@ -673,16 +705,21 @@ POST   /api/v1/spaces/{space_id}/keys    -- owner only
     "has_space_key": true,                      // holds a keyring? presence only, never the bytes
     "online": true                              // any device connected, from Redis presence
   }],
-  "my_wrapped_space_keys": "[\"...\",\"...\"] | null"   // only ever the caller's own keyring
+  "my_wrapped_space_keys": "[\"...\",\"...\"] | null",  // only ever the caller's own keyring
+  "my_wrapped_by": "uuid | null",         // whose public key opens it; null = the owner
+  "key_fingerprint": "base64 | null",     // what a received keyring is checked against
+  "rekey_requested_at": 1234567           // non-null = this space is waiting for a new key
 }
 ```
 
-Three fields carry the key-distribution contract. `identity_pubkey` is what the owner
-wraps for. `has_space_key` lets the owner wrap only for members who need one — without
-it, every reconcile would re-distribute to everybody, the server would echo that back
-as `space:rekey`, and clients would loop. `my_wrapped_space_keys` is the restart
-recovery path, since Space Keys live in client memory only and `space:rekey` is
-fire-and-forget. A member's keyring is never exposed to anyone else.
+Six fields carry the key-distribution contract. `identity_pubkey` is what a distributor
+wraps for. `has_space_key` lets it wrap only for members who need one — without it, every
+reconcile would re-distribute to everybody, the server would echo that back as
+`space:rekey`, and clients would loop. `my_wrapped_space_keys` is the restart recovery
+path, since Space Keys live in client memory only and `space:rekey` is fire-and-forget;
+`my_wrapped_by` says whose public key opens it. `key_fingerprint` is what the recipient
+checks the unwrapped ring against, and `rekey_requested_at` is the request for a new one.
+A member's keyring is never exposed to anyone else.
 
 There is no rotate-invite-code route: a space's code is minted once at creation.
 
@@ -695,8 +732,13 @@ expiry (72 h) is judged at read/accept time, no sweeper.
 ```
 POST   /api/v1/spaces/{id}/invites   Body: { email }   -- owner only, requires X-Device-Id
        Returns: 201 { id, space_id, space_name, inviter_id, inviter_name,
-                      invitee_email, status, created_at, expires_at }
+                      invitee_email, status, created_at, expires_at,
+                      invitee_identity_pubkey, has_space_key }
+       The last two are returned to the inviter only, so it can pre-wrap the keyring;
+       the copy published to the invitee omits both.
        400 if it's the caller's own email; 409 if already a member.
+       The invitee must already have an account -- 404 otherwise -- so a key can
+       always be wrapped for them at this point.
        Refreshes an existing pending invite instead of stacking duplicates.
        Publishes invite:received to the invitee when resolvable; emails the code.
 GET    /api/v1/invites               Returns: { sent: [...], received: [...] }
@@ -705,6 +747,11 @@ GET    /api/v1/invites               Returns: { sent: [...], received: [...] }
 POST   /api/v1/invites/{id}/accept   Joins the space; same events as a code join
 POST   /api/v1/invites/{id}/decline
 DELETE /api/v1/invites/{id}          -- inviter revokes a pending invite; needs X-Device-Id
+PUT    /api/v1/invites/{id}/key      Body: { wrapped_space_keys }  -- inviter only, pending only
+       Attaches the keyring wrapped for invitee_identity_pubkey. Accept moves it onto
+       the new membership (wrapped_by = the inviter) and clears it from the invite, so
+       the member can read the space the moment they join with nobody else online.
+       Re-inviting drops a stale wrap rather than reusing it.
 ```
 
 `GET /invites` and the accept / decline routes authenticate on the bearer token alone,
@@ -1010,44 +1057,72 @@ at all.
 
 ### 7.4 Space Key Distribution and Rekey
 
-Every space has a **Space Key**: a random 32-byte key held in client memory, minted and
-distributed by the **owner**. It never encrypts content directly — it only wraps per-entry
-CEKs (section 7.2). A member's copy is wrapped for their identity key:
+Every space has a **Space Key**: a random 32-byte key held in client memory, **minted** by
+the owner and handed over by **any member who holds it**. It never encrypts content
+directly — it only wraps per-entry CEKs (section 7.2). A member's copy is wrapped for their
+identity key:
 
 ```
-shared  = X25519(owner_identity_priv, member_identity_pubkey)
+shared  = X25519(distributor_identity_priv, member_identity_pubkey)
 wrapped = wrap(shared, SpaceKey)
 ```
 
-Because X25519 is symmetric in the pair, the member derives the same secret from
-`X25519(their_priv, owner_identity_pubkey)` — which is why `SpaceOut.members[].identity_pubkey`
-includes the owner's key. The owner also wraps for themselves (`X25519(priv, own_pub)` is a
-valid secret); that is how the owner recovers after a restart.
+Because X25519 is symmetric in the pair, the recipient derives the same secret from
+`X25519(their_priv, distributor_identity_pubkey)` — which is why
+`SpaceOut.members[].identity_pubkey` carries every member's key, and why `my_wrapped_by`
+says which of them to use (null = the owner). A distributor also wraps for itself
+(`X25519(priv, own_pub)` is a valid secret); that is how a member recovers its ring after a
+restart.
+
+Handing the key over was owner-only until migration 0017, and the cost was a real
+blockage: a member who joined while the owner's app was closed could neither read the space
+nor write to it, for as long as that lasted. Widening it gives up nothing, because every
+member already holds the key in memory and could pass it on by other means — the
+restriction only ever stopped members who had no intention of leaking. Minting stays
+owner-only, so there is still exactly one account deciding what the current key is.
+
+**Verifying a received ring.** The server stores whatever wrap it is handed and cannot
+check it. With more than one possible writer, a member could hand a newcomer a key that is
+not this space's: the unwrap would succeed and the victim would silently decrypt nothing.
+So the owner writes `spaces.key_fingerprint` when it mints, and a recipient checks the
+unwrapped ring against it before adopting it. A mismatch is surfaced as an error rather
+than retried, since retrying cannot fix a wrong key. A self-write needs no check.
 
 **The keyring.** `space_memberships.wrapped_space_keys` is a JSON *array*, newest key
 first, and every distribution sends the whole ring. Older keys must survive a rekey or
 entries written under them become permanently unreadable, and they exist nowhere but in
 client memory and these wraps.
 
-**Owner-side reconcile** runs on login, on `space:rekey`, and after any membership change.
-For each space the owner is in, given `GET /spaces`:
+**Reconcile** runs on login, on WebSocket connect, on `space:rekey`, and after any
+membership change. Every member runs it, for each space it is in, given `GET /spaces`:
 
-1. Recover the local ring by unwrapping `my_wrapped_space_keys` against the owner's key.
-   An empty/absent wrap does **not** clear the in-memory ring.
-2. If the ring is empty, mint one key. If the server returned an *empty* keyring while the
-   client still holds keys, that is the rekey signal: mint a new key and **prepend** it.
+1. Recover the local ring by unwrapping `my_wrapped_space_keys` against the public key
+   `my_wrapped_by` names. Verify it against `key_fingerprint`; on mismatch, refuse and
+   report. An empty or absent wrap does **not** clear the in-memory ring.
+2. Only the owner mints. An empty ring means a first key; a non-null `rekey_requested_at`
+   while the ring is non-empty means a new key **prepended** to it, published with a fresh
+   `key_fingerprint`.
 3. Wrap the full ring for every member with `has_space_key = false` (or for everyone, if a
    key was just minted) and `POST /spaces/{id}/keys`. Members with no registered
    `identity_pubkey` are skipped and retried on the next reconcile.
 
 Distribution only happens while someone lacks keys, so the `space:rekey` events the server
-echoes back cannot drive an endless reconcile loop.
+echoes back cannot drive an endless reconcile loop. A member who cannot yet be helped is
+retried on a backoff, and any keyholder coming online is another chance — in a space with
+more than one person, somebody nearly always is.
 
 **Rekey on departure.** When a member is removed or leaves, the server deletes the
-membership and sets `wrapped_space_keys = NULL` for *every remaining member* — including
-the owner. That is the entire server-side mechanism; the server never sees a key. The
-owner's next reconcile prepends a fresh key and redistributes, and entries pushed from then
-on wrap their CEK under the new key, which the departed member never receives.
+membership, clears `wrapped_space_keys` for every remaining **non-owner** member, and sets
+`spaces.rekey_requested_at`. That is the entire server-side mechanism; the server never
+sees a key. The owner's next reconcile prepends a fresh key and redistributes, and entries
+pushed from then on wrap their CEK under the new key, which the departed member never
+receives. Distribution clears the flag once every remaining member holds a wrap.
+
+The owner's own wrap is deliberately left alone. Clearing it too — which is what happened
+before migration 0017 — meant that if the owner's app restarted before redistributing, the
+previous ring was gone, because it lived only in memory and in the wrap just deleted.
+Everything ever shared in that space became unreadable for everyone, permanently, and any
+member could trigger it by leaving.
 
 Revocation is **best-effort by construction**, and the edges are real:
 
@@ -1056,12 +1131,13 @@ Revocation is **best-effort by construction**, and the edges are real:
 - Between the removal and the owner's reconcile, remaining members show
   `has_space_key = false` but keep decrypting with the ring already in memory. Nothing
   breaks; the state is transient.
-- If the owner's client restarts in that window, the previous ring is gone (it lived only
-  in memory once the server cleared the wraps). Reconcile then mints a *first* key rather
-  than prepending, and entries written under the old keys become unreadable for everyone,
-  the owner included.
-- A rekey needs the owner online. Until then no new key exists, and a removed member who
-  still holds the old key could decrypt entries pushed under it.
+- A rekey needs the owner online, since only the owner mints. Until then no new key
+  exists, and a removed member who still holds the old key could decrypt entries pushed
+  under it.
+- A wrap is opened against a public key the *server* returned, unpinned. That is fine
+  against a passive server, which is the threat model here; an active malicious server
+  could substitute a key it owns. The fingerprint check defends against another member,
+  not against the server that also serves the fingerprint.
 
 ```mermaid
 sequenceDiagram
@@ -1071,15 +1147,16 @@ sequenceDiagram
     participant O as Owner client
 
     J->>API: POST /spaces/join (or /invites/{id}/accept)
+    Note over API: an accepted invite may already carry a wrap:<br/>moved onto the membership, nobody has to be online
     API->>R: space:{id} + user:{joiner} space:membership_changed
     R-->>O: membership_changed → reconcile
     O->>API: GET /spaces  (joiner: has_space_key=false, identity_pubkey)
-    Note over O: wrapped[] = ring.map(k => wrap(X25519(owner_priv, joiner_pub), k))
+    Note over O: any keyholder, not only the owner<br/>wrapped[] = ring.map(k => wrap(X25519(my_priv, joiner_pub), k))
     O->>API: POST /spaces/{id}/keys [{user_id, wrapped_space_keys}]
-    API->>API: persist the keyring on the membership
+    API->>API: persist the keyring + wrapped_by on the membership
     API->>R: user:{joiner} space:rekey
-    R-->>J: space:rekey → unwrap ring, cache in memory
-    Note over J,API: restart: GET /spaces returns my_wrapped_space_keys<br/>+ owner identity_pubkey → unwrap the ring again
+    R-->>J: space:rekey → unwrap ring, check key_fingerprint, cache in memory
+    Note over J,API: restart: GET /spaces returns my_wrapped_space_keys<br/>+ my_wrapped_by → unwrap the ring again
 ```
 
 ### 7.5 Server Visibility

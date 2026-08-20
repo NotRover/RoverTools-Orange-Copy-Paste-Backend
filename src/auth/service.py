@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import uuid
 from datetime import UTC, datetime
@@ -9,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.models import Device, Profile
 from src.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _now_ms() -> int:
@@ -213,7 +216,22 @@ async def store_public_keys(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     if device.user_id != profile.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your device")
+    # The identity keypair is derived from the UMK, so every device of an account
+    # derives the same one and an honest client sends the same value forever. A
+    # *different* value therefore means the caller does not hold the UMK - it holds
+    # a bearer token and is trying to become the account's key. Space Keys are
+    # wrapped to whatever sits in this column, so accepting that would hand over
+    # every space the account is in from then on. First write wins; a change is
+    # refused rather than merged.
+    if profile.identity_pubkey and profile.identity_pubkey != identity_pubkey:
+        logger.warning("Refused identity pubkey change for profile %s", profile.id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Identity key already registered for this account",
+        )
     profile.identity_pubkey = identity_pubkey
+    # Device keys are per device and legitimately re-registered, so this one stays
+    # writable: it only ever unwraps that device's own copy of the UMK.
     device.device_pubkey = device_pubkey
     await db.commit()
 

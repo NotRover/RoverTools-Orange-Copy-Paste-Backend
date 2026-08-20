@@ -226,13 +226,24 @@ async def distribute_keys(
 ):
     """Distribute per-member wrapped keyrings after a membership or rekey event.
 
+    Any member of the space may call this, not only the owner - see
+    `service.distribute_keys` for why that costs nothing and what it fixes. The
+    fingerprint in the body is still owner-only.
+
     Requires: Bearer token + X-Device-Id header.
     Emits `space:rekey` to each target member's user channel.
     """
     user_id, _ = current
-    await service.distribute_keys(db, space_id, user_id, body)
+    written = await service.distribute_keys(db, space_id, user_id, body)
+    # Announce only what was stored. A keyring for someone who has since left is
+    # dropped by the service, and telling them to reconcile would send them
+    # looking for a space they are no longer in.
+    stored = {str(u) for u in written}
     for entry in body.wrapped_keyrings:
-        await rt.publish_space_rekey(redis, str(space_id), str(entry.user_id), entry.wrapped_space_keys)
+        if str(entry.user_id) in stored:
+            await rt.publish_space_rekey(
+                redis, str(space_id), str(entry.user_id), entry.wrapped_space_keys
+            )
 
 
 # ── Comments ──────────────────────────────────────────────────────────────────
