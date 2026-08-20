@@ -377,6 +377,7 @@ CREATE TABLE spaces (
     invite_code       TEXT UNIQUE,        -- bearer secret; 8 chars, 72 h TTL
     invite_expires_at BIGINT,
     share_history     BOOLEAN NOT NULL DEFAULT true,  -- may later joiners read older entries?
+    members_can_approve BOOLEAN NOT NULL DEFAULT false, -- may members decide join requests?
     key_fingerprint    TEXT,     -- truncated hash of the newest Space Key (section 7.4)
     rekey_requested_at BIGINT,   -- set when a departure demands a new key (section 7.4)
     created_at        BIGINT NOT NULL
@@ -389,6 +390,13 @@ There is no space *type* and no member cap. `invite_code` is drawn from
 retyped; the API normalizes case and strips `-`/spaces on join, and displays it as
 `KX7Q-2M4X`. Anything longer than 8 characters is treated as a legacy
 `token_urlsafe` code and matched case-sensitively.
+
+Redeeming a code no longer joins the space. It raises a row in
+`space_join_requests` (section 4.10) that somebody already inside has to approve, so a
+leaked or forwarded code buys a knock rather than a membership. `members_can_approve`
+is the only control over who may answer: owner alone by default, or the owner and any
+member. Addressed invites (section 4.9) are unaffected - naming someone by email *is*
+the approval.
 
 `share_history` is resolved into the joining member's `history_from_ts` **at join
 time**, so flipping it later does not retroactively widen what an existing member can
@@ -507,6 +515,48 @@ erDiagram
         bigint history_from_ts "pull floor, nullable"
     }
 ```
+
+---
+
+### 4.10 `space_join_requests`
+
+The anonymous counterpart to `space_invites`. An invite is addressed and starts with
+the inviter; a request starts with the joiner, whom nobody named, so it carries no
+inviter, no invitee email, and nothing to deliver. Overloading `space_invites` would
+leave half its columns null on every row and put a discriminator in every query.
+
+```sql
+CREATE TABLE space_join_requests (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    space_id           UUID NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+    user_id            UUID NOT NULL,      -- profiles.id of whoever pasted the code
+    status             TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | declined
+    wrapped_space_keys TEXT,               -- the approver's wrap, handed to the membership
+    wrapped_by         UUID,               -- whose public key opens it
+    created_at         BIGINT NOT NULL,
+    decided_at         BIGINT,
+    decided_by         UUID
+);
+CREATE UNIQUE INDEX ix_join_requests_space_user   ON space_join_requests(space_id, user_id);
+CREATE INDEX        ix_join_requests_space_status ON space_join_requests(space_id, status);
+CREATE INDEX        ix_join_requests_user         ON space_join_requests(user_id);
+```
+
+The unique index is the abuse cap: a leaked code lets strangers knock, and a knock
+must not stack. A declined row is kept rather than deleted, because it is both what
+stops the same person knocking again on a code they still hold and the only record
+anyone has that somebody tried.
+
+One exception to that: an `approved` row whose membership is gone, because the member
+left afterwards. Refusing there would lock them out of a code they still hold with no
+way back, so `request_join` reopens the spent row instead of refusing or duplicating it.
+
+`wrapped_space_keys` is why approval is worth the round trip. Whoever approves is by
+definition online and holding the keyring at that moment - they are the one clicking -
+so the approval writes the wrap in the same call and `add_membership` moves it onto the
+new membership, exactly as an accepted invite does. The joiner goes from pending
+straight to readable. Joining by code used to be instant and then unreadable for as
+long as it took somebody's app to notice.
 
 ---
 
@@ -675,8 +725,28 @@ POST   /api/v1/spaces                    Body: { name, share_history?: true }
        Returns: 201 { space_id, invite_code }   -- caller becomes owner, full history
 GET    /api/v1/spaces                    Returns: [SpaceOut]   -- every space the caller is in
 GET    /api/v1/spaces/{space_id}         Returns: SpaceOut      -- 403 if not a member
-POST   /api/v1/spaces/join               Body: { invite_code } → { space_id, name }
-       410 when the code has expired; idempotent if already a member.
+GET    /api/v1/spaces/my-join-requests   Returns: [{ space_id, space_name, created_at }]
+       The caller's own outstanding knocks. A pending request is not a membership, so
+       these spaces are absent from GET /spaces and the wait would otherwise be a blank
+       screen. Declared *above* /{space_id}, which takes a UUID and would shadow it
+       into a 422.
+POST   /api/v1/spaces/join               Body: { invite_code }
+       → { status: "pending" | "declined", space_name }
+       Raises a join request; does not join (section 4.10). The space name is the only
+       thing leaked, and the caller needs it to know what they asked for. 410 when the
+       code has expired; already a member returns the name and changes nothing;
+       knocking twice returns the same pending row rather than stacking one.
+GET    /api/v1/spaces/{space_id}/join-requests
+       Returns: [{ id, user_id, display_name, avatar_url, identity_pubkey, created_at }]
+       Pending rows only, for a caller who may approve. 403 otherwise.
+POST   /api/v1/spaces/{space_id}/join-requests/{request_id}/approve   -> 204
+       Body: { wrapped_space_keys?: "[...]" } -- same shape as PUT /invites/{id}/key.
+       Handed to add_membership, so the joiner can read immediately. 409 if the request
+       was already decided.
+POST   /api/v1/spaces/{space_id}/join-requests/{request_id}/decline   -> 204
+PATCH  /api/v1/spaces/{space_id}         Body: { share_history?, members_can_approve? }
+       Owner only. Both fields optional and applied independently, so setting one
+       cannot clobber the other.
 DELETE /api/v1/spaces/{space_id}/members/{member_user_id}
        Owner removes a member, or a member removes themselves. 400 if the target is
        the owner (delete the space instead). Clears the remaining *non-owner* wraps
@@ -698,6 +768,9 @@ POST   /api/v1/spaces/{space_id}/keys    -- any member holding the keyring
   "id": "...", "owner_id": "...", "name": "...",
   "invite_code": "KX7Q2M4X", "invite_expires_at": 1234567, "share_history": true,
   "created_at": 1234567,
+  "members_can_approve": false,   // the owner's choice about who answers a knock
+  "i_can_approve": true,          // derived by service.may_approve -- the one definition
+  "pending_join_requests": 0,     // counted only for a caller who may act on it
   "members": [{
     "user_id": "...", "display_name": "...", "avatar_url": null,
     "role": "owner|member", "joined_at": 1234567,
@@ -721,7 +794,15 @@ path, since Space Keys live in client memory only and `space:rekey` is fire-and-
 checks the unwrapped ring against, and `rekey_requested_at` is the request for a new one.
 A member's keyring is never exposed to anyone else.
 
+`i_can_approve` and `pending_join_requests` are derived server-side rather than left
+to the client, so the rule about who may approve has exactly one definition
+(`service.may_approve`) and a client cannot drift from it. The count comes back as zero
+to anybody who could not act on it anyway.
+
 There is no rotate-invite-code route: a space's code is minted once at creation.
+Rotating it on approval was considered and dropped - the code is printed on links and
+sitting in mailboxes, so rotating it silently breaks every one of them, and approval
+already neutralises a leaked code, which is what rotation was for.
 
 ### 5.6 Invite Routes (addressed invites)
 
@@ -744,7 +825,8 @@ POST   /api/v1/spaces/{id}/invites   Body: { email }   -- owner only, requires X
 GET    /api/v1/invites               Returns: { sent: [...], received: [...] }
        received = pending, unexpired, matched by user id or the token's email claim
        sent = the caller's 50 most recent, any status, so outcomes are visible
-POST   /api/v1/invites/{id}/accept   Joins the space; same events as a code join
+POST   /api/v1/invites/{id}/accept   Joins the space immediately -- no approval step,
+                                     because naming an email *is* the approval
 POST   /api/v1/invites/{id}/decline
 DELETE /api/v1/invites/{id}          -- inviter revokes a pending invite; needs X-Device-Id
 PUT    /api/v1/invites/{id}/key      Body: { wrapped_space_keys }  -- inviter only, pending only
@@ -832,6 +914,8 @@ demand (see `resubscribe` below).
 { "event": "space:entry_removed", "payload": { "space_id": "...", "client_id": "...", "entry_type": "clipboard|note", "author_id": "...", "removed_by": "..." } }
 { "event": "space:membership_changed", "payload": { "space_id": "...", "action": "joined|left|deleted", "user_id": "..." } }
 { "event": "space:rekey",  "payload": { "space_id": "...", "wrapped_space_keys": "[...]" } }
+{ "event": "space:join_requested", "payload": { "space_id": "...", "request": { ...JoinRequestOut } } }
+{ "event": "space:join_decided",   "payload": { "space_id": "...", "decision": "approved|declined" } }
 { "event": "invite:received",      "payload": { ...InviteOut } }
 { "event": "invite:updated",       "payload": { "invite_id": "...", "status": "accepted|declined|revoked", "space_id": "..." } }
 { "event": "settings:updated",     "payload": { "updated_at": 1234567 } }
@@ -862,6 +946,11 @@ Routing rules worth knowing when implementing a client:
   user's own channel, because the joiner is not on the space channel yet and a removed
   member may already be off it. `action: "deleted"` is published *before* the row is
   deleted, while the channel still has subscribers.
+- `space:join_requested` goes to the space channel when `members_can_approve` is set
+  and to the owner's own channel when it is not, so the fan-out matches who may act on
+  it rather than being filtered client-side. `space:join_decided` is addressed to the
+  requester's own channel - they are not on the space channel, and after a decline they
+  never will be.
 - `space:rekey` is addressed to one member's own channel and is fire-and-forget: nothing
   retries it. A client that was offline recovers the same keyring from
   `SpaceOut.my_wrapped_space_keys` on its next `GET /spaces`.
@@ -1146,8 +1235,9 @@ sequenceDiagram
     participant R as Redis pub/sub
     participant O as Owner client
 
-    J->>API: POST /spaces/join (or /invites/{id}/accept)
-    Note over API: an accepted invite may already carry a wrap:<br/>moved onto the membership, nobody has to be online
+    J->>API: POST /spaces/join -> a join request, not a membership
+    O->>API: POST .../join-requests/{id}/approve { wrapped_space_keys }
+    Note over API: approve and accept both arrive carrying a wrap:<br/>moved onto the membership, so the joiner reads at once
     API->>R: space:{id} + user:{joiner} space:membership_changed
     R-->>O: membership_changed → reconcile
     O->>API: GET /spaces  (joiner: has_space_key=false, identity_pubkey)
@@ -1426,6 +1516,7 @@ and the server has no view into that decision.
 Owner   → POST /api/v1/spaces { name, share_history }
           → { space_id, invite_code }; owner membership with history_from_ts = NULL
 Invitee → POST /api/v1/spaces/join { invite_code }            -- bearer secret path
+          → a join request; an approver posts .../approve with the wrapped ring
        or POST /api/v1/invites/{id}/accept                    -- addressed path (section 5.6)
           → membership added, history floor resolved from share_history at join time
 Owner   → reconciles and posts the wrapped keyring (section 7.4)

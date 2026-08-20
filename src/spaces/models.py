@@ -15,6 +15,9 @@ class Space(Base):
     realtime, and encrypted client-side under a Space Key the server never sees.
     What flows into a space (send filters) and what happens to incoming entries
     (auto-copy) are client-side choices; the server only routes ciphertext.
+
+    `invite_code` introduces a space; it no longer authorises entry to one.
+    Redeeming it raises a `SpaceJoinRequest` that somebody inside approves.
     """
 
     __tablename__ = "spaces"
@@ -36,6 +39,13 @@ class Space(Base):
     rekey_requested_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Owner's choice: may someone who joins later read entries from before they joined?
     share_history: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    # Owner's choice: may any member approve a join request, or only the owner?
+    # The whole of the approval policy - deliberately one boolean rather than a
+    # third role, because approving is not renaming, deleting, or removing
+    # members, and a removal forces a rekey of the entire space.
+    members_can_approve: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
@@ -94,6 +104,52 @@ class SpaceMembership(Base):
     joined_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class SpaceJoinRequest(Base):
+    """Somebody redeemed this space's invite code and is waiting to be let in.
+
+    The counterpart to `SpaceInvite`, from the other direction. An invite is
+    addressed - the owner names an email, which *is* the approval, so that path
+    never lands here. A request is anonymous: the code says nothing about who is
+    holding it, so a member decides.
+
+    Approval carries the Space Key. Whoever approves is by definition online and
+    holding the keyring at that instant - they are the one clicking - so
+    `wrapped_space_keys` is written in the same action and moves into the
+    membership row, exactly as an invite's pre-wrap does. The requester goes from
+    pending to readable in one step, which is faster than the membership this
+    replaces: that granted access instantly and then left the joiner unable to
+    read anything until somebody else's app happened to be running.
+
+    Declined rows are kept, not deleted. Together with the unique index on
+    (space_id, user_id) they are what stops somebody who still holds the code
+    from knocking again, and they are the only record the owner has that a
+    stranger tried.
+    """
+
+    __tablename__ = "space_join_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No per-column index on either of these: the composite unique index below
+    # serves space_id lookups by prefix, and the requester's own view goes
+    # through ix_join_requests_user. Both are declared at the foot of this file
+    # so they match the migration name for name.
+    space_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending"
+    )  # 'pending' | 'approved' | 'declined'
+    # The approver's keyring, wrapped for the requester's identity key. Cleared
+    # on approval once it has moved into the membership row - a spent request has
+    # no reason to keep key material around.
+    wrapped_space_keys: Mapped[str | None] = mapped_column(Text, nullable=True)
+    wrapped_by: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    decided_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    decided_by: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+
+
 class SpaceComment(Base):
     """One comment written by a member on one entry shared into a space.
 
@@ -132,3 +188,17 @@ class SpaceComment(Base):
 # Threads are read per entry and counted per space, and both go through the
 # space id first, so one composite index serves them together.
 Index("ix_space_comments_thread", SpaceComment.space_id, SpaceComment.client_id, SpaceComment.entry_type)
+
+# One knock per person per space. This is the abuse cap: a leaked code can raise
+# requests where it used to walk straight in, and the uniqueness is what stops
+# those stacking - and what makes a declined row stay in the way.
+Index(
+    "ix_join_requests_space_user",
+    SpaceJoinRequest.space_id,
+    SpaceJoinRequest.user_id,
+    unique=True,
+)
+# The approver's list: pending rows for one space.
+Index("ix_join_requests_space_status", SpaceJoinRequest.space_id, SpaceJoinRequest.status)
+# The requester's own view, across every space they have knocked on.
+Index("ix_join_requests_user", SpaceJoinRequest.user_id)

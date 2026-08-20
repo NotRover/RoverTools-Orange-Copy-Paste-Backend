@@ -18,7 +18,12 @@ class UpdateSpaceRequest(BaseModel):
     # joined, so "share the history" means what it says rather than applying to
     # future joiners only. Turning it OFF never takes history away from someone
     # who can already read it - it only changes what the next joiner gets.
-    share_history: bool
+    #
+    # Both fields are optional so a client can set one without restating the
+    # other; omitting both is a no-op rather than an error.
+    share_history: bool | None = None
+    # Owner-only. May any member approve a join request, or only the owner?
+    members_can_approve: bool | None = None
 
 
 class CreateSpaceResponse(BaseModel):
@@ -73,6 +78,14 @@ class SpaceOut(BaseModel):
     # Set while a departure's rekey is still owed. Only the owner acts on it: it
     # tells their client to mint a new key on top of the ring and redistribute.
     rekey_requested_at: int | None = None
+    # The owner's approval policy, and what it means for *this* caller. The
+    # derived flag is here so no client re-implements the rule and none of them
+    # can disagree with the server about it.
+    members_can_approve: bool = False
+    i_can_approve: bool = False
+    # Pending join requests on this space, for a caller who may approve them.
+    # Zero for everybody else, so the count is safe to render unconditionally.
+    pending_join_requests: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -85,8 +98,17 @@ class JoinRequest(BaseModel):
 
 
 class JoinResponse(BaseModel):
-    space_id: uuid.UUID
-    name: str
+    """The result of redeeming an invite code.
+
+    A code no longer grants membership, so there is no space to return - only
+    the name of the one asked for, which the requester needs to recognise what
+    they are waiting on. `status` is "pending" for a fresh or still-undecided
+    request and "declined" when a previous knock was turned down, which is the
+    one case where the answer is already known.
+    """
+
+    status: Literal["pending", "declined"]
+    space_name: str
 
 
 # ── Key distribution ──────────────────────────────────────────────────────────
