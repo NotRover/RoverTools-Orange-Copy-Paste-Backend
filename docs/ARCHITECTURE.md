@@ -5,6 +5,13 @@
 > **Last updated:** 2026-08-16
 > **Stack:** FastAPI + Supabase (Postgres + Auth) + Redis + S3-compatible blob storage
 
+**Owns:** the wire contract. Routes, payloads, DDL, socket events, the crypto envelope,
+and every rule the server itself enforces. If it crosses the network, its one true
+description is here, and a client doc that disagrees is wrong.
+**Not here:** client internals (`orange-copy-paste-clipboard-app-rust/docs/ARCHITECTURE.md`),
+who-may-do-what (root `docs/PERMISSIONS.md`), cross-component invariants (root
+`docs/ARCHITECTURE.md`). Link to those rather than restating them — one fact, one home.
+
 ---
 
 ## Table of Contents
