@@ -17,17 +17,19 @@ import json
 import logging
 import uuid
 from collections import defaultdict
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Awaitable, cast
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from redis.asyncio import Redis, from_url
+from redis.exceptions import RedisError
 from sqlalchemy import select
 
 from src.auth.tokens import decode_supabase_token
 from src.database import AsyncSessionLocal
 from src.spaces.models import SpaceMembership
-from src.redis_client import get_redis_pool
+from src.redis_client import client_kwargs, get_redis_pool
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["realtime"])
@@ -37,6 +39,17 @@ PING_INTERVAL = 25  # seconds between server pings
 # of one per connected user.
 BROADCAST_CHANNEL = "broadcast:all"
 PRESENCE_TTL = 300  # seconds; refreshed on every client message/pong
+
+# How long the pub/sub listener waits before re-subscribing, and the ceiling it
+# backs off to. A Redis that is restarting comes back in seconds; one that is
+# gone for the afternoon should not be probed every second all afternoon.
+LISTENER_RETRY_SECONDS = 1
+LISTENER_RETRY_CEILING_SECONDS = 30
+
+# Fan-out events Redis would not take. Exposed as a gauge by /internal/metrics:
+# swallowing a publish keeps the request honest, but a silent delivery gap needs
+# somewhere to show up other than a support ticket.
+_dropped_events = 0
 
 
 def _now_ms() -> int:
@@ -63,6 +76,55 @@ async def user_is_online(redis: Redis, user_id: str) -> bool:
         if await redis.exists(presence_key(user_id, device_id)):
             return True
     return False
+
+
+async def presence_for_users(redis: Redis, user_ids: Sequence[str]) -> set[str]:
+    """Which of `user_ids` have at least one live device, in two round trips.
+
+    For response *fields* only. A presence store that is unreachable reports
+    everyone offline rather than failing the request: `online` is documented as a
+    snapshot and no client authorizes anything on it, so a wrong hint beats a 500
+    on a list of spaces that Postgres answered in full.
+
+    Never use this where the answer drives a decision. Both callers of
+    `user_is_online` do - one publishes user-offline on socket teardown, the other
+    sweeps evicted devices - and reporting offline there tells a whole space that
+    a user with live devices went away, with nothing to correct it, since the
+    online announcement only fires on connect.
+
+    Batched rather than a loop over `user_is_online`, because the per-user form is
+    one SMEMBERS plus one EXISTS per device. Called once per member of every space
+    in a list, that is a round trip count that grows with the account - and with a
+    read timeout configured, a slow-but-alive Redis multiplies its own timeout by
+    that number. Two pipelines cannot.
+    """
+    unique = list(dict.fromkeys(user_ids))
+    if not unique:
+        return set()
+    try:
+        devices = redis.pipeline(transaction=False)
+        for user_id in unique:
+            devices.smembers(devices_set_key(user_id))
+        device_sets = await devices.execute()
+
+        # The device set outlives a socket that died without a clean close, so
+        # membership is not presence: each candidate is checked against the TTL
+        # key only a heartbeating device keeps alive.
+        live = redis.pipeline(transaction=False)
+        owners: list[str] = []
+        for user_id, device_ids in zip(unique, device_sets, strict=True):
+            for device_id in device_ids or ():
+                live.exists(presence_key(user_id, device_id))
+                owners.append(user_id)
+        if not owners:
+            return set()
+        results = await live.execute()
+        return {owner for owner, is_live in zip(owners, results, strict=True) if is_live}
+    except RedisError:
+        logger.warning(
+            "presence store unavailable; reporting %d user(s) offline", len(unique)
+        )
+        return set()
 
 
 # ── In-process connection hub ───────────────────────────────────────────────────
@@ -121,39 +183,91 @@ async def _broadcast_local(channel: str, raw: str, exclude_device: str | None = 
 
 
 async def start_listener(redis_url: str) -> None:
-    """Long-lived task (started in app lifespan): forward Redis messages to local sockets."""
-    redis = from_url(redis_url, decode_responses=True)
-    pubsub = redis.pubsub()
-    await pubsub.psubscribe("user:*", "space:*", "broadcast:*")
-    try:
-        async for message in pubsub.listen():
-            if message.get("type") != "pmessage":
-                continue
-            channel = message.get("channel", "")
-            data = message.get("data", "")
-            if not isinstance(data, str):
-                continue
-            try:
-                parsed = json.loads(data)
-                exclude_device: str | None = parsed.pop("_origin_device", None)
-                await _broadcast_local(channel, json.dumps(parsed), exclude_device)
-            except Exception:
-                logger.exception("pubsub dispatch error on channel %s", channel)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await pubsub.aclose()
-        await redis.aclose()
+    """Long-lived task (started in app lifespan): forward Redis messages to local sockets.
+
+    Supervised, because this is the one Redis failure with no HTTP symptom. One
+    `ConnectionError` out of `listen()` used to end the task, and the replica then
+    served every request normally while delivering nothing to any socket it held:
+    no live updates, no error, nothing to alert on. It reconnects instead, and
+    keeps its own subscription rather than borrowing the request pool, since a
+    blocking read has to be configured differently from a request.
+    """
+    delay = LISTENER_RETRY_SECONDS
+    while True:
+        redis = from_url(redis_url, **client_kwargs(blocking_reads=True))
+        pubsub = redis.pubsub()
+        try:
+            # Inside the try: a failure to subscribe is exactly the failure this
+            # loop exists for, and it used to escape with nothing closed.
+            await pubsub.psubscribe("user:*", "space:*", "broadcast:*")
+            delay = LISTENER_RETRY_SECONDS
+            async for message in pubsub.listen():
+                if message.get("type") != "pmessage":
+                    continue
+                channel = message.get("channel", "")
+                data = message.get("data", "")
+                if not isinstance(data, str):
+                    continue
+                try:
+                    parsed = json.loads(data)
+                    exclude_device: str | None = parsed.pop("_origin_device", None)
+                    await _broadcast_local(channel, json.dumps(parsed), exclude_device)
+                except Exception:
+                    logger.exception("pubsub dispatch error on channel %s", channel)
+        except asyncio.CancelledError:
+            # Shutdown, not a fault. Re-raised so the lifespan's cancel actually
+            # cancels: swallowing it reported the task as having finished
+            # normally and hid a listener that stopped on its own.
+            raise
+        except RedisError:
+            logger.exception("pubsub listener lost Redis; reconnecting in %ss", delay)
+        finally:
+            await pubsub.aclose()
+            await redis.aclose()
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, LISTENER_RETRY_CEILING_SECONDS)
 
 
 # ── Publish helpers (called by sync / spaces / settings services) ────────────────
 
 
+# Events whose loss a client cannot recover from by pulling. Logged louder
+# because that is the whole difference: everything else arrives late, these two
+# do not arrive.
+_UNRECOVERABLE_EVENTS = frozenset({"space:rekey", "space:entry_removed"})
+
+
 async def publish(redis: Redis, channel: str, event: str, payload: dict, origin_device: str | None = None) -> None:
+    """Fan an event out to every replica. Best-effort by design.
+
+    Every `publish_*` helper below funnels through here, and every one of them is
+    called *after* the write it announces has been committed. Letting a Redis
+    blip raise would answer 500 for work that succeeded, and the client would
+    retry a push that is already stored.
+
+    What that costs, stated plainly: most events are only delayed, because the
+    next pull carries the same change. `space:entry_removed` is not - a pull
+    matches rows that still carry the space id, so once the id is gone the
+    withdrawal is invisible and a member keeps a copy of something taken down.
+    A retry from the client emits nothing either, because the id is already off
+    the row. Closing that needs a durable outbox, which is a bigger decision
+    than this function.
+    """
+    global _dropped_events
     data: dict = {"event": event, "payload": payload}
     if origin_device:
         data["_origin_device"] = origin_device
-    await redis.publish(channel, json.dumps(data))
+    try:
+        await redis.publish(channel, json.dumps(data))
+    except RedisError as exc:
+        _dropped_events += 1
+        level = logging.ERROR if event in _UNRECOVERABLE_EVENTS else logging.WARNING
+        logger.log(level, "dropped %s on %s: %s", event, channel, exc)
+
+
+def dropped_events() -> int:
+    """Fan-out events lost to an unreachable Redis since this process started."""
+    return _dropped_events
 
 
 async def publish_sync_entry(
@@ -355,7 +469,15 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=PING_INTERVAL)
                 msg = json.loads(raw)
                 if msg.get("event") in ("pong", "ack"):
-                    await redis.expire(presence_key(user_id, device_id), PRESENCE_TTL)
+                    try:
+                        await redis.expire(presence_key(user_id, device_id), PRESENCE_TTL)
+                    except RedisError as exc:
+                        # `except (WebSocketDisconnect, RuntimeError)` below does
+                        # not catch this, so one blip used to break the loop and
+                        # drop a perfectly live socket. Swallowing is right here:
+                        # a missed refresh is reconciled by the sweeper, and the
+                        # next pong refreshes the key anyway.
+                        logger.warning("presence refresh failed for %s: %s", device_id, exc)
                 elif msg.get("event") == "resubscribe":
                     # Membership changed mid-connection (join/leave/invite accept):
                     # re-resolve the channel set so space fan-out starts (or stops)

@@ -51,6 +51,7 @@ from src.admin.schemas import (
     UserListResponse,
 )
 from src import email
+from src import realtime
 from src.config import settings
 from src.database import get_db
 from src.dependencies import get_redis
@@ -142,6 +143,13 @@ async def metrics(db: AsyncSession = Depends(get_db), redis: Redis = Depends(get
     _gauge("orange_storage_bytes_used", "Confirmed blob storage bytes across all users", stats.storage_bytes_used)
     if stats.redis_memory_bytes is not None:
         _gauge("orange_redis_memory_bytes", "Redis used_memory bytes", stats.redis_memory_bytes)
+    # Fan-out publishes are best-effort so a committed write is not reported as a
+    # 500. This is the only place that trade becomes visible.
+    _gauge(
+        "orange_realtime_events_dropped_total",
+        "Fan-out events dropped because Redis was unreachable",
+        realtime.dropped_events(),
+    )
 
     return "\n".join(lines) + "\n"
 
