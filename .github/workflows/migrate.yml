@@ -1,5 +1,14 @@
 name: Migrate database
 
+# What the run list shows. Without this every run reads "Migrate database",
+# so a read-only check and an applied migration are indistinguishable until
+# someone opens one - and the whole point of glancing at the list is not having
+# to. `inputs` is empty on a push, which resolves to the read-only branch.
+run-name: >-
+  migrate ${{ github.event_name == 'push' && 'preview-sql' || inputs.action }}
+  -> ${{ github.event_name == 'push' && 'head' || inputs.revision }}
+  (${{ inputs.action == 'upgrade' && 'APPLIES CHANGES' || 'read-only' }})
+
 # Render's pre-deploy hook is a paid feature, so this is how a merged Alembic
 # revision reaches the database. Applying is manual: someone dispatches it and
 # says which revision, on purpose.
@@ -27,13 +36,16 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: What to do
+        description: >-
+          What to do. Only "upgrade" touches the database; "current" and
+          "preview-sql" report and change nothing. An upgrade also needs
+          confirm=migrate below.
         type: choice
         default: current
         options:
           - current      # print the revision the database is on, change nothing
           - preview-sql  # print the SQL an upgrade would run, change nothing
-          - upgrade      # apply it
+          - upgrade      # apply it -- needs confirm=migrate
       revision:
         description: Target revision (head, or a specific one like 0015)
         type: string
@@ -84,6 +96,12 @@ jobs:
           esac
           if [ "${ACTION}" = "upgrade" ] && [ "${{ inputs.confirm }}" != "migrate" ]; then
             echo "::error::Upgrade needs confirm=migrate. Nothing has been run."
+            {
+              echo '### Refused'
+              echo ''
+              echo 'An upgrade needs `confirm=migrate`. Nothing has been run, and'
+              echo 'the database is untouched.'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
@@ -108,11 +126,75 @@ jobs:
       - name: Where the database is now
         id: current
         run: |
-          CURRENT=$(uv run alembic current | awk 'NF {print $1; exit}')
+          # Read the two revisions as their own commands rather than piping
+          # alembic straight into awk. A pipeline hides alembic's exit code, and
+          # what it hid here was a connection failure: an unreachable database
+          # produced an empty revision, which the rest of this step then reported
+          # as "no alembic_version row, everything pending" - a confident,
+          # green, entirely wrong answer.
+          if ! CURRENT_OUT=$(uv run alembic current); then
+            echo "::error::Could not read the database revision. Nothing has been run."
+            {
+              echo '### Could not reach the database'
+              echo ''
+              echo 'The revision could not be read, so this run reports nothing about'
+              echo 'the schema. Check `DATABASE_URL` in the repository secrets.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          CURRENT=$(awk 'NF {print $1; exit}' <<< "${CURRENT_OUT}")
           HEAD=$(uv run alembic heads | awk 'NF {print $1; exit}')
           echo "revision=${CURRENT}" >> "$GITHUB_OUTPUT"
           echo "head=${HEAD}" >> "$GITHUB_OUTPUT"
           echo "database: ${CURRENT:-<no alembic_version row>}, repository head: ${HEAD}"
+
+          # Written on every path, including the read-only ones. A run that
+          # reports nothing is indistinguishable from a run that did the job,
+          # and that is not hypothetical: `current` was dispatched during an
+          # outage, went green, printed only into the log, and the outage was
+          # left in place because the run looked like the fix.
+          {
+            echo '### Where things stand'
+            echo ''
+            echo '| | |'
+            echo '|---|---|'
+            echo '| Database | `'"${CURRENT:-no alembic_version row}"'` |'
+            echo '| Repository head | `'"${HEAD}"'` |'
+            echo '| This run | `'"${ACTION}"'` to `'"${REVISION}"'` |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "${CURRENT}" ] && [ "${CURRENT}" = "${HEAD}" ]; then
+            {
+              echo ''
+              echo 'Nothing pending.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo ''
+            echo '### Pending'
+            echo ''
+            echo '```'
+            uv run alembic history -r "${CURRENT:-base}:head"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # The line that would have saved the outage. A read-only run that
+          # finds work has to hand over the exact way to do it, rather than
+          # leaving the reader to remember which of three options applies.
+          if [ "${ACTION}" != "upgrade" ]; then
+            echo "::warning::A migration is pending and this ${ACTION} run changed nothing. Re-dispatch with action=upgrade, revision=head, confirm=migrate to apply it."
+            {
+              echo ''
+              echo '> **This run changed nothing.** To apply the revisions above:'
+              echo ''
+              echo '```bash'
+              echo 'gh workflow run migrate.yml -f action=upgrade -f revision=head -f confirm=migrate \'
+              echo '  --repo '"${GITHUB_REPOSITORY}"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # Nothing pending is the normal case for a push, so it is a notice and a
       # success, never a failure. A commit that touches migrations/ without
@@ -149,16 +231,31 @@ jobs:
         if: env.ACTION == 'upgrade'
         run: uv run alembic upgrade "${REVISION}"
 
-      - name: Where the database is now
+      # Alembic's exit code is not the whole answer, and a green run that did
+      # not migrate is the worst outcome this workflow can produce: it reads as
+      # "the schema is fine", so the next place anyone looks is the application.
+      - name: Confirm it landed
         if: env.ACTION == 'upgrade'
         run: |
+          NOW=$(uv run alembic current | awk 'NF {print $1; exit}')
+          WANT="${REVISION}"
+          if [ "${WANT}" = "head" ]; then
+            WANT='${{ steps.current.outputs.head }}'
+          fi
           {
             echo '### Applied'
             echo ''
-            echo 'Was: `${{ steps.current.outputs.revision }}`'
+            echo '| | |'
+            echo '|---|---|'
+            echo '| Was | `'"${{ steps.current.outputs.revision }}"'` |'
+            echo '| Now | `'"${NOW}"'` |'
+            echo '| Asked for | `'"${WANT}"'` |'
             echo ''
-            echo 'Now:'
             echo '```'
             uv run alembic current --verbose
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${NOW}" != "${WANT}" ]; then
+            echo "::error::The upgrade reported success but the database is at ${NOW}, not ${WANT}."
+            exit 1
+          fi
