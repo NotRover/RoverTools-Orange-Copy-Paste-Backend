@@ -1333,9 +1333,25 @@ project's JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`, cached in-proces
 300 s, so Supabase-side rotation needs no redeploy); `HS256` verifies against
 `SUPABASE_JWT_SECRET` and is refused outright when that secret is unset. Algorithm
 confusion has nothing to forge against, since the two branches draw on unrelated key
-material. Decode requires `exp` and `sub` and checks the audience. No deny-list —
-Supabase owns session revocation. To immediately cut off a user, ban them via the admin
-suspend endpoint (Supabase).
+material. Decode requires `exp` and `sub` and checks the audience, with 30 s of leeway
+for clock drift between Supabase and this host. No deny-list — Supabase owns session
+revocation. To immediately cut off a user, ban them via the admin suspend endpoint
+(Supabase).
+
+**A verification failure answers 401 only when a token was actually judged.** Every
+authenticated route can therefore return one of two statuses on failure, and the
+difference is part of the contract:
+
+| Status | Means | What a client may do |
+|---|---|---|
+| `401` | The token was read and refused: bad signature, unknown `kid` in a key set we *did* fetch, expired, wrong audience, disallowed algorithm | Treat the credential as dead. Re-authenticate. |
+| `503` + `Retry-After` | We could not reach the JWKS endpoint, so nothing was judged (`PyJWKClientConnectionError`) | Retry. The credential is untouched. |
+
+Collapsing the second into the first is not a cosmetic error: the desktop client's
+silent session restore reads 401 as a verdict and ends the session with no retry, so a
+single failed DNS lookup here signs a user out and makes them type a password. An
+unknown `kid` fetched successfully stays 401 on purpose — a forged random `kid` must
+not be a way to drive 5xx out of the service.
 
 ---
 
