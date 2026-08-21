@@ -43,6 +43,23 @@ def _unauthorized() -> HTTPException:
     )
 
 
+def _key_set_unavailable() -> HTTPException:
+    """We could not reach the JWKS endpoint, which says nothing about the token.
+
+    The distinction matters more than it looks. A 401 is a verdict on the
+    caller's credential, and the desktop client acts on it: a 401 during its
+    silent session restore used to end the session outright, with no retry, so
+    one failed DNS lookup here signed a user out and made them type a password.
+    503 is the honest answer - the client retries it, and `Retry-After` tells it
+    roughly when.
+    """
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Cannot verify tokens right now",
+        headers={"Retry-After": "2"},
+    )
+
+
 @lru_cache(maxsize=1)
 def _jwks_client() -> PyJWKClient:
     """Process-wide JWKS client.
@@ -87,10 +104,14 @@ def _signing_key(token: str, algorithm: str):
         )
     try:
         return _jwks_client().get_signing_key_from_jwt(token).key
+    except jwt.PyJWKClientConnectionError as exc:
+        # We never reached the JWKS endpoint. Nothing was judged, so do not
+        # answer with a verdict on the credential.
+        raise _key_set_unavailable() from exc
     except jwt.PyJWTError as exc:
-        # Covers both an unknown `kid` and a JWKS fetch failure. Reported as 401
-        # rather than 5xx so a forged token with a random `kid` can't be used to
-        # drive server-error responses.
+        # We did reach it and the `kid` is not in the set - a forged or
+        # long-rotated token. 401, and deliberately not 5xx: a random `kid`
+        # must not be a way to drive server-error responses.
         raise _unauthorized() from exc
 
 
@@ -111,6 +132,13 @@ def decode_supabase_token(token: str) -> dict:
             algorithms=[algorithm],
             audience=settings.supabase_jwt_audience,
             options={"require": ["exp", "sub"]},
+            # Clock skew between Supabase and this host. Without it a token
+            # minted a moment ago fails `iat` validation with
+            # ImmatureSignatureError, which lands in the 401 below. Only the
+            # client's session restore is exposed - it presents a token that is
+            # milliseconds old - and being signed out over a second of drift is
+            # not a trade worth making against a token that lives an hour.
+            leeway=30,
         )
     except jwt.PyJWTError as exc:
         raise _unauthorized() from exc
