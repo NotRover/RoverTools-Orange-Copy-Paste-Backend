@@ -150,6 +150,11 @@ async def _space_to_out(
             .where(SpaceMembership.space_id == s.id)
         )
     ).all()
+    # One batched presence read for the whole space, not one per member: this
+    # runs for every space in a list, and a snapshot is never worth a round trip
+    # per person. An unreachable presence store reports everyone offline rather
+    # than failing a list Postgres already answered in full.
+    online = await rt.presence_for_users(redis, [str(m.user_id) for m, _, _, _ in rows])
     members = [
         MemberOut(
             user_id=m.user_id,
@@ -159,7 +164,7 @@ async def _space_to_out(
             joined_at=m.joined_at,
             identity_pubkey=pubkey,
             has_space_key=m.wrapped_space_keys is not None,
-            online=await rt.user_is_online(redis, str(m.user_id)),
+            online=str(m.user_id) in online,
         )
         for m, pubkey, display_name, avatar_url in rows
     ]

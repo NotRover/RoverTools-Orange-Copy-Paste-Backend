@@ -6,10 +6,12 @@ This router owns only what the app itself must store: the profile (KDF salt +
 identity key), device registration, and E2E key wrapping.
 """
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import realtime as rt
@@ -17,6 +19,7 @@ from src.auth import schemas, service
 from src.database import get_db
 from src.dependencies import get_current_claims, get_current_user_id, get_current_user_only, get_redis
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
@@ -146,7 +149,13 @@ async def list_devices(
     out = []
     for d in devices:
         item = schemas.DeviceOut.model_validate(d)
-        item.online = bool(await redis.exists(rt.presence_key(user_id, str(d.id))))
+        try:
+            item.online = bool(await redis.exists(rt.presence_key(user_id, str(d.id))))
+        except RedisError:
+            # Same trade as the member list: the device list is on the account
+            # screen's critical path, and every field but this one comes from
+            # Postgres. `online` defaults to False in the schema.
+            logger.warning("presence store unavailable; reporting devices offline")
         out.append(item)
     return out
 

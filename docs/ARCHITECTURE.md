@@ -783,7 +783,7 @@ POST   /api/v1/spaces/{space_id}/keys    -- any member holding the keyring
     "role": "owner|member", "joined_at": 1234567,
     "identity_pubkey": "base64 X25519 | null",  // null until that member registers keys
     "has_space_key": true,                      // holds a keyring? presence only, never the bytes
-    "online": true                              // any device connected, from Redis presence
+    "online": true                              // any device connected; a hint, see below
   }],
   "my_wrapped_space_keys": "[\"...\",\"...\"] | null",  // only ever the caller's own keyring
   "my_wrapped_by": "uuid | null",         // whose public key opens it; null = the owner
@@ -791,6 +791,13 @@ POST   /api/v1/spaces/{space_id}/keys    -- any member holding the keyring
   "rekey_requested_at": 1234567           // non-null = this space is waiting for a new key
 }
 ```
+
+`online` is a snapshot and nothing more. It is read from Redis presence at request
+time, and when the presence store is unreachable every member reports `false`
+rather than the request failing - the rest of the response comes from Postgres
+and is still correct. So it may drive what a member list *shows*, and never
+whether an action is allowed or whether a device has really gone away. The same
+applies to `online` on `GET /auth/devices`, and to the `user:presence` event.
 
 Six fields carry the key-distribution contract. `identity_pubkey` is what a distributor
 wraps for. `has_space_key` lets it wrap only for members who need one — without it, every
