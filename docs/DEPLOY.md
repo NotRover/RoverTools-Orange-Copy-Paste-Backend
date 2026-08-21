@@ -133,14 +133,50 @@ attachments need it.
 
 ## 5. Apply Database Migrations
 
-**On a free instance nothing migrates itself. Run migrations by hand, before
-you deploy the commit that needs them.**
+**Migrate first, deploy second, and never take a green deploy as proof that
+anything migrated.**
 
 `render.yaml` sets `preDeployCommand: alembic upgrade head`, but that field is
-paid-plan only; on `free` it is locked and silently inert. The deploy still goes
-green, and the new code then answers against a schema missing its tables -
-`relation "..." does not exist`, on a live route. Nothing in the app's startup
-path migrates either, by design.
+paid-plan only and inert on `free` - and which plan the live service is actually
+on is a dashboard setting this repository cannot see. Either way the deploy
+reports success, and if the migration did not run the new code then answers
+against a schema missing its tables: `relation "..." does not exist`, on a live
+route, under a deploy that went green. Nothing in the app's startup path
+migrates either, by design.
+
+So the revision is something to read, never to infer.
+
+### The Migrate database workflow
+
+[`.github/workflows/migrate.yml`](../.github/workflows/migrate.yml) is the
+normal way to do both halves of that, and it holds the production
+`DATABASE_URL` so nobody has to paste one.
+
+It runs itself, read-only, on any push to `main` that touches `migrations/**`,
+and posts the pending DDL to the run summary. Applying is always a separate,
+deliberate dispatch:
+
+```bash
+gh workflow run migrate.yml -f action=upgrade -f revision=head -f confirm=migrate
+```
+
+`action` has three values and only one of them writes:
+
+| `action` | Does |
+|---|---|
+| `current` | Reports the revision and what is pending. Changes nothing. **The default** |
+| `preview-sql` | Prints the SQL an upgrade would run. Changes nothing. |
+| `upgrade` | Applies it. Also needs `confirm=migrate`, or it refuses. |
+
+Every run reports where the database stands, whichever action it was given, and
+a read-only run that finds pending revisions says so as a warning and prints the
+dispatch that would apply them - because the failure worth designing against is
+a green run that looks like the fix and was not. An `upgrade` also re-reads the
+revision afterwards and fails if the database did not actually move.
+
+### By hand
+
+Equivalent, for a database the workflow does not hold credentials for:
 
 ```bash
 uv sync
@@ -248,11 +284,12 @@ default).
 
 ## 9. Ongoing Operations
 
-**Schema changes.** Author the Alembic revision and review it before merging -
-the deploy applies it (section 5). The migration runs before the new code, so an
-additive change is safe as written; for a destructive one, plan an
-expand/contract sequence across two deploys so the replicas still running the
-old code tolerate the new shape.
+**Schema changes.** Author the Alembic revision and review it before merging,
+then apply it yourself before the deploy that needs it - a green deploy is not
+evidence that anything migrated (section 5). Applied in that order an additive
+change is safe as written; for a destructive one, plan an expand/contract
+sequence across two deploys so the replicas still running the old code tolerate
+the new shape.
 
 **Supabase key rotation.** Rotating an asymmetric signing key needs no action —
 the JWKS is re-fetched (cached ~5 minutes). Rotating a *legacy* HS256 secret

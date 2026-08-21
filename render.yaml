@@ -49,7 +49,7 @@ services:
       # ── Supabase: Postgres + Auth ──────────────────────────────────────────
       # MUST be a Supavisor pooler URL, not the direct `db.<ref>.supabase.co`
       # host: direct connections are IPv6-only and Render has no outbound IPv6,
-      # so they fail with "Network is unreachable". See docs/DEPLOY.md §3.
+      # so they fail with "Network is unreachable". See docs/DEPLOY.md section 3.
       #   postgresql+asyncpg://postgres.<ref>:<pw>@aws-<region>.pooler.supabase.com:5432/postgres
       - key: DATABASE_URL
         sync: false
@@ -97,8 +97,11 @@ services:
     # Every deploy migrates the database first. Render runs this once, before any
     # traffic moves to the new version, and a non-zero exit aborts the deploy — so
     # the app never boots against a schema it does not match.
-    # Paid instances only: on `free` this is locked and inert, and the deploy
-    # goes green without migrating. Migrate by hand there. See docs/DEPLOY.md §5.
+    # Paid instances only: on `free` it is locked and inert, and the deploy goes
+    # green without migrating. Which plan the live service is on is a dashboard
+    # setting this file cannot confirm, so never read a green deploy as evidence
+    # that the schema moved - apply migrations deliberately and read the revision
+    # back. The Migrate database workflow does both. See docs/DEPLOY.md section 5.
     preDeployCommand: alembic upgrade head
 
   - name: rovertools-clipboard-keyvalue
