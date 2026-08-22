@@ -91,7 +91,15 @@ async def _upsert_entry(
     ``room`` honest across a batch without counting the table again."""
     # Checked before the lookup: an oversized row is refused whether it would be
     # an insert or an update, and refusing costs nothing.
-    if len(entry.encrypted_content) > settings.max_entry_bytes:
+    #
+    # Both ciphertext fields, each against the ceiling on its own rather than as
+    # a sum: metadata is a couple of hundred bytes in practice, and charging it
+    # against the content budget would put the client's own limit - derived from
+    # this number - a few bytes off and refuse rows that should have fit.
+    if (
+        len(entry.encrypted_content) > settings.max_entry_bytes
+        or len(entry.encrypted_metadata or "") > settings.max_entry_bytes
+    ):
         return ConflictEntry(client_id=entry.client_id, reason="entry_too_large"), [], False
 
     existing = await db.scalar(

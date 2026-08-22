@@ -1022,13 +1022,32 @@ write only moves forward (`POST /sync/cursor` ignores a lower value).
 
 ### 6.3 Size and Row Limits
 
-Three ceilings, all in `src/config.py`, all enforced in `push_entries`:
+Four ceilings, all in `src/config.py`. The first three are enforced in
+`push_entries`; the fourth sits in middleware, in front of it.
 
 | Setting | Default | Refusal |
 |---|---|---|
 | `max_entry_bytes` | 512 KB | `entry_too_large`, checked before the row lookup |
 | `max_entries_per_user` | 3,000 live rows | `account_full` |
 | `max_push_batch` | 200 entries | 422 on the request body, before any work |
+| `max_request_bytes` | 8 MB | 413, before the body is read at all |
+
+`max_entry_bytes` applies to `encrypted_content` and `encrypted_metadata`
+**separately**. Both are ciphertext on the same row, and capping only the first left
+the second as a way around it. Separately rather than as a sum because the client
+derives its own local limit from this number, and charging metadata against the
+content budget would put that derivation a few bytes off and refuse rows that
+should have fit.
+
+`max_request_bytes` is the only one of the four that is not about a row. The three
+above it are read off an already-parsed body, so by the time any of them runs the
+request has been buffered and built into as many as `max_push_batch` models - which
+is the cost they cannot prevent, whatever they then decide. It is checked against
+`Content-Length` when the client offers one and against the running total either
+way, because a chunked request offers nothing. A body that goes over is answered
+413 from inside the receive channel and its read is then closed as a disconnect, so
+the route never runs; `BodySizeLimitMiddleware` carries the reason that answer
+cannot simply be an exception.
 
 `account_full` counts live rows only (`deleted_at IS NULL`) and is checked *after* the
 update path, so a full account can still be emptied - a cap that blocks its own
