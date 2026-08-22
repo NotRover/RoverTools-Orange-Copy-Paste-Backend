@@ -181,6 +181,31 @@ async def test_an_oversized_entry_is_refused_with_a_reason(
     assert [a["client_id"] for a in body["accepted"]] == ["cid-small"]
 
 
+async def test_oversized_metadata_is_refused_the_same_way(
+    client: AsyncClient, auth_headers: dict, monkeypatch
+):
+    """`encrypted_metadata` is ciphertext on the same row and was unbounded
+    while `encrypted_content` was capped, so the ceiling could be walked around
+    by putting the payload in the other field."""
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "max_entry_bytes", 16)
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+
+    big = _entry("cid-big-meta")
+    big["encrypted_metadata"] = "A" * 64
+
+    resp = await client.post(
+        "/api/v1/sync/push",
+        json={"entries": [big, _entry("cid-small")]},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [c["reason"] for c in body["conflicts"]] == ["entry_too_large"]
+    assert [a["client_id"] for a in body["accepted"]] == ["cid-small"]
+
+
 async def test_a_full_account_refuses_new_rows_but_still_accepts_deletes(
     client: AsyncClient, auth_headers: dict, monkeypatch
 ):

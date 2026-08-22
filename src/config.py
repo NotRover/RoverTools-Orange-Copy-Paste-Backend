@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     # is 500). The client pushes one entry per request, so this only ever stops
     # an abusive body.
     max_push_batch: int = 200
+    # Whole request body, any route. A different question from the three above:
+    # they judge a parsed row, and parsing is what this is meant to prevent -
+    # without it a body is read into memory and built into models before
+    # `max_entry_bytes` gets a look at it. 8 MB leaves room for several
+    # max-size rows in one batch while no legitimate request comes near it;
+    # the largest the client ever sends is a single row plus its envelope.
+    max_request_bytes: int = 8_388_608
 
     # ── Admin ─────────────────────────────────────────────────────────────────────
     admin_api_key: str = ""  # Required for /internal/* admin endpoints; empty disables them (503)

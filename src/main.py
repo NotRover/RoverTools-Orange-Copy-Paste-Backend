@@ -17,7 +17,7 @@ from src.announcements.router import router as announcements_router
 from src.spaces.invites import router as invites_router
 from src.spaces.router import router as spaces_router
 from src.limiter import limiter
-from src.middleware import SecurityHeadersMiddleware
+from src.middleware import BodySizeLimitMiddleware, SecurityHeadersMiddleware
 from src.redis_client import close_redis_pool, get_redis_pool
 from src.settings.router import router as settings_router
 from src.sync.router import router as sync_router
@@ -99,6 +99,12 @@ app.add_middleware(SlowAPIMiddleware)
 
 # ── Security headers ──────────────────────────────────────────────────────────
 app.add_middleware(SecurityHeadersMiddleware)
+
+# ── Request body ceiling ──────────────────────────────────────────────────────
+# Added after the security headers and before CORS, which puts it *outside* both
+# in the call order: the point is to refuse before anything reads the body, and
+# CORS still wraps it so the 413 carries the headers a browser needs.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_bytes)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
