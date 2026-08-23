@@ -73,8 +73,34 @@ class SyncEntryOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class RemovalOut(BaseModel):
+    """One entry that left one space, for a device catching up.
+
+    Carries the same fields as the `space:entry_removed` event, so a client
+    applies both through one code path. `author_id` and `removed_by` are what
+    separate an author withdrawing their own post from a space owner moderating
+    it - without the pair, a client can only guess, and guessing told everyone
+    that the author had been moderated.
+    """
+
+    space_id: uuid.UUID
+    client_id: str
+    entry_type: str
+    author_id: uuid.UUID
+    removed_by: uuid.UUID
+    server_ts: int
+
+    model_config = {"from_attributes": True}
+
+
 class PullResponse(BaseModel):
     entries: list[SyncEntryOut]
+    # Additive, and safe for a client that ignores it: such a client is exactly
+    # as well off as it was before this field existed. Apply these *before*
+    # `entries` - an entry re-shared after a withdrawal carries a newer
+    # `server_ts` than the removal, so removal-then-entry lands on the right
+    # final state while the reverse order drops a live entry.
+    removals: list[RemovalOut] = Field(default_factory=list)
     next_cursor: int | None
 
 

@@ -185,6 +185,66 @@ class SpaceComment(Base):
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class SpaceEntryRemoval(Base):
+    """A durable record that one entry left one space.
+
+    The only mutation in the system that used to leave no trace. An addition or
+    an edit is a row; deleting an entry outright is a tombstone (`deleted_at`)
+    that pull returns like any other change. Taking an entry *out of a space*
+    strips the space id from `sync_entries.space_ids` - and pull's space arm
+    matches on that array, so from that moment the row is not "changed" or
+    "deleted" to a member, it is simply absent, indistinguishable from an entry
+    that never existed.
+
+    The `space:entry_removed` event was the only signal, and an event reaches
+    whoever happens to be connected. A member whose device was closed came back,
+    pulled, matched nothing, and kept its copy of withdrawn content forever -
+    with a healthy Redis and nothing failing anywhere. This table is what a
+    catching-up device reads instead.
+
+    One row per (space, entry): re-sharing and re-removing the same entry
+    updates the row and bumps `server_ts` rather than accumulating history.
+    Only the latest removal matters, and the entry row itself carries a newer
+    `server_ts` than any removal that preceded it, so a client applying
+    removals before entries lands on the right final state either way.
+
+    Not a tombstone for the entry. The author keeps their own copy - what was
+    withdrawn is the *sharing*, and the wrapped key for this space is dropped
+    from the entry in the same transaction that writes this row.
+    """
+
+    __tablename__ = "space_entry_removals"
+
+    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    space_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    # The client-side entry id, keyed with entry_type exactly as `sync_entries`
+    # is - this identifies the entry to a client, which never sees the server id.
+    client_id: Mapped[str] = mapped_column(Text, nullable=False)
+    entry_type: Mapped[str] = mapped_column(String(16), nullable=False)  # 'clipboard' | 'note'
+    # Who shared it, and who took it down. Both travel to the client because the
+    # placeholder it shows depends on whether the author withdrew their own post
+    # or somebody moderated it - the same distinction `space:entry_removed`
+    # carries as `author_id` / `removed_by`.
+    author_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    removed_by: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    # Same clock and same meaning as `sync_entries.server_ts`, because a device
+    # pulls both streams against one cursor.
+    server_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+# One removal fact per entry per space, so a re-share/re-remove cycle updates in
+# place instead of growing the table. Also the conflict target for that upsert.
+Index(
+    "ix_space_entry_removals_entry",
+    SpaceEntryRemoval.space_id,
+    SpaceEntryRemoval.client_id,
+    SpaceEntryRemoval.entry_type,
+    unique=True,
+)
+# The pull query: removals in one of my spaces, newer than my cursor.
+Index("ix_space_entry_removals_pull", SpaceEntryRemoval.space_id, SpaceEntryRemoval.server_ts)
+
+
 # Threads are read per entry and counted per space, and both go through the
 # space id first, so one composite index serves them together.
 Index("ix_space_comments_thread", SpaceComment.space_id, SpaceComment.client_id, SpaceComment.entry_type)

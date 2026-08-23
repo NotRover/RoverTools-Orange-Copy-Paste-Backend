@@ -15,6 +15,7 @@ from src.sync.schemas import (
     PullResponse,
     PushRequest,
     PushResponse,
+    RemovalOut,
     SyncEntryOut,
 )
 
@@ -76,9 +77,10 @@ async def pull(
     Requires: Bearer token + X-Device-Id header.
     """
     user_id, _ = current
-    rows, next_cursor = await service.pull_entries(db, user_id, after_ts, limit, entry_type)
+    rows, removed, next_cursor = await service.pull_entries(db, user_id, after_ts, limit, entry_type)
     entries = [SyncEntryOut.model_validate(r) for r in rows]
-    return PullResponse(entries=entries, next_cursor=next_cursor)
+    removals = [RemovalOut.model_validate(r) for r in removed]
+    return PullResponse(entries=entries, removals=removals, next_cursor=next_cursor)
 
 
 @router.post("/cursor", status_code=204)

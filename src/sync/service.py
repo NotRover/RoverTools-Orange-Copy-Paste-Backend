@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -7,8 +8,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.blobs import service as blobs_service
+from src.spaces.service import record_space_removals
 from src.config import settings
-from src.spaces.models import SpaceMembership
+from src.spaces.models import SpaceEntryRemoval, SpaceMembership
 from src.sync.models import SyncCursor, SyncEntry
 from src.sync.schemas import (
     AcceptedEntry,
@@ -148,6 +150,25 @@ async def _upsert_entry(
         existing.wrapped_keys = entry.wrapped_keys
         if superseded_blob:
             await blobs_service.release_blob(db, user_id, superseded_blob)
+        # Same transaction as the strip. The event this push triggers reaches
+        # whoever is connected; this is what a member who was offline reads
+        # later, and pull cannot infer it because the row no longer carries the
+        # space id it would have to match on.
+        #
+        # `removed_by` is the author here by construction - this path is a push
+        # from the owner of the entry, so un-sharing is always self-inflicted.
+        # The moderation case goes through `remove_entry_from_space` instead and
+        # records whoever took it down.
+        if dropped:
+            await record_space_removals(
+                db,
+                space_ids=dropped,
+                client_id=entry.client_id,
+                entry_type=entry.entry_type,
+                author_id=user_id,
+                removed_by=user_id,
+                server_ts=server_ts,
+            )
         await db.commit()
         return AcceptedEntry(client_id=entry.client_id, server_id=existing.id, server_ts=server_ts), dropped, False
 
@@ -225,7 +246,7 @@ async def pull_entries(
     after_ts: int,
     limit: int,
     entry_type: str,
-) -> tuple[list[SyncEntry], int | None]:
+) -> tuple[list[SyncEntry], list[SpaceEntryRemoval], int | None]:
     uid = uuid.UUID(user_id)
 
     # A device pulls its own user's entries plus anything shared into a space it
@@ -256,14 +277,80 @@ async def pull_entries(
     q = q.order_by(SyncEntry.server_ts.asc()).limit(limit + 1)
     result = await db.scalars(q)
     rows = list(result.all())
+    rows, entries_next = _paginate(rows, limit)
 
+    removals, removals_next = await _pull_removals(db, memberships, after_ts, limit, entry_type)
+
+    return rows, removals, merge_cursors(entries_next, removals_next)
+
+
+def merge_cursors(entries_next: int | None, removals_next: int | None) -> int | None:
+    """One watermark over two streams.
+
+    A pull now returns two independently paginated streams against a single
+    cursor, so the cursor may only advance to a point *both* are complete to.
+    Taking the entry stream's position while the removal stream was truncated
+    earlier steps the device past removals it never received - and a missed
+    removal is the one fact in this system that nothing else recovers, which is
+    the entire reason the removals stream exists.
+
+    So: the lower of the two truncation points, and `None` (meaning "caught up")
+    only when neither stream was truncated. Erring low re-sends part of the
+    un-truncated stream on the next round, which costs bytes and nothing else -
+    entries merge last-write-wins and a removal for an entry you no longer hold
+    is a no-op, so both are safe to apply twice.
+    """
+    truncations = [c for c in (entries_next, removals_next) if c is not None]
+    return min(truncations) if truncations else None
+
+
+def _paginate(rows: list, limit: int) -> tuple[list, int | None]:
+    """Trim an over-fetched page and report where it stopped."""
     if len(rows) > limit:
         rows = rows[:limit]
-        next_cursor = rows[-1].server_ts
-    else:
-        next_cursor = None
+        return rows, rows[-1].server_ts
+    return rows, None
 
-    return rows, next_cursor
+
+async def _pull_removals(
+    db: AsyncSession,
+    memberships: Sequence[SpaceMembership],
+    after_ts: int,
+    limit: int,
+    entry_type: str,
+) -> tuple[list[SpaceEntryRemoval], int | None]:
+    """Entries that left this caller's spaces since their cursor.
+
+    The second half of a pull, and the only way a device that was not connected
+    at the time can learn a withdrawal happened: removing an entry from a space
+    strips the space id from `space_ids`, and the entries query above matches on
+    exactly that, so the row it would need to notice is not in the result set at
+    all - it is absent, which is indistinguishable from an entry that never
+    existed.
+
+    `history_from_ts` is applied the same way it is for entries, so a member who
+    joined after a withdrawal is not told about content they never held.
+    """
+    if not memberships:
+        return [], None
+
+    arms = []
+    for m in memberships:
+        arm = and_(
+            SpaceEntryRemoval.space_id == m.space_id,
+            SpaceEntryRemoval.server_ts > after_ts,
+        )
+        if m.history_from_ts is not None:
+            arm = and_(arm, SpaceEntryRemoval.server_ts >= m.history_from_ts)
+        arms.append(arm)
+
+    q = select(SpaceEntryRemoval).where(or_(*arms))
+    if entry_type in ("clipboard", "note"):
+        q = q.where(SpaceEntryRemoval.entry_type == entry_type)
+    q = q.order_by(SpaceEntryRemoval.server_ts.asc()).limit(limit + 1)
+
+    rows = list((await db.scalars(q)).all())
+    return _paginate(rows, limit)
 
 
 # ── Cursor ────────────────────────────────────────────────────────────────────

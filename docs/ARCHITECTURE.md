@@ -671,9 +671,21 @@ POST /api/v1/sync/push
      JSON string, default "{}". Both are stored verbatim and never interpreted.
 
 GET  /api/v1/sync/pull?after_ts=<ts>&limit=200&entry_type=all|clipboard|note
-     Returns: { entries: [...], next_cursor: <ts | null> }
+     Returns: { entries: [...], removals: [...], next_cursor: <ts | null> }
      Each entry echoes space_ids + wrapped_keys. Rows come from the caller's own
      user_id OR any space they belong to, per-membership history floor applied.
+     removals: [{ space_id, client_id, entry_type, author_id, removed_by, server_ts }]
+     Entries that LEFT one of the caller's spaces since their cursor. Same fields
+     as the space:entry_removed event, and for the same reason: apply both through
+     one path. Necessary because a removal strips the space id from space_ids, and
+     the entries query matches on exactly that array - so from that moment the row
+     is absent rather than changed, and a device that was offline when it happened
+     can learn it no other way. Apply removals BEFORE entries: an entry re-shared
+     after a withdrawal carries the newer server_ts, so that order converges and
+     the reverse drops a live entry. Same history floor as entries.
+     next_cursor is the LOWER of the two streams' truncation points - a watermark
+     may only advance past a point both are complete to, or a device steps over
+     removals it never received.
 
 POST /api/v1/sync/cursor        Body: { last_server_ts }
 ```
@@ -956,6 +968,12 @@ Routing rules worth knowing when implementing a client:
 - `space:entry_removed` carries both `author_id` and `removed_by`. They are equal when
   the author withdrew their own post and differ when the space owner took it down, and
   that is the only way a member can tell the two apart.
+- `space:entry_removed` is the *fast* path, not the guarantee. The durable record is a
+  `space_entry_removals` row written in the same transaction that strips the space id,
+  returned by `GET /sync/pull` as `removals`. The event may be missed by anyone not
+  connected at the time, and pub/sub does not buffer for absent subscribers, so a
+  member whose device was closed learns about the withdrawal from the pull instead.
+  Losing the event therefore costs latency, not correctness.
 - `space:membership_changed` is published to the space channel **and** to the affected
   user's own channel, because the joiner is not on the space channel yet and a removed
   member may already be off it. `action: "deleted"` is published *before* the row is
@@ -1008,6 +1026,10 @@ Pull:  client → GET /sync/pull?after_ts=<cursor>&limit=200
                       OR space_ids && ARRAY[<one space I'm in>]        -- one arm per membership,
                          [AND server_ts >= that membership's history_from_ts] )
                 ORDER BY server_ts ASC (+1 for next_cursor)
+              + removals WHERE server_ts > cursor
+                AND space_id IN (<spaces I'm in>)                      -- same history floor
+                ORDER BY server_ts ASC (+1 for its own cursor)
+                next_cursor = min(entry cursor, removal cursor)
        repeat until next_cursor = null → POST /sync/cursor
 ```
 
