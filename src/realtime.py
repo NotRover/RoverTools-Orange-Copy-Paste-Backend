@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["realtime"])
 
 PING_INTERVAL = 25  # seconds between server pings
+# Longest a single socket may hold up fan-out to everyone else on this replica.
+# See `_broadcast_local` for why a bound has to exist at all.
+SEND_TIMEOUT = 5
 # Every socket joins this, which is what makes a broadcast one publish instead
 # of one per connected user.
 BROADCAST_CHANNEL = "broadcast:all"
@@ -64,15 +67,50 @@ def devices_set_key(user_id: str) -> str:
     return f"user:{user_id}:devices"
 
 
-async def user_is_online(redis: Redis, user_id: str) -> bool:
+async def _assert_presence(redis: Redis, user_id: str, device_id: str) -> None:
+    """State that this device is here, from scratch, in one round trip.
+
+    Used by both the connect path and every heartbeat, and it *rewrites* both
+    keys rather than extending a TTL. That difference is the whole point.
+
+    The heartbeat used to call `EXPIRE` on the presence key, and `EXPIRE` on a
+    key that no longer exists returns 0 and does nothing. So any loss of the key
+    was permanent for the life of the socket: a still-connected device kept
+    checking in, every check did nothing, and the device read as offline on
+    `GET /auth/devices` and to every member of its spaces until the app was
+    restarted. The sweeper could not repair it either — it only ever removes.
+
+    Keys are lost in ordinary operation, not just in disasters: the instance is
+    configured with an LRU eviction policy, so presence keys are eviction
+    candidates by design; a Redis restart drops the lot; and a link that misses
+    pongs for longer than `PRESENCE_TTL` lets the key lapse before recovering.
+
+    The device set is rewritten for the same reason — `SADD` is already
+    idempotent, but a restart takes the set with the keys, and `user_is_online`
+    and the sweeper both read the set rather than the keys.
+    """
+    pipe = redis.pipeline(transaction=False)
+    pipe.sadd(devices_set_key(user_id), device_id)
+    pipe.set(presence_key(user_id, device_id), "1", ex=PRESENCE_TTL)
+    await pipe.execute()
+
+
+async def user_is_online(redis: Redis, user_id: str, exclude_device: str | None = None) -> bool:
     """True when at least one of the user's devices holds a live presence key.
 
     The device set can outlive a socket that died without a clean close, so
     membership alone is not proof — each candidate is checked against its
     TTL key, which only a connected (and heartbeating) device keeps alive.
+
+    `exclude_device` answers "is anyone *else* still here", which is the question
+    a disconnecting socket actually has. It lets the teardown path ask before it
+    removes itself, so the answer survives a Redis blip on the way out — see the
+    comment in the endpoint's `finally`.
     """
     device_ids = await cast(Awaitable[set[str]], redis.smembers(devices_set_key(user_id)))
     for device_id in device_ids:
+        if exclude_device is not None and device_id == exclude_device:
+            continue
         if await redis.exists(presence_key(user_id, device_id)):
             return True
     return False
@@ -164,19 +202,64 @@ def connection_count() -> int:
     return len(_ws_device)
 
 
+async def _send_to_one(ws: WebSocket, raw: str) -> bool:
+    """Deliver to a single socket. False means give up on it.
+
+    The timeout is the load-bearing part: `send_text` applies the transport's
+    backpressure, so a client that has stopped reading blocks here for as long
+    as it likes unless something bounds it.
+    """
+    try:
+        await asyncio.wait_for(ws.send_text(raw), timeout=SEND_TIMEOUT)
+        return True
+    except Exception:
+        return False
+
+
 async def _broadcast_local(channel: str, raw: str, exclude_device: str | None = None) -> None:
+    """Deliver one event to this replica's sockets on `channel`.
+
+    Concurrently, and with a per-socket timeout, because this is awaited by the
+    pub/sub listener and used to be neither. Sending in sequence meant one
+    backpressured client stalled delivery to every other socket on the replica —
+    and because the listener does not read the next Redis message until this
+    returns, the stall propagated backwards into Redis: the pub/sub client output
+    buffer filled, Redis dropped the subscriber (its default limits are 32 MB
+    hard, 8 MB sustained for 60 s), and the replica went on serving HTTP normally
+    while delivering nothing at all to any socket it held. The supervised
+    reconnect in `start_listener` recovers the connection but not the events —
+    pub/sub has no replay, so everything published during the gap was gone. None
+    of it showed up in `orange_realtime_events_dropped_total`, which only counts
+    publish-side failures.
+
+    `SEND_TIMEOUT` therefore bounds how long the bus can be held up by its
+    slowest reader. The bound is what matters, not its exact value: filling an
+    8 MB buffer inside it would take on the order of a thousand events a second
+    at the sizes actually seen in this system.
+
+    A socket that times out is unregistered and closed rather than retried. It
+    has stopped reading, so the next event would stall on it too; closing ends
+    the endpoint's receive loop, which runs the presence teardown and lets the
+    client reconnect and pull.
+    """
     async with _lock:
-        targets = list(_channels.get(channel, set()))
-    dead: list[tuple[WebSocket, str]] = []
-    for ws, device_id in targets:
-        if exclude_device and device_id == exclude_device:
+        targets = [
+            (ws, device_id)
+            for ws, device_id in _channels.get(channel, set())
+            if not (exclude_device and device_id == exclude_device)
+        ]
+    if not targets:
+        return
+
+    delivered = await asyncio.gather(*(_send_to_one(ws, raw) for ws, _ in targets))
+    for (ws, _), ok in zip(targets, delivered, strict=True):
+        if ok:
             continue
+        await _unregister(ws)
         try:
-            await ws.send_text(raw)
+            await ws.close(code=1011)
         except Exception:
-            dead.append((ws, device_id))
-    for item in dead:
-        await _unregister(item[0])
+            pass  # already gone, or never going to answer — either way, done with it
 
 
 # ── Redis pub/sub bridge ─────────────────────────────────────────────────────────
@@ -458,8 +541,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
     # away and an edge-triggered publish says nothing — leaving every member's
     # list showing them offline until something else refreshes it. Repeats are
     # free: the client drops a presence update that changes nothing.
-    await cast(Awaitable[int], redis.sadd(devices_set_key(user_id), device_id))
-    await redis.set(presence_key(user_id, device_id), "1", ex=PRESENCE_TTL)
+    await _assert_presence(redis, user_id, device_id)
     await publish(redis, f"user:{user_id}", "device:online", {"device_id": device_id})
     await publish_user_presence(redis, _space_channels(channels), user_id, True)
 
@@ -470,7 +552,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
                 msg = json.loads(raw)
                 if msg.get("event") in ("pong", "ack"):
                     try:
-                        await redis.expire(presence_key(user_id, device_id), PRESENCE_TTL)
+                        await _assert_presence(redis, user_id, device_id)
                     except RedisError as exc:
                         # `except (WebSocketDisconnect, RuntimeError)` below does
                         # not catch this, so one blip used to break the loop and
@@ -491,9 +573,24 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
                 break
     finally:
         await _unregister(websocket)
-        await cast(Awaitable[int], redis.srem(devices_set_key(user_id), device_id))
-        await redis.delete(presence_key(user_id, device_id))
-        await publish(redis, f"user:{user_id}", "device:offline", {"device_id": device_id})
-        # Only the user's last device going away makes them offline to others.
-        if not await user_is_online(redis, user_id):
-            await publish_user_presence(redis, _space_channels(channels), user_id, False)
+        try:
+            # Asked *before* the removal and excluding this device, so the answer
+            # is in hand before anything is mutated. Asking afterwards — which is
+            # what this used to do — meant a Redis blip between the SREM and the
+            # check left the user advertised as online to their spaces with
+            # nothing able to correct it: the sweeper re-derives presence from the
+            # device set, and this device is no longer in it.
+            others_online = await user_is_online(redis, user_id, exclude_device=device_id)
+            await cast(Awaitable[int], redis.srem(devices_set_key(user_id), device_id))
+            await redis.delete(presence_key(user_id, device_id))
+            await publish(redis, f"user:{user_id}", "device:offline", {"device_id": device_id})
+            # Only the user's last device going away makes them offline to others.
+            if not others_online:
+                await publish_user_presence(redis, _space_channels(channels), user_id, False)
+        except RedisError as exc:
+            # Nothing on a disconnect is worth raising out of a `finally`. These
+            # calls were unguarded while the pong path above was not, so a blip
+            # here escaped the endpoint. Whatever did not happen is reconciled by
+            # the sweeper: the presence key expires on its own, and the sweep
+            # publishes both events from the device set this device is still in.
+            logger.warning("presence teardown failed for %s: %s", device_id, exc)

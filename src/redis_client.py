@@ -24,6 +24,17 @@ _SOCKET_TIMEOUT_SECONDS = 5
 _HEALTH_CHECK_INTERVAL_SECONDS = 30
 _RETRIES = 3
 
+# `from_url` leaves `max_connections` at redis-py's effectively-unlimited default,
+# so a burst opened one connection per concurrent coroutine and kept it. Managed
+# providers answer that with a hard cap and an error rather than a queue; a
+# self-hosted instance answers by spending memory on per-connection buffers.
+# Neither is what we want, and requests here are short, so a modest ceiling that
+# waits is better than an unbounded one that does not.
+_MAX_CONNECTIONS = 24
+# The listener needs exactly one, plus room to establish the next before the old
+# one is released on a reconnect.
+_LISTENER_MAX_CONNECTIONS = 2
+
 
 def client_kwargs(*, blocking_reads: bool) -> dict:
     """Connection settings for one Redis client.
@@ -42,8 +53,11 @@ def client_kwargs(*, blocking_reads: bool) -> dict:
         "retry": Retry(ExponentialWithJitterBackoff(base=0.05, cap=1.0), retries=_RETRIES),
         "retry_on_error": [RedisConnectionError, RedisTimeoutError],
     }
-    if not blocking_reads:
+    if blocking_reads:
+        kwargs["max_connections"] = _LISTENER_MAX_CONNECTIONS
+    else:
         kwargs["socket_timeout"] = _SOCKET_TIMEOUT_SECONDS
+        kwargs["max_connections"] = _MAX_CONNECTIONS
     return kwargs
 
 

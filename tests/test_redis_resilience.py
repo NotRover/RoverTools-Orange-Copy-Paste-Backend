@@ -139,3 +139,156 @@ def test_a_dropped_fan_out_is_counted_and_not_raised():
     before = rt.dropped_events()
     asyncio.run(rt.publish(_DeadRedis(), "user:u", "sync:entry", {"client_id": "c"}))
     assert rt.dropped_events() == before + 1
+
+
+# ── Presence is re-asserted, never merely extended ───────────────────
+
+
+def test_a_heartbeat_restores_presence_that_was_lost():
+    """The regression: the heartbeat used to call `EXPIRE`, and `EXPIRE` on a
+    missing key does nothing at all.
+
+    So any loss of the presence key was permanent for the life of the socket -
+    the device kept checking in, every check was a no-op, and it read as offline
+    to `GET /auth/devices` and to every member of its spaces until the app was
+    restarted. Keys are lost in ordinary operation: the instance runs an LRU
+    eviction policy, a restart drops everything, and a link that misses pongs for
+    longer than the TTL lets the key lapse on its own.
+    """
+    from fakeredis.aioredis import FakeRedis
+
+    async def scenario() -> tuple[bool, bool]:
+        redis = FakeRedis(decode_responses=True)
+        await rt._assert_presence(redis, "u", "d1")
+        assert await rt.user_is_online(redis, "u")
+
+        # Everything Redis held, gone - an eviction, or a restart.
+        await redis.flushall()
+        lost = await rt.user_is_online(redis, "u")
+
+        # One heartbeat from the still-connected socket.
+        await rt._assert_presence(redis, "u", "d1")
+        restored = await rt.user_is_online(redis, "u")
+        await redis.aclose()
+        return lost, restored
+
+    lost, restored = asyncio.run(scenario())
+    assert lost is False, "precondition: the loss must actually be observable"
+    assert restored is True, "a heartbeat has to rebuild presence, not just extend it"
+
+
+def test_presence_is_asserted_in_one_round_trip():
+    """Connect and every heartbeat go through here, so it is pipelined."""
+    from fakeredis.aioredis import FakeRedis
+
+    async def scenario() -> int:
+        redis = FakeRedis(decode_responses=True)
+        calls = 0
+        real_pipeline = redis.pipeline
+
+        def counting_pipeline(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real_pipeline(*args, **kwargs)
+
+        redis.pipeline = counting_pipeline
+        await rt._assert_presence(redis, "u", "d1")
+        await redis.aclose()
+        return calls
+
+    assert asyncio.run(scenario()) == 1
+
+
+def test_a_departing_socket_can_ask_whether_anyone_else_is_left():
+    """What the teardown path actually needs to know, asked before it removes
+    itself so the answer survives a blip on the way out."""
+    from fakeredis.aioredis import FakeRedis
+
+    async def scenario() -> tuple[bool, bool]:
+        redis = FakeRedis(decode_responses=True)
+        await rt._assert_presence(redis, "u", "d1")
+        alone = await rt.user_is_online(redis, "u", exclude_device="d1")
+        await rt._assert_presence(redis, "u", "d2")
+        accompanied = await rt.user_is_online(redis, "u", exclude_device="d1")
+        await redis.aclose()
+        return alone, accompanied
+
+    alone, accompanied = asyncio.run(scenario())
+    assert alone is False, "its own presence key must not count as company"
+    assert accompanied is True
+
+
+# ── Fan-out cannot be held up by one reader ──────────────────────────
+
+
+class _Socket:
+    """A local WebSocket, as much of one as `_broadcast_local` touches."""
+
+    def __init__(self, *, hangs: bool = False) -> None:
+        self.hangs = hangs
+        self.received: list[str] = []
+        self.closed = False
+
+    async def send_text(self, raw: str) -> None:
+        if self.hangs:
+            await asyncio.Event().wait()  # never returns, like a stalled transport
+        self.received.append(raw)
+
+    async def close(self, code: int = 1000) -> None:
+        self.closed = True
+
+
+def test_one_stalled_socket_does_not_hold_up_the_others():
+    """The regression: sends ran in sequence, and the listener awaits this
+    function before reading the next Redis message. So a client that stopped
+    reading stalled fan-out for every other socket on the replica, and then
+    stalled the listener, and Redis dropped the subscriber - leaving the replica
+    serving HTTP while delivering nothing, with no counter moving."""
+
+    async def scenario() -> tuple[list[str], list[str], bool]:
+        stalled = _Socket(hangs=True)
+        healthy = _Socket()
+        rt._channels["space:s"] = {(stalled, "d-stalled"), (healthy, "d-healthy")}  # type: ignore[arg-type]
+        try:
+            original, rt.SEND_TIMEOUT = rt.SEND_TIMEOUT, 0.05
+            try:
+                await rt._broadcast_local("space:s", "payload")
+            finally:
+                rt.SEND_TIMEOUT = original
+            return healthy.received, stalled.received, stalled.closed
+        finally:
+            rt._channels.pop("space:s", None)
+            rt._ws_channels.pop(stalled, None)  # type: ignore[arg-type]
+            rt._ws_channels.pop(healthy, None)  # type: ignore[arg-type]
+
+    healthy_got, stalled_got, stalled_closed = asyncio.run(scenario())
+    assert healthy_got == ["payload"], "a healthy socket must not wait on a stalled one"
+    assert stalled_got == []
+    assert stalled_closed, "a socket that stopped reading is closed, not retried"
+
+
+def test_the_origin_device_is_still_skipped():
+    """Concurrency must not lose the exclusion that stops a device receiving its
+    own push back."""
+
+    async def scenario() -> tuple[list[str], list[str]]:
+        author = _Socket()
+        other = _Socket()
+        rt._channels["user:u"] = {(author, "d-author"), (other, "d-other")}  # type: ignore[arg-type]
+        try:
+            await rt._broadcast_local("user:u", "payload", exclude_device="d-author")
+            return author.received, other.received
+        finally:
+            rt._channels.pop("user:u", None)
+
+    author_got, other_got = asyncio.run(scenario())
+    assert author_got == []
+    assert other_got == ["payload"]
+
+
+def test_the_request_pool_is_bounded():
+    """An unbounded pool opened one connection per concurrent coroutine: a hard
+    cap and an error on a managed instance, per-connection buffers on a
+    self-hosted one."""
+    assert client_kwargs(blocking_reads=False)["max_connections"] == 24
+    assert client_kwargs(blocking_reads=True)["max_connections"] == 2
