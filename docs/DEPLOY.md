@@ -229,7 +229,13 @@ private network — don't set it manually.
   and an idled instance cannot hold WebSocket connections — realtime sync would
   silently stop. Free is fine for a one-off smoke test.
 - **`healthCheckPath: /internal/healthz`** — public, unauthenticated, and it
-  checks Postgres *and* Redis, so a broken dependency fails the deploy loudly.
+  reports on Postgres *and* Redis. It answers **200 either way**, with
+  `status: "degraded"` and a per-dependency breakdown in the body when one of
+  them is unreachable. That is deliberate: most routes keep working without
+  Redis (presence degrades to "offline" rather than failing), so a Redis blip
+  must not take the service out of the load balancer or roll back a deploy. Read
+  the body, not the status code, and alert on it — the status code is liveness,
+  not dependency health.
 - **`region: oregon`** — change it to sit near your Supabase region; every
   request makes a database round trip.
 - **`ipAllowList: []`** on Key Value — private-network access only.

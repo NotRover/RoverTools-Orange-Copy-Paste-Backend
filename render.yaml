@@ -19,8 +19,10 @@ services:
     plan: starter
     # Keep this close to your Supabase region — every request makes a DB round trip.
     region: oregon
-    # Public, unauthenticated, and checks both Postgres and Redis, so a failing
-    # dependency correctly fails the deploy.
+    # Public and unauthenticated. Reports on both Postgres and Redis but answers
+    # 200 either way, with `status: "degraded"` in the body when one is down —
+    # deliberately, so a Redis blip does not pull the instance out of the load
+    # balancer when most routes still work. Liveness here, not dependency health.
     healthCheckPath: /internal/healthz
     autoDeployTrigger: commit
     envVars:
