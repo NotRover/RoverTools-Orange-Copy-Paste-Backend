@@ -1,17 +1,26 @@
 import json
 import secrets
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import realtime as rt
 from src.auth.models import Profile
-from src.spaces.models import Space, SpaceComment, SpaceInvite, SpaceJoinRequest, SpaceMembership
+from src.spaces.models import (
+    Space,
+    SpaceComment,
+    SpaceEntryRemoval,
+    SpaceInvite,
+    SpaceJoinRequest,
+    SpaceMembership,
+)
 from src.spaces.schemas import (
     CommentCountOut,
     CreateCommentRequest,
@@ -423,6 +432,58 @@ async def distribute_keys(
     return written
 
 
+async def record_space_removals(
+    db: AsyncSession,
+    *,
+    space_ids: Sequence[uuid.UUID],
+    client_id: str,
+    entry_type: str,
+    author_id: uuid.UUID,
+    removed_by: uuid.UUID,
+    server_ts: int,
+) -> None:
+    """Write the durable record that an entry left these spaces.
+
+    **Deliberately does not commit.** Both call sites strip the space id from
+    the entry in a transaction of their own, and the record has to land in that
+    same transaction or it is not a guarantee - a commit here would open a window
+    where the entry has left the space and nothing says so, which is the exact
+    state this table exists to make impossible.
+
+    Upsert rather than insert, against the unique index on
+    (space_id, client_id, entry_type): an entry can be shared, withdrawn,
+    re-shared and withdrawn again, and only the latest withdrawal is a fact
+    anyone needs. `server_ts` moves forward so a device that already saw the
+    first one still picks up the second.
+    """
+    if not space_ids:
+        return
+    stmt = pg_insert(SpaceEntryRemoval).values(
+        [
+            {
+                "id": uuid.uuid4(),
+                "space_id": space_id,
+                "client_id": client_id,
+                "entry_type": entry_type,
+                "author_id": author_id,
+                "removed_by": removed_by,
+                "server_ts": server_ts,
+            }
+            for space_id in space_ids
+        ]
+    )
+    await db.execute(
+        stmt.on_conflict_do_update(
+            index_elements=["space_id", "client_id", "entry_type"],
+            set_={
+                "author_id": stmt.excluded.author_id,
+                "removed_by": stmt.excluded.removed_by,
+                "server_ts": stmt.excluded.server_ts,
+            },
+        )
+    )
+
+
 async def remove_entry_from_space(
     db: AsyncSession, space_id: uuid.UUID, client_id: str, entry_type: str, user_id: str
 ) -> str:
@@ -479,6 +540,20 @@ async def remove_entry_from_space(
         if isinstance(keys, dict) and keys.pop(str(space_id), None) is not None:
             row.wrapped_keys = json.dumps(keys)
         row.server_ts = server_ts
+
+    # Same transaction as the strip above. Pull's space arm matches on
+    # `space_ids`, so the moment that array loses the id the row is invisible to
+    # members - this row is the only thing a device that was offline at the time
+    # can ever learn the removal from.
+    await record_space_removals(
+        db,
+        space_ids=[space_id],
+        client_id=client_id,
+        entry_type=entry_type,
+        author_id=uuid.UUID(author_id),
+        removed_by=uid,
+        server_ts=server_ts,
+    )
     await db.commit()
     return author_id
 

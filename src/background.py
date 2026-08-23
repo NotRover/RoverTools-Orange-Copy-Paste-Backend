@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Awaitable, cast
 
 from redis.asyncio import Redis
-from sqlalchemy import and_, exists, select, text, update
+from sqlalchemy import and_, delete, exists, select, text, update
 
 from src import realtime as rt
 from src.blobs import s3
@@ -27,7 +27,7 @@ from src.blobs.models import Blob
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database import AsyncSessionLocal, engine
-from src.spaces.models import SpaceMembership
+from src.spaces.models import SpaceEntryRemoval, SpaceMembership
 from src.sync.models import SyncEntry
 from src.redis_client import get_redis_pool
 
@@ -42,6 +42,20 @@ _ORPHAN_TTL_MS = 3600 * 1000  # unconfirmed blobs older than 1h are orphans
 # push can sit in a client's offline queue for days. Only sweep blobs that have
 # been unreferenced for longer than any plausible queue.
 _UNREFERENCED_GRACE_MS = 7 * 24 * 3600 * 1000
+# How long a space-removal record is kept, and a real cliff rather than a tidy
+# boundary: a device that has been offline longer than this comes back, pulls,
+# finds no record, and keeps its copy of the withdrawn entry. A full resync from
+# a zero cursor does NOT repair it - the client's merge is additive, so an entry
+# that has stopped matching the space arm is simply not mentioned, and nothing
+# deletes it.
+#
+# 90 days is therefore a bet that no device stays away that long while still
+# holding shared content. The rows are ~100 bytes, so the storage argument for
+# pruning at all is weak; the reason to keep a horizon is that unbounded is
+# unbounded. If the bet ever looks wrong, raising this costs almost nothing and
+# lowering it silently restores the bug for exactly the devices that have been
+# gone longest.
+_REMOVAL_RETENTION_MS = 90 * 24 * 3600 * 1000
 
 
 async def run_maintenance(stop: asyncio.Event) -> None:
@@ -85,6 +99,11 @@ async def _leader_loop(stop: asyncio.Event) -> None:
                 await _cleanup_orphan_blobs()
             except Exception:
                 logger.exception("orphan blob cleanup failed")
+            try:
+                async with AsyncSessionLocal() as db:
+                    await _prune_space_entry_removals(db)
+            except Exception:
+                logger.exception("space removal pruning failed")
             elapsed_since_cleanup = 0
 
         await _wait(stop, _PRESENCE_SWEEP_INTERVAL)
@@ -187,3 +206,29 @@ async def _cleanup_orphan_blobs() -> None:
         await db.commit()
     if deleted:
         logger.info("orphan blob cleanup: deleted %d blob(s)", deleted)
+
+
+async def _prune_space_entry_removals(db: AsyncSession) -> None:
+    """Drop removal records old enough that nobody can still need them.
+
+    These exist so a device that was offline during a withdrawal learns about it
+    on its next pull. Past the retention window the record is gone and a device
+    that has been away that whole time keeps its copy - see the note on
+    `_REMOVAL_RETENTION_MS` for why that is a cliff and not a clean boundary.
+
+    Deleting sooner is the one dangerous direction: it restores the bug the
+    table was added to fix, for exactly the devices that have been away longest.
+    """
+    cutoff = int((datetime.now(UTC) - timedelta(milliseconds=_REMOVAL_RETENTION_MS)).timestamp() * 1000)
+    # `RETURNING` rather than reading `rowcount`, which SQLAlchemy's stubs do not
+    # expose on the generic `Result`. One statement either way.
+    dropped = (
+        await db.scalars(
+            delete(SpaceEntryRemoval)
+            .where(SpaceEntryRemoval.server_ts < cutoff)
+            .returning(SpaceEntryRemoval.id)
+        )
+    ).all()
+    await db.commit()
+    if dropped:
+        logger.info("space removal pruning: dropped %d record(s)", len(dropped))
