@@ -51,10 +51,10 @@ docker compose -f "$COMPOSE" build api
 docker tag "$IMAGE" "${IMAGE_REPO}:latest"
 
 # Recreate the stack (first deploy brings up caddy + redis too). Recreating the
-# single `api` leaves a ~3s gap; Caddy holds and retries HTTP across it
-# (lb_try_duration in the Caddyfile), so requests arrive a little late instead of
-# 502ing. Open WebSockets drop once and reconnect. We deliberately do not use an
-# overlap tool (docker-rollout/Swarm) — see docs/DEPLOY.md section 9.
+# single `api` leaves a ~1-3s window with no backend, so a request landing in it
+# gets a 502 and open WebSockets drop once. Accepted deliberately: no overlap tool
+# (docker-rollout/Swarm), and a Caddy retry was tried and measured not to help.
+# See docs/DEPLOY.md section 9.
 docker compose -f "$COMPOSE" up -d
 
 # Keep the last few tagged images for rollback; drop older ones. Best-effort.

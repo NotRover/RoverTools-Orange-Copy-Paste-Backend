@@ -432,8 +432,8 @@ cat ~/.ssh/id_repo.pub
 #   -> add that PUBLIC key as a READ-ONLY Deploy key on the GitHub repo.
 ```
 
-The rest of the wiring — cloning the repo, `.env`, the optional `docker-rollout` plugin, and
-the systemd timer — is in section 9, since it depends on the repo files.
+The rest of the wiring — cloning the repo, `.env`, and the systemd timer — is in section 9,
+since it depends on the repo files.
 
 **Historical:** an earlier design added a separate `deploy` user with an inbound,
 forced-command-locked CI key (`id_ci`) for a GitHub Actions push-deploy. The poll model
@@ -718,19 +718,26 @@ script), not proxy tuning.
 ### Architecture
 
 ```
-                        VPS  (rovertools-temp.ctx.cl)
-   internet --> :443 --> Caddy --> api  xN  --> Supabase (Postgres + Auth)  [external]
-                         (TLS,       |  \------> Cloudflare R2 (blobs)       [external]
-                          WS proxy,  |
-                          LB)        \--------> redis   (pub/sub + presence) [in-compose]
+                        VPS
+   internet --> :443 --> Caddy --> api     --> Supabase (Postgres + Auth)  [external]
+                         (TLS,       |  \------> Cloudflare R2 (blobs)      [external]
+                          WS proxy)  |
+                                     \--------> redis  (pub/sub + presence) [in-compose]
+                                 \
+                                  \----------> kuma   (status dashboard)    [in-compose]
+
+   rovertools-temp.ctx.cl   -> api
+   rovertools-status.ctx.cl -> kuma
 ```
 
 - **Caddy** — the only container with published ports (80/443). Automatic TLS, proxies
-  WebSockets with no config, load-balances across `api` replicas. Never rolled.
+  WebSockets with no config, serves both hostnames. Never rolled.
 - **api** — built locally from the `Dockerfile`; **no** host port (only Caddy reaches it over
-  the compose network, which is also what lets two run at once during a swap).
+  the compose network). One replica; a deploy recreates it.
 - **redis** — internal network, **no published port**, `requirepass`, persistence off. Not
   recreated on an `api` deploy, so presence is not needlessly flushed.
+- **kuma** — Uptime Kuma, **no** host port, data in the `kuma_data` volume, no Docker socket.
+  Watches the stack from inside it, which is why an external check still matters (section 12).
 
 ### The files (backend repo)
 
@@ -779,10 +786,9 @@ GIT_SSH_COMMAND='ssh -i ~/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChe
 # 3. Secrets — .env lives INSIDE the checkout (git-ignored, so `git reset --hard` keeps it):
 install -m 600 /dev/null ~/app/.env    # then fill it (see Secrets below)
 
-# 4. (No docker-rollout.) We deliberately do NOT install it — Caddy's retry absorbs the
-#    recreate gap instead ("What zero downtime means here"). If you ever want true container
-#    overlap, that is a deliberate change: vendor a reviewed tag from
-#    github.com/Wowu/docker-rollout/releases AND add the rollout branch back to deploy.sh.
+# 4. (Nothing to install for rollovers.) The ~1-3s 502 window per deploy is accepted; see
+#    "What zero downtime means here" for what was tried and rejected. Adding real overlap
+#    later is a deliberate change to deploy.sh, not a plugin drop-in.
 
 # 5. Install the systemd timer:
 sudo cp ~/app/deploy/rovertools-deploy.service /etc/systemd/system/
@@ -857,10 +863,20 @@ Check, in order:
 - If `ADMIN_API_KEY` is set, `/internal/metrics` with `X-Admin-Key` returns 200 (503 means
   the key is unset).
 
-When the pipeline is live, also run the drills: **rollout** (push a trivial change, watch
-`docker rollout` health-gate the new container and drop the old — HTTP never errors, the
-client reconnects once); **rollback** (redeploy the previous SHA); **reboot** (`sudo reboot`,
-confirm the stack comes back on its own via `restart: unless-stopped`).
+Also run the drills. **Deploy** — push a trivial change (or `deploy/deploy.sh --force`) and
+watch the swap; measure the gap rather than assume it:
+
+```bash
+cd ~/app && ./deploy/deploy.sh --force >/tmp/deploy.log 2>&1 &
+while kill -0 $! 2>/dev/null; do
+  curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" https://rovertools-temp.ctx.cl/internal/healthz
+  sleep 0.3
+done
+```
+
+Expect 200s with **two 502s** at the recreate (one immediate, one ~3s dial timeout) — that is
+the known, accepted window, not a regression. Then **rollback** (redeploy the previous SHA) and
+**reboot** (`sudo reboot`, confirm the stack returns on its own via `restart: unless-stopped`).
 
 ---
 
@@ -882,6 +898,45 @@ has not updated is offline until they do. Make sure `APP_CORS_ORIGINS` includes 
 ---
 
 ## 12. Ongoing operations
+
+**Monitoring (Uptime Kuma).** Runs as the `kuma` service in the prod stack, published by Caddy
+at `https://rovertools-status.ctx.cl`, with its data in the `kuma_data` volume. One-time setup:
+
+1. **Register the DNS name first** (FreeDNS, an A record for `rovertools-status` at the box's
+   IPv4) — deploying before it resolves leaves Caddy retrying a cert it cannot validate.
+2. Deploy (`deploy/deploy.sh --force`, or wait for the poll), then **open the URL immediately
+   and create the admin account**. Kuma's setup page is unauthenticated until the first user
+   exists, so whoever loads it first claims the instance. Turn on **2FA** in Profile ->
+   Security straight after; this is a public login page.
+3. Add the monitors below.
+
+**The monitor that matters, and the trap in it.** `/internal/healthz` returns **200 even when
+degraded** — a dead Postgres or Redis shows only in the body (`src/admin/router.py`). A plain
+status-code monitor stays green through a database outage. Use a **keyword** monitor:
+
+| Monitor | Type | Target | Keyword |
+|---|---|---|---|
+| API (public path) | HTTP(s) - Keyword | `https://rovertools-temp.ctx.cl/internal/healthz` | `"status":"ok"` |
+| API (direct) | HTTP(s) - Keyword | `http://api:8000/internal/healthz` | `"status":"ok"` |
+
+Both, because the pair localises a fault: public failing while direct passes means Caddy, TLS,
+or DNS; both failing means the app, Postgres, or Redis. The HTTPS monitor also tracks
+certificate expiry on its own.
+
+**Notifications: do not use email.** OVH filters outbound SMTP (the same reason the app sends
+through Brevo's HTTPS API, section 13), so Kuma's SMTP notifier will silently fail to deliver.
+Use an HTTPS-based notifier — Telegram, Discord, ntfy, Pushover — or Brevo SMTP on port 2525
+if you want mail. Send a test notification and confirm it arrives before trusting it.
+
+**What this cannot tell you.** Kuma runs on the box it watches, so if the VPS is down or off
+the network, the dashboard is down with it and no alert is sent. A **free external check**
+(UptimeRobot, Better Stack) hitting the same keyword URL is the only thing that catches a
+whole-box outage; run one alongside this. Kuma covers the common cases — app crashed,
+dependency unreachable, cert expiring, a deploy that broke the service.
+
+**No Docker socket.** Kuma's container monitors need `/var/run/docker.sock`, which is
+root-equivalent access for a web-facing service — the same objection that ruled out
+docker-rollout (section 9). HTTP checks cover the stack; `docker compose ps` covers the rest.
 
 **Inspecting logs.** Everything lands in the host's systemd journal, which is persistent and
 survives the container swaps a deploy makes. Two surfaces: the deploy runner and the app
@@ -1107,6 +1162,14 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   ~1-3s 502 window per deploy. Also fixed `deploy.sh`: its `docker rollout` guard exited 0
   with no plugin installed, so the branch ran and broke the deploy. Reproduce the measurement
   with a watch-curl during `deploy.sh --force`.
+- **2026-08-24 — monitoring: Uptime Kuma on the box.** Added as the `kuma` compose service
+  behind Caddy on `rovertools-status.ctx.cl`, with no Docker socket mounted (container monitors
+  would mean root-equivalent access for a web-facing service, the docker-rollout objection
+  again). Health monitors must be **keyword** checks on `"status":"ok"`, because
+  `/internal/healthz` answers 200 while degraded and a status-code check would stay green
+  through a Postgres outage. Email notifiers are unusable (OVH filters SMTP) — use an HTTPS
+  notifier. Kuma cannot report a whole-box outage since it shares the box; pair it with a free
+  external check (section 12).
 
 ---
 

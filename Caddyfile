@@ -20,3 +20,14 @@ rovertools-temp.ctx.cl {
 		# gap is accepted rather than papered over. See docs/DEPLOY.md section 9.
 	}
 }
+
+# Uptime Kuma dashboard. Register this name in FreeDNS (A -> the box) BEFORE
+# deploying, or Caddy will retry a cert it cannot validate. Kuma owns its own
+# login; turn on 2FA right after creating the admin account, because this is a
+# public login page. See docs/DEPLOY.md section 12.
+rovertools-status.ctx.cl {
+	encode zstd gzip
+
+	# Kuma's UI is socket.io; Caddy proxies the upgrade with no extra config.
+	reverse_proxy kuma:3001
+}

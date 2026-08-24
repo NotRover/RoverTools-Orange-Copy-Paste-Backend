@@ -5,7 +5,8 @@
 # origin/main. See docs/DEPLOY.md section 9.
 #   - api is built here (`build: .`) and tagged ${IMAGE}; a per-commit tag makes
 #     rollback exact. It publishes NO host port; only Caddy reaches it over the
-#     compose network, which is also what lets two run during a start-first swap.
+#     compose network. One replica: a deploy recreates it, with a ~1-3s 502
+#     window accepted rather than run an overlap tool (docs/DEPLOY.md section 9).
 #   - redis publishes NO host port; it holds only pub/sub + presence, persistence off.
 services:
   caddy:
@@ -41,6 +42,20 @@ services:
       options:
         tag: rovertools-api
 
+  # Uptime Kuma — self-hosted status dashboard (docs/DEPLOY.md section 12).
+  # No host port: Caddy publishes it on the status subdomain. The Docker socket is
+  # deliberately NOT mounted — container monitors would need root-equivalent access,
+  # the same objection that ruled out docker-rollout; HTTP checks cover the stack.
+  kuma:
+    image: louislam/uptime-kuma:1
+    restart: unless-stopped
+    volumes:
+      - kuma_data:/app/data
+    logging:
+      driver: journald
+      options:
+        tag: rovertools-kuma
+
   redis:
     image: redis:8-alpine
     restart: unless-stopped
@@ -65,3 +80,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  kuma_data:      # monitor definitions + history (SQLite); back this up, not the image

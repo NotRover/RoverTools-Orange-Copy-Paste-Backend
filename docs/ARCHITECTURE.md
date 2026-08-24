@@ -1444,8 +1444,8 @@ Blobs use MinIO or a real R2 bucket via env. No worker service.
 ### 11.2 Production
 
 Self-hosted on a single VPS in Docker (Caddy + FastAPI + Redis); Supabase and R2 stay
-external. The operational steps — hardening, the compose/Caddy stack, CI/CD — live in
-[`DEPLOY.md`](DEPLOY.md); this is the model.
+external. The operational steps — hardening, the compose/Caddy stack, and the on-box
+build-and-deploy — live in [`DEPLOY.md`](DEPLOY.md); this is the model.
 
 - **Supabase** (managed): Postgres + Auth. `DATABASE_URL` (asyncpg driver, via the
   Supavisor pooler), `SUPABASE_URL` and optionally `SUPABASE_JWT_SECRET`.
@@ -1464,7 +1464,8 @@ external. The operational steps — hardening, the compose/Caddy stack, CI/CD �
 - **R2 free**: 10 GB storage, **zero egress**. Binary blobs are the real storage cost;
   even beyond free it is ~$0.015/GB-mo. At the **50 MB** default per-user quota, the
   10 GB free pool covers ~200 users before R2 costs anything.
-- **Redis**: presence + pub/sub only — well within any free managed tier.
+- **Redis**: presence + pub/sub only, and co-located in the compose stack — it costs
+  nothing beyond the VPS it already runs on.
 
 Per-user storage is capped by `profiles.blob_bytes_quota` (default 50 MB, set via
 `DEFAULT_BLOB_QUOTA_BYTES`, overridable per user via the admin quota endpoint) and a
