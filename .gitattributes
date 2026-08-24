@@ -2,7 +2,7 @@
 # Pin LF regardless of anyone's core.autocrlf.
 *.sh              text eol=lf
 Dockerfile        text eol=lf
-Caddyfile         text eol=lf
+caddy/Caddyfile   text eol=lf
 docker-compose*.yml text eol=lf
 deploy/rovertools-deploy.service text eol=lf
 deploy/rovertools-deploy.timer   text eol=lf

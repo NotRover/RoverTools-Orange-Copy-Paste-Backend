@@ -57,6 +57,19 @@ docker tag "$IMAGE" "${IMAGE_REPO}:latest"
 # See docs/DEPLOY.md section 9.
 docker compose -f "$COMPOSE" up -d
 
+# Ship Caddyfile changes too. `up -d` does not recreate caddy when only the
+# mounted config changed, so without this a Caddyfile edit sits unapplied until
+# something recreates the container (historically: the next reboot). The config
+# is mounted as a DIRECTORY (see the compose file) precisely so this reload sees
+# the current file - a single-file bind mount pins the container to the inode
+# that git replaces on every pull, and the container keeps reading the old one.
+# Reload is atomic: an invalid config is rejected and the running one keeps
+# serving, so a bad Caddyfile fails the deploy instead of taking the site down.
+# -T because there is no TTY under systemd.
+if [[ -n "$(docker compose -f "$COMPOSE" ps -q caddy)" ]]; then
+	docker compose -f "$COMPOSE" exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+fi
+
 # Keep the last few tagged images for rollback; drop older ones. Best-effort.
 docker images "${IMAGE_REPO}" --format '{{.ID}} {{.Tag}}' \
 	| awk '$2 != "latest"' | tail -n +$((KEEP_IMAGES + 1)) | awk '{print $1}' \

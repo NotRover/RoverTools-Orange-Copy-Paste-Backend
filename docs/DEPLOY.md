@@ -1,7 +1,8 @@
 # Orange Clipboard — Backend Deployment
 
 **Owns:** the self-hosted OVH VPS that runs the sync backend and Redis — how to reach it,
-recover it, harden it, and deploy the API onto it (Docker Compose + Caddy + CI/CD). Also
+recover it, harden it, and deploy the API onto it (Docker Compose + Caddy, deployed by a
+git poll on the box). Also
 the external services the backend depends on (Supabase, R2) and the migration discipline.
 **Not here:** the wire contract — routes, payloads, DDL, socket events, crypto envelope —
 which is [ARCHITECTURE.md](ARCHITECTURE.md); client internals (the app's own
@@ -30,7 +31,7 @@ forever; if that ever happens, rotate it, do not edit it out.
 6. [What you are deploying](#6-what-you-are-deploying)
 7. [External services — Supabase and R2](#7-external-services--supabase-and-r2)
 8. [Database migrations](#8-database-migrations)
-9. [Deployment — Docker Compose + Caddy + CI/CD](#9-deployment--docker-compose--caddy--cicd)
+9. [Deployment — build-on-box, polled from git](#9-deployment--build-on-box-polled-from-git)
 10. [Verify the deployment](#10-verify-the-deployment)
 11. [Point the desktop app at it](#11-point-the-desktop-app-at-it)
 12. [Ongoing operations](#12-ongoing-operations)
@@ -56,7 +57,7 @@ forever; if that ever happens, rotate it, do not edit it out.
 | Timezone | UTC |
 | Admin user | `ubuntu` (passwordless `sudo`) |
 | `root` | locked — no root login by any path, including the console |
-| Deploy user | `deploy` (no sudo, in `docker` group, key locked to one command) |
+| Deploy runs as | `ubuntu` in `~/app`, pulling with a read-only deploy key (section 4) |
 
 ---
 
@@ -680,8 +681,10 @@ push to main ─▶ GitHub (repo only)
   (plus `:latest`). It never leaves the box — no registry, no push, no Actions.
 - Deploys land within a couple of minutes of a push. No inbound endpoint, no webhook secret,
   no CI credentials on the box — the attack surface stays exactly "outbound git + Docker".
-- Config travels with the code: `docker-compose.prod.yml`, `Caddyfile`, and `deploy.sh` all
-  live in the checkout, so a change to any of them ships on the next poll like app code does.
+- Config travels with the code: `docker-compose.prod.yml`, `caddy/Caddyfile`, and `deploy.sh`
+  all live in the checkout, so a change to any of them ships on the next poll like app code
+  does. For the Caddyfile that takes a deliberate reload step in `deploy.sh` - see the trap
+  below.
 
 ### What "zero downtime" means here
 
@@ -751,7 +754,7 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   build context.
 - **`docker-compose.prod.yml`** — `caddy` (published 80/443), `api` (`build: .`, tagged
   `${IMAGE}`, no host port), `redis` (no host port). The dev `docker-compose.yml` is untouched.
-- **`Caddyfile`** — `rovertools-temp.ctx.cl`, auto TLS. The `dynamic a` upstream (via Docker
+- **`caddy/Caddyfile`** — `rovertools-temp.ctx.cl` and the status site, auto TLS. The `dynamic a` upstream (via Docker
   DNS `127.0.0.11`) re-resolves `api` per request, so after a recreate Caddy finds the new
   container's IP instead of caching the dead one. No retry directives — see "What zero
   downtime means here" for why they do not help with a single container.
@@ -1065,6 +1068,16 @@ hour, so configuring custom SMTP is what makes signup and reset mail dependable.
 `AWS_REGION=auto`, and the endpoint is the account-level R2 URL. Presigned PUTs expire in 5
 minutes and GETs in 1 hour, so a badly skewed client clock also breaks uploads.
 
+**A Caddyfile change does not take effect, and `caddy reload` says "config is unchanged".**
+The container is reading a stale copy. A *single-file* bind mount binds the inode, and `git
+pull` replaces the file rather than editing it in place, so the container keeps the inode it
+started with - `validate` and `reload` inside the container then both operate on the old
+file. Fixed by mounting the `caddy/` **directory** instead (`./caddy:/etc/caddy:ro`), which
+resolves the path fresh, plus a reload step in `deploy.sh`. If you meet this on a container
+predating that fix, `docker compose -f docker-compose.prod.yml up -d --force-recreate caddy`.
+Symptom to recognise: the file on disk clearly has your change, `caddy validate` passes, and
+the reload logs `"config is unchanged"`.
+
 **Two builds of one commit differ.** Fixed once the `Dockerfile` builds `--frozen` from
 `uv.lock` (section 9). Until then, the image installs with `uv pip install -e .` resolved
 from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
@@ -1170,6 +1183,15 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   through a Postgres outage. Email notifiers are unusable (OVH filters SMTP) — use an HTTPS
   notifier. Kuma cannot report a whole-box outage since it shares the box; pair it with a free
   external check (section 12).
+- **2026-08-24 — the Caddyfile was never actually shipping.** Adding Kuma surfaced it: the new
+  site block was on disk and on the right commit, yet `caddy validate` passed and `caddy
+  reload` logged `"config is unchanged"`. `docker-compose.prod.yml` bind-mounted the *single
+  file* `./Caddyfile`, which binds an inode; `git pull` replaces the file, so the running
+  container kept reading the copy it started with, and every Caddyfile change since the last
+  container recreate had been silently inert (applying only at the next reboot). Fixed by
+  moving the config to `caddy/Caddyfile` and mounting the **directory**, and by adding a
+  `caddy reload` step to `deploy.sh` so config changes ship with the code as section 9 always
+  claimed they did.
 
 ---
 
