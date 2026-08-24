@@ -20,6 +20,13 @@ services:
       - caddy_config:/config
     depends_on:
       - api
+    # Ship logs to the host journal (persistent, survives the rollout that
+    # replaces this container, size-capped by journald). Read with
+    # `journalctl -t rovertools-caddy`. See docs/DEPLOY.md section 12.
+    logging:
+      driver: journald
+      options:
+        tag: rovertools-caddy
 
   api:
     build: .
@@ -29,10 +36,18 @@ services:
     depends_on:
       - redis
     # no published ports (only Caddy reaches it; two can run during a rollout)
+    logging:
+      driver: journald
+      options:
+        tag: rovertools-api
 
   redis:
     image: redis:8-alpine
     restart: unless-stopped
+    logging:
+      driver: journald
+      options:
+        tag: rovertools-redis
     command:
       - redis-server
       - --requirepass
