@@ -1443,11 +1443,17 @@ Blobs use MinIO or a real R2 bucket via env. No worker service.
 
 ### 11.2 Production
 
-- **Supabase** (managed): Postgres + Auth. Point `DATABASE_URL` at the Supabase
-  connection string (asyncpg driver) and set `SUPABASE_URL` / `SUPABASE_JWT_SECRET`.
-- **FastAPI**: deploy anywhere (Fly/Render/etc.); scale to N stateless replicas behind
-  a load balancer. Nginx/ingress must allow the `/ws` upgrade with a long read timeout.
-- **Redis**: managed (e.g. Upstash, `rediss://`).
+Self-hosted on a single VPS in Docker (Caddy + FastAPI + Redis); Supabase and R2 stay
+external. The operational steps — hardening, the compose/Caddy stack, CI/CD — live in
+[`DEPLOY.md`](DEPLOY.md); this is the model.
+
+- **Supabase** (managed): Postgres + Auth. `DATABASE_URL` (asyncpg driver, via the
+  Supavisor pooler), `SUPABASE_URL` and optionally `SUPABASE_JWT_SECRET`.
+- **FastAPI**: stateless — run N replicas. Caddy terminates TLS, reverse-proxies, and
+  passes the `/ws` upgrade through with no extra config. The image is portable, so it can
+  also run on any platform that assigns `$PORT`.
+- **Redis**: co-located as a compose service on the internal network (no published port);
+  holds only pub/sub fan-out + presence, so persistence is off.
 - **R2**: bucket + credentials via the S3 env vars (`AWS_REGION=auto`).
 
 ### 11.3 Free-tier ceilings & cost

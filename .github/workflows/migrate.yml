@@ -9,9 +9,9 @@ run-name: >-
   -> ${{ github.event_name == 'push' && 'head' || inputs.revision }}
   (${{ inputs.action == 'upgrade' && 'APPLIES CHANGES' || 'read-only' }})
 
-# Render's pre-deploy hook is a paid feature, so this is how a merged Alembic
-# revision reaches the database. Applying is manual: someone dispatches it and
-# says which revision, on purpose.
+# The deploy pipeline ships code only and never migrates (by design), so this is
+# how a merged Alembic revision reaches the database. Applying is manual: someone
+# dispatches it and says which revision, on purpose.
 #
 # A push to main that touches migrations/ runs the preview by itself. That is
 # the half worth automating - it says "a migration is pending, here is the exact

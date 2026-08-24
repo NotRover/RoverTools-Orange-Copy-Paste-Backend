@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     # this service puts in front of a person (space invites, the password-reset
     # redirect). Single source, so pointing a domain at the deployment is an env
     # change rather than a code change. No trailing slash.
-    public_base_url: str = "https://rovertools-smart-clipboard-app-backend.onrender.com"
+    public_base_url: str = "https://rovertools-temp.ctx.cl"
     # The interactive API docs and the OpenAPI schema. Off by default, so a
     # deployment that configures nothing keeps them private: the schema is a full
     # map of the surface, including the `/internal` admin routes, and publishing

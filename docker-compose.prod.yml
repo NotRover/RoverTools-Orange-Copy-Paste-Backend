@@ -1,0 +1,52 @@
+# Production stack for the self-hosted VPS. Local dev stays in docker-compose.yml.
+#
+# The image is BUILT ON THE BOX from the git checkout (no registry, no CI minutes)
+# and deployed by deploy/deploy.sh, which a systemd timer runs on a poll of
+# origin/main. See docs/DEPLOY.md section 9.
+#   - api is built here (`build: .`) and tagged ${IMAGE}; a per-commit tag makes
+#     rollback exact. It publishes NO host port; only Caddy reaches it over the
+#     compose network, which is also what lets two run during a start-first swap.
+#   - redis publishes NO host port; it holds only pub/sub + presence, persistence off.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+  api:
+    build: .
+    image: ${IMAGE:-rovertools-api:latest}   # built & tagged locally by deploy.sh
+    restart: unless-stopped
+    env_file: .env          # every secret lives here, on the box, mode 600
+    depends_on:
+      - redis
+    # no published ports (only Caddy reaches it; two can run during a rollout)
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - volatile-ttl
+    # no published ports
+
+volumes:
+  caddy_data:
+  caddy_config:

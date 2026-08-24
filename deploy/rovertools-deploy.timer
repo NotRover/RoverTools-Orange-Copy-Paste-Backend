@@ -1,0 +1,13 @@
+# Install to /etc/systemd/system/rovertools-deploy.timer, then:
+#   sudo systemctl enable --now rovertools-deploy.timer
+# Polls ~every 90s. Deploys land within a couple of minutes of a push to main.
+[Unit]
+Description=Poll for RoverTools backend deploys
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=90s
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

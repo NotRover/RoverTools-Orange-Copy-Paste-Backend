@@ -34,7 +34,7 @@ one.
 
 ```bash
 export ADMIN_KEY='<the value from the service environment>'
-export API='https://<your-service>.onrender.com'
+export API='https://rovertools-temp.ctx.cl'
 ```
 
 ## Send one to everybody
