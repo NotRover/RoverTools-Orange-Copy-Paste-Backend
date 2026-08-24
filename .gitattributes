@@ -6,3 +6,5 @@ caddy/Caddyfile   text eol=lf
 docker-compose*.yml text eol=lf
 deploy/rovertools-deploy.service text eol=lf
 deploy/rovertools-deploy.timer   text eol=lf
+deploy/rovertools-health.service text eol=lf
+deploy/rovertools-health.timer   text eol=lf

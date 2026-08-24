@@ -1,0 +1,13 @@
+# Install to /etc/systemd/system/rovertools-health.timer, then:
+#   sudo systemctl enable --now rovertools-health.timer
+# Every 5 minutes, matching the monitor's heartbeat interval in Kuma.
+[Unit]
+Description=Push RoverTools host health to Uptime Kuma
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
