@@ -4,21 +4,19 @@ rovertools-temp.ctx.cl {
 	encode zstd gzip
 
 	reverse_proxy {
-		# Re-resolve `api` on each request via Docker's embedded DNS (127.0.0.11)
-		# so a request always finds the current container. `resolvers` is a
-		# subdirective of `dynamic a`, so it sits inside its block.
+		# Re-resolve `api` on each request via Docker's embedded DNS (127.0.0.11),
+		# so after a deploy recreates the container Caddy finds its new IP instead
+		# of caching the dead one. `resolvers` is a subdirective of `dynamic a`, so
+		# it sits inside its block (a bare `resolvers` under reverse_proxy does not
+		# parse and crash-loops caddy).
 		dynamic a {
 			name api
 			port 8000
 			resolvers 127.0.0.11
 		}
-		# Deploys recreate the single `api` container, leaving a ~3s gap with no
-		# backend. Rather than 502 during it, hold the request and retry the dial
-		# until the new container answers: it arrives a couple seconds late instead
-		# of failing. Retrying a dial that never connected is safe for any method.
-		# This is why we don't need docker-rollout for HTTP; WebSockets still drop
-		# once and reconnect. See docs/DEPLOY.md section 9.
-		lb_try_duration 10s
-		lb_try_interval 250ms
+		# No lb_try_duration here on purpose: with one `api` container a deploy
+		# leaves a ~1-3s window with no backend at all, and retry/failover cannot
+		# reach a host that is not there — measured on the box, it still 502s. The
+		# gap is accepted rather than papered over. See docs/DEPLOY.md section 9.
 	}
 }

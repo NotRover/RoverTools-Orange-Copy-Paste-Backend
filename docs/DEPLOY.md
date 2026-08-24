@@ -685,29 +685,35 @@ push to main ─▶ GitHub (repo only)
 
 ### What "zero downtime" means here
 
-There is one `api` container, and a deploy recreates it — so there is a ~3s gap with no
-backend. We do **not** run an overlap tool (docker-rollout/Swarm); instead Caddy absorbs the
-gap, which splits the story in two:
+**There is none, and that is a deliberate choice.** There is one `api` container and a deploy
+recreates it, so every deploy has a **~1-3s window with no backend**:
 
-- **HTTP** — no errors. Caddy is set to hold a request and retry the upstream for up to 10s,
-  every 250ms (`lb_try_duration` / `lb_try_interval` in the `Caddyfile`), re-resolving `api`
-  through Docker DNS each interval. A request that lands mid-swap arrives a couple seconds
-  late instead of 502ing; retrying a dial that never connected is safe for any method. This is
-  "no failed requests", not literally zero-latency — the accepted trade for keeping the stack
-  a plain `docker compose up -d` with nothing third-party running as root.
-- **WebSockets** — the old container's open sockets drop once, when it is removed, and clients
-  reconnect (a new handshake mid-gap is retried like any HTTP request). The presence heartbeat
-  (`PING_INTERVAL = 25s`, `src/realtime.py`) keeps a socket under any 100s idle timeout and
-  re-`SET`s presence on reconnect.
+- **HTTP** — a request landing in that window gets a **502**. Measured, not assumed: a
+  watch-curl across `deploy.sh --force` shows two 502s (one immediate, one ~3s dial timeout)
+  and 200s either side. Clients retry, and deploys are infrequent, so it rarely meets a real
+  request.
+- **WebSockets** — open sockets drop once when the old container is removed, and clients
+  reconnect. The presence heartbeat (`PING_INTERVAL = 25s`, `src/realtime.py`) keeps a socket
+  under any 100s idle timeout and re-`SET`s presence on reconnect.
 
-**Why not docker-rollout / Swarm.** True zero-gap needs two `api` containers overlapping.
-`docker-rollout` is a third-party single-file script run with Docker (root) access — declined
-on trust grounds; Swarm is a cluster orchestrator whose weight is hard to justify on one host.
-For a single VPS with infrequent deploys, the Caddy retry covers the case that matters (no
-failed HTTP) at zero added surface. `deploy.sh` always does a plain `docker compose up -d` —
-an earlier version guarded a `docker rollout` branch, but the guard misfired once the plugin
-was removed (`docker <unknown> --help` exits 0, so the branch ran and broke the deploy), so
-the branch is gone. To use overlap later, reintroduce it deliberately.
+**What was tried and rejected.** True zero-gap needs two `api` containers overlapping, and
+every route to that was declined:
+
+- **`docker-rollout`** — a third-party single-file script running with Docker (root) access.
+  Declined on trust. `deploy.sh` briefly guarded a `docker rollout` branch; the guard misfired
+  once the plugin was absent (`docker <unknown> --help` exits 0, so the branch ran and failed
+  the deploy with `unknown shorthand flag: 'f'`). The branch is gone — reintroducing overlap
+  means editing `deploy.sh` deliberately.
+- **Docker Swarm** — native start-first updates, but a cluster orchestrator on a single host,
+  and `docker stack deploy` cannot build, which fights the build-on-box model.
+- **Caddy `lb_try_duration` retry** — looked like a free win and **does not work here**. The
+  config was confirmed live (`caddy adapt` showing `try_duration: 10000000000`) and the swap
+  still 502'd identically. Retry/failover is for picking another *healthy host in a pool*; with
+  one container the pool is momentarily empty and there is nothing to fail over to. Removed
+  rather than left in place implying protection it does not give.
+
+If the blip ever matters, the honest fix is overlap (Swarm, or a vendored+audited rollout
+script), not proxy tuning.
 
 ### Architecture
 
@@ -739,10 +745,9 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
 - **`docker-compose.prod.yml`** — `caddy` (published 80/443), `api` (`build: .`, tagged
   `${IMAGE}`, no host port), `redis` (no host port). The dev `docker-compose.yml` is untouched.
 - **`Caddyfile`** — `rovertools-temp.ctx.cl`, auto TLS. The `dynamic a` upstream (via Docker
-  DNS `127.0.0.11`) re-resolves `api` on each request so it always finds the current
-  container. `lb_try_duration 10s` / `lb_try_interval 250ms` make Caddy hold and retry across
-  the deploy recreate gap instead of 502ing — the reason no overlap tool is needed for HTTP
-  ("What zero downtime means here").
+  DNS `127.0.0.11`) re-resolves `api` per request, so after a recreate Caddy finds the new
+  container's IP instead of caching the dead one. No retry directives — see "What zero
+  downtime means here" for why they do not help with a single container.
 - **`deploy/deploy.sh`** — the poll+build+deploy script (run from the checkout by the timer).
 - **`deploy/rovertools-deploy.{service,timer}`** — the systemd units that poll ~every 90s.
 
@@ -1024,11 +1029,12 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   first to bring the pipeline up for free.
 - **Deploy stack** — Docker Compose + Caddy, on a systemd poll. The draw is tagged images and
   one-step rollback.
-- **Deploy rollover** — plain `docker compose up -d` recreate, with **Caddy retrying across
-  the ~3s gap** (`lb_try_duration`), over an overlap tool. `docker-rollout` was declined on
-  trust (a third-party script with Docker/root access); Docker Swarm was declined as
-  cluster-weight on one host. The trade: a few requests take a couple seconds longer during a
-  deploy, versus zero failed requests. See "What zero downtime means here".
+- **Deploy rollover** — plain `docker compose up -d` recreate, **accepting a ~1-3s 502 window
+  per deploy**, over an overlap tool. `docker-rollout` was declined on trust (a third-party
+  script with Docker/root access); Swarm as cluster-weight on one host; and a Caddy
+  `lb_try_duration` retry was tried and measured not to help (one container = an empty pool,
+  nothing to fail over to). Infrequent deploys and retrying clients make the blip cheap. See
+  "What zero downtime means here".
 - **Build + delivery** — **build on the box, polled from git**, over GitHub Actions +
   GHCR. A private repo's Actions minutes and (worse) its 500 MB Packages storage both cost
   money as builds pile up; building on the VPS we already pay for spends nothing on GitHub,
@@ -1091,13 +1097,16 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   logs moved to the persistent `journald` driver so they survive a rollout (section 5.8, 12).
   `https://rovertools-temp.ctx.cl/internal/healthz` returns 200 with `db` and `redis` ok, valid
   TLS, `via: 1.1 Caddy`. Backend is live; client cutover still pending (section 11).
-- **2026-08-24 — deploy rollover settled on Caddy retry, not docker-rollout.** Weighed
-  docker-rollout (declined: third-party script with Docker/root access) and Docker Swarm
-  (declined: cluster-weight on one host). Chose plain `docker compose up -d` with Caddy holding
-  and retrying HTTP across the ~3s recreate gap (`lb_try_duration`), confirmed against Caddy's
-  docs that dynamic upstreams are re-queried every retry iteration and dial failures are always
-  retried. Trade: a few requests run a couple seconds late per deploy, no failed requests.
-  Verify on the box with `watch -n1 curl ... /internal/healthz` during `deploy.sh --force`.
+- **2026-08-24 — deploy rollover: accept the blip.** Weighed docker-rollout (declined:
+  third-party script with Docker/root access) and Swarm (declined: cluster-weight on one host,
+  and `stack deploy` cannot build). Tried a Caddy `lb_try_duration` retry as the free middle
+  option; **measured on the box, it does not work** — config confirmed live via `caddy adapt`
+  (`try_duration: 10000000000`) and the swap still produced the same two 502s, because retry
+  needs another healthy host and one container means an empty pool. Removed the retry rather
+  than leave misleading config, and settled on plain `docker compose up -d` with a known
+  ~1-3s 502 window per deploy. Also fixed `deploy.sh`: its `docker rollout` guard exited 0
+  with no plugin installed, so the branch ran and broke the deploy. Reproduce the measurement
+  with a watch-curl during `deploy.sh --force`.
 
 ---
 
