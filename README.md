@@ -92,7 +92,7 @@ All settings come from environment variables (or `.env`) via `pydantic-settings`
 | Variable | Purpose |
 | --- | --- |
 | `DATABASE_URL` | Postgres connection string with the asyncpg driver. Use Supabase's **connection pooler** host in production. |
-| `REDIS_URL` | Pub/sub fan-out and device presence. `rediss://` for managed Redis. |
+| `REDIS_URL` | Pub/sub fan-out and device presence. `redis://:<pw>@redis:6379/0` in the prod compose network; `rediss://` for a TLS endpoint. |
 | `SUPABASE_URL` | Required. Identifies the project and derives the JWKS endpoint used to verify tokens. |
 | `SUPABASE_JWT_SECRET` | Legacy HS256 secret. Leave blank for projects created from 2025-10-01 onward, which sign asymmetrically. Both schemes are accepted, so a project mid-migration works. |
 | `SUPABASE_JWT_AUDIENCE` | Expected `aud` claim, default `authenticated`. |
@@ -198,9 +198,9 @@ docker-compose exec db createdb -U postgres clipboard_test
 
 ## Deployment
 
-Production runs against Supabase (Postgres + Auth), managed Redis, and Cloudflare R2, with only the API deployed — horizontally scalable behind a load balancer, since realtime fan-out goes through Redis rather than process memory.
+The backend is self-hosted on a small VPS in Docker: Caddy (TLS + reverse proxy) in front of the stateless FastAPI service, with Redis co-located for realtime fan-out and presence. Supabase (Postgres + Auth) and Cloudflare R2 (blobs) stay external. Deploys are pull-based with no CI service or registry: a systemd timer on the box polls `main`, and on a new commit it builds the image locally and rolls it out with a start-first swap, so realtime clients reconnect at most once per deploy.
 
-`render.yaml` is a ready Render Blueprint, and the `Dockerfile` honours `$PORT` so the image runs unchanged on platforms that assign one. The full walkthrough — provisioning Supabase and R2, the connection-pooler requirement, applying migrations, verification, and pointing the desktop app at the deployment — is in [`docs/DEPLOY.md`](docs/DEPLOY.md).
+The `Dockerfile` builds from the lockfile and honours `$PORT`, so the image also runs unchanged under plain `docker run`. The full walkthrough — hardening the box, provisioning Supabase and R2, applying migrations, the compose/Caddy/deploy setup, verification, and pointing the desktop app at it — is in [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ---
 

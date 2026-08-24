@@ -1,0 +1,20 @@
+# The image is built on the VPS from a git checkout, so keep the build context
+# small and never ship the checkout's own venv or history into the image.
+.git
+.gitignore
+.venv
+**/__pycache__
+*.py[codz]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+tests
+docs
+.github
+.env
+.env.*
+*.md
+docker-compose.yml
+docker-compose.prod.yml
+Caddyfile
+deploy

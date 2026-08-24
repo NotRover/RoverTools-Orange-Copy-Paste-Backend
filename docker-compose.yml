@@ -1,8 +1,8 @@
 # Local development stack.
 #
-# In production the API talks to Supabase (Postgres + Auth) and a managed Redis
-# (e.g. Upstash) — only the `api` service is deployed, scaled horizontally behind
-# a load balancer. The `db` and `redis` services below exist purely for local dev.
+# Production is a separate file (docker-compose.prod.yml): Caddy + the API + a
+# co-located Redis on the VPS, with Supabase (Postgres + Auth) external. The `db`,
+# `minio`, and `redis` services below exist purely for local dev.
 services:
   api:
     build: .

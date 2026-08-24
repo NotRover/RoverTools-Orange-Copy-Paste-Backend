@@ -1,0 +1,13 @@
+# Reverse proxy + automatic TLS for the self-hosted backend.
+# Swap the hostname (and PUBLIC_BASE_URL in .env) to move domains.
+rovertools-temp.ctx.cl {
+	encode zstd gzip
+
+	reverse_proxy {
+		# Re-resolve `api` on each request via Docker's embedded DNS (127.0.0.11)
+		# so both containers are used during a rollout. Without `dynamic a`, Caddy
+		# resolves `api` once at startup and never sees the second replica.
+		dynamic a api 8000
+		resolvers 127.0.0.11
+	}
+}
