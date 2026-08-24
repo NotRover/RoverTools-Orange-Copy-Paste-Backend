@@ -197,11 +197,6 @@ def _space_channels(channels: list[str]) -> list[str]:
     return [c for c in channels if c.startswith("space:")]
 
 
-def connection_count() -> int:
-    """Local (per-process) connected socket count."""
-    return len(_ws_device)
-
-
 async def _send_to_one(ws: WebSocket, raw: str) -> bool:
     """Deliver to a single socket. False means give up on it.
 
