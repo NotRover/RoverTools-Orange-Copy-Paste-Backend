@@ -764,6 +764,9 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   on success (and `status=down` from an exit trap on failure) so a broken pipeline alerts
   instead of going quiet. Both exist because both failures already happened - section 15.
 - **`deploy/rovertools-deploy.{service,timer}`** — the systemd units that poll ~every 90s.
+- **`deploy/host-health.sh`** + **`deploy/rovertools-health.{service,timer}`** — pushes disk,
+  memory, load and stopped-container state to Kuma every 5 minutes (section 12). Independent
+  of the deploy: it reports whether the *box* is healthy, not whether a deploy ran.
 
 **Why the Redis flags** (`--save "" --appendonly no --requirepass --maxmemory 256mb
 --maxmemory-policy volatile-ttl`): it holds only pub/sub + presence, so persistence off (an
@@ -927,11 +930,15 @@ status-code monitor stays green through a database outage. Use a **keyword** mon
 |---|---|---|---|
 | API (public path) | HTTP(s) - Keyword | `https://rovertools-temp.ctx.cl/internal/healthz` | `"status":"ok"` |
 | API (direct) | HTTP(s) - Keyword | `http://api:8000/internal/healthz` | `"status":"ok"` |
+| Redis | TCP Port | `redis` : `6379` | - |
 | Deploy pipeline | Push | (see below) | - |
+| Host health | Push | (see below) | - |
 
 Both HTTP monitors, because the pair localises a fault: public failing while direct passes
 means Caddy, TLS, or DNS; both failing means the app, Postgres, or Redis. The HTTPS monitor
-also tracks certificate expiry on its own.
+also tracks certificate expiry on its own. Kuma sits on the compose network, so `api` and
+`redis` resolve by service name — the direct and TCP checks need no published port. Do not
+add a monitor for Kuma itself: a dashboard cannot report its own absence.
 
 **The deploy heartbeat (Push monitor).** The two checks above watch the *service*. They say
 nothing about the *pipeline*, and a pipeline that stops working is silent by nature: the
@@ -961,6 +968,39 @@ echo 'KUMA_PUSH_URL=<paste the push URL>' >> .env
 The monitor should go green within a poll. `KUMA_PUSH_URL` is **optional** — leave it out and
 `kuma_ping` is a no-op, so the deploy works unchanged on a box without Kuma. It is also the
 one "secret" here that is not one: it grants nothing but the ability to ping a monitor.
+
+**Host health (Push monitor).** Kuma is an uptime monitor, not a metrics agent: it has no view
+of disk, memory, load, or a container that exited, and the container monitors that would give
+it one need the Docker socket — refused for a web-facing service (section 9). `deploy/host-health.sh`
+supplies those facts from outside the container instead. A timer runs it every 5 minutes; it
+pushes `status=down` when a compose service is not running, disk on `/` is at 85% or more, or
+memory is at 92% or more, and `status=up` otherwise. Either way the message carries the
+numbers, so a **green** beat reading `disk 78% mem 41% load 0.2 svc 4/4` is an early warning
+you can read at a glance — which is the point, since disk filling up is the most common way a
+small VPS dies (images, journal, volumes).
+
+Set it up the same way: **Add New Monitor** -> **Push** -> name `Host health`, Heartbeat
+Interval `330` (a little over the 5-minute timer), Retries `1`, then **save** and copy the URL.
+Install the timer and wire the URL:
+
+```bash
+cd ~/app
+echo 'HEALTH_PUSH_URL=<paste the push URL>' >> .env
+sudo cp deploy/rovertools-health.service deploy/rovertools-health.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rovertools-health.timer
+./deploy/host-health.sh          # run once now, so the monitor goes green immediately
+```
+
+Read its history with `journalctl -u rovertools-health.service -n 20 --no-pager`. The
+thresholds are constants at the top of the script; raise `DISK_LIMIT` only if you have
+decided the disk is meant to run that full.
+
+**What Kuma still will not give you: graphs.** These monitors answer "is it up, and is
+anything close to a limit" — not "what did memory do overnight". If you want time-series
+charts of CPU, RAM, disk and per-container usage, that is a different tool (Beszel is the
+light one; Netdata the thorough one), and both want more of the box than Kuma does. Add one
+only if you find yourself wanting history you do not have.
 
 **Notifications: do not use email.** OVH filters outbound SMTP (the same reason the app sends
 through Brevo's HTTPS API, section 13), so Kuma's SMTP notifier will silently fail to deliver.

@@ -1,0 +1,15 @@
+# Install to /etc/systemd/system/rovertools-health.service (see docs/DEPLOY.md section 12).
+# One-shot host-health push, driven by rovertools-health.timer. Runs as the login user
+# that owns the checkout (in the docker group, so `docker compose ps` works). Adjust
+# User= and the paths if you cloned somewhere other than /home/ubuntu/app.
+[Unit]
+Description=RoverTools: push host health (disk, memory, load, services) to Uptime Kuma
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/app
+ExecStart=/bin/bash /home/ubuntu/app/deploy/host-health.sh
+TimeoutStartSec=60
