@@ -704,8 +704,10 @@ gap, which splits the story in two:
 `docker-rollout` is a third-party single-file script run with Docker (root) access — declined
 on trust grounds; Swarm is a cluster orchestrator whose weight is hard to justify on one host.
 For a single VPS with infrequent deploys, the Caddy retry covers the case that matters (no
-failed HTTP) at zero added surface. `deploy.sh` still *uses* `docker rollout` if someone
-vendors the plugin later, but nothing installs it.
+failed HTTP) at zero added surface. `deploy.sh` always does a plain `docker compose up -d` —
+an earlier version guarded a `docker rollout` branch, but the guard misfired once the plugin
+was removed (`docker <unknown> --help` exits 0, so the branch ran and broke the deploy), so
+the branch is gone. To use overlap later, reintroduce it deliberately.
 
 ### Architecture
 
@@ -774,8 +776,8 @@ install -m 600 /dev/null ~/app/.env    # then fill it (see Secrets below)
 
 # 4. (No docker-rollout.) We deliberately do NOT install it — Caddy's retry absorbs the
 #    recreate gap instead ("What zero downtime means here"). If you ever want true container
-#    overlap, vendor a reviewed tag from github.com/Wowu/docker-rollout/releases into
-#    ~/.docker/cli-plugins/docker-rollout (chmod +x); deploy.sh will use it automatically.
+#    overlap, that is a deliberate change: vendor a reviewed tag from
+#    github.com/Wowu/docker-rollout/releases AND add the rollout branch back to deploy.sh.
 
 # 5. Install the systemd timer:
 sudo cp ~/app/deploy/rovertools-deploy.service /etc/systemd/system/
