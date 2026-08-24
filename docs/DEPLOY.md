@@ -453,6 +453,27 @@ the FreeDNS panel. DNS negatively caches, so a resolver queried too early (Cloud
 nameserver or `8.8.8.8`. Harmless for TLS: Let's Encrypt validates from its own resolvers,
 not a public cache.
 
+### 5.8 Persistent, capped journal for container logs
+
+The containers log to the systemd journal (`journald` driver, section 9), so the logs outlive
+the container swaps a deploy makes. Two things to set once: make the journal persistent (write
+to disk, not just RAM) and cap it so it can never fill the disk.
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/rovertools.conf >/dev/null <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=500M
+MaxRetentionSec=1month
+EOF
+sudo systemctl restart systemd-journald
+```
+
+**Verify:** `journalctl --disk-usage` reports a figure under the cap, and `ls /var/log/journal`
+exists (persistent storage active). Without this, `Storage=auto` keeps logs in a volatile ring
+buffer that a reboot wipes — the opposite of "read them anytime."
+
 ---
 
 Redis is **not** installed on the host — it ships as a compose service (section 9). At this
@@ -840,8 +861,9 @@ during the switch — anyone who has not updated is offline until they do. Make 
 
 ## 12. Ongoing operations
 
-**Inspecting logs.** Two separate surfaces: the deploy runner (systemd) and the running app
-(Docker). The deploy runner tells you whether a poll picked up a commit and whether the
+**Inspecting logs.** Everything lands in the host's systemd journal, which is persistent and
+survives the container swaps a deploy makes. Two surfaces: the deploy runner and the app
+containers. The deploy runner tells you whether a poll picked up a commit and whether the
 build/rollout succeeded:
 
 ```bash
@@ -850,20 +872,26 @@ journalctl -u rovertools-deploy.service -n 100 --no-pager   # last run's output
 systemctl status rovertools-deploy.timer               # poll active? last / next fire
 ```
 
-The app containers carry the actual API/proxy/redis output. Run these from `~/app` (they
-need the compose file); swap `api` for `caddy` (TLS / proxy) or `redis`:
+The containers log to the journal via the `journald` driver, tagged per service
+(`docker-compose.prod.yml`). Read them by tag — the tag is stable across rollouts, so you see
+old and new containers under one name:
 
 ```bash
-cd ~/app
-docker compose -f docker-compose.prod.yml logs -f api        # API, live
-docker compose -f docker-compose.prod.yml logs --tail 200 api
-docker compose -f docker-compose.prod.yml logs -f            # all three services
-docker compose -f docker-compose.prod.yml ps                 # up? health, restarts
+journalctl -t rovertools-api -f            # API, live
+journalctl -t rovertools-api -n 200 --no-pager
+journalctl -t rovertools-api --since '1h'  # bound the window (or --since 10m)
+journalctl -t rovertools-caddy             # TLS / proxy
+journalctl -t rovertools-redis
 ```
 
-The API logs to stdout, so `docker compose logs` is the whole story — no log file inside the
-container. Bound the window with `--since 10m` (or `--since '1h'`). During a rolling swap you
-will briefly see two `api` containers; `logs api` shows both, which is expected.
+Because it is the journal, not ephemeral container output, `--since`/`--until` reach back past
+the current container's lifetime. To hand someone a plain file, redirect any of the above:
+`journalctl -t rovertools-api --since today > api-$(date +%F).log`. Still-useful Docker views
+for state (not history): `docker compose -f docker-compose.prod.yml ps` (health, restarts) and
+`docker stats --no-stream` (per-container CPU/memory).
+
+The journal is capped, not infinite: persistent storage and a 500 MB / one-month ceiling are
+set in section 5.8, so old lines age out rather than filling the disk.
 
 **Schema changes.** Author the Alembic revision and review it, then apply it yourself
 (section 8) *before* the deploy that needs it — a green deploy is not evidence anything
