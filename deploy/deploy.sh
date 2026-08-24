@@ -50,16 +50,12 @@ export IMAGE="${IMAGE_REPO}:${SHA}"
 docker compose -f "$COMPOSE" build api
 docker tag "$IMAGE" "${IMAGE_REPO}:latest"
 
-if [[ -n "$RUNNING" ]] && docker rollout --help >/dev/null 2>&1; then
-	# Only taken if someone has vendored the docker-rollout plugin; we don't
-	# install it by default (see docs/DEPLOY.md section 9).
-	docker rollout -f "$COMPOSE" api          # start-first swap (new up + healthy, then old out)
-else
-	# The default path. Recreating the single `api` leaves a ~3s gap; Caddy holds
-	# and retries HTTP across it (lb_try_duration in the Caddyfile), so requests
-	# arrive a little late instead of 502ing. Open WebSockets drop once, reconnect.
-	docker compose -f "$COMPOSE" up -d
-fi
+# Recreate the stack (first deploy brings up caddy + redis too). Recreating the
+# single `api` leaves a ~3s gap; Caddy holds and retries HTTP across it
+# (lb_try_duration in the Caddyfile), so requests arrive a little late instead of
+# 502ing. Open WebSockets drop once and reconnect. We deliberately do not use an
+# overlap tool (docker-rollout/Swarm) — see docs/DEPLOY.md section 9.
+docker compose -f "$COMPOSE" up -d
 
 # Keep the last few tagged images for rollback; drop older ones. Best-effort.
 docker images "${IMAGE_REPO}" --format '{{.ID}} {{.Tag}}' \
