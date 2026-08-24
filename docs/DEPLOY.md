@@ -245,7 +245,7 @@ a break.
   pushed — **no inbound SSH at all**: the box reaches out to GitHub, nothing reaches in. Its
   only key is an **outbound, read-only** repo deploy key, `/home/deploy/.ssh/id_repo`, used
   for `git fetch`; the matching public key is a read-only Deploy key on the GitHub repo.
-  - `/opt/rovertools/app` (deploy-owned) is the git checkout; `.env` lives inside it,
+  - `/home/deploy/app` (deploy-owned) is the git checkout; `.env` lives inside it,
     git-ignored, mode 600 (a `git reset --hard` leaves ignored files alone).
   - **Historical:** an earlier design used an inbound, forced-command-locked CI key
     (`/home/deploy/.ssh/id_ci`) for a GitHub Actions push-deploy. That was dropped for the
@@ -728,13 +728,12 @@ sudo -u deploy ssh-keygen -t ed25519 -N '' -f /home/deploy/.ssh/id_repo -C 'rove
 sudo -u deploy cat /home/deploy/.ssh/id_repo.pub
 #   -> add that PUBLIC key in GitHub: repo -> Settings -> Deploy keys -> Add (read-only, NO write).
 
-# 2. Clone the repo to the deploy root:
-sudo install -d -o deploy -g deploy /opt/rovertools
-sudo -u deploy GIT_SSH_COMMAND='ssh -i /home/deploy/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' \
-  git clone git@github.com:Spectrewolf8/RoverTools-Smart-Clipboard-App-Backend.git /opt/rovertools/app
+# 2. Clone the repo into the deploy user's home (it owns ~, so no /opt or sudo mkdir):
+sudo -u deploy env GIT_SSH_COMMAND='ssh -i /home/deploy/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' \
+  git clone git@github.com:Spectrewolf8/RoverTools-Smart-Clipboard-App-Backend.git /home/deploy/app
 
 # 3. Secrets — .env lives INSIDE the checkout (git-ignored, so `git reset --hard` keeps it):
-sudo -u deploy install -m 600 /dev/null /opt/rovertools/app/.env    # then fill it (see Secrets below)
+sudo -u deploy install -m 600 /dev/null /home/deploy/app/.env    # then fill it (see Secrets below)
 
 # 4. Optional: the docker-rollout plugin for start-first swaps (without it, deploys still work
 #    with a few-second blip). It is a third-party single-file script the box will run, so pick
@@ -747,8 +746,8 @@ sudo -u deploy curl -fsSL \
 sudo -u deploy chmod +x /home/deploy/.docker/cli-plugins/docker-rollout
 
 # 5. Install the systemd timer:
-sudo cp /opt/rovertools/app/deploy/rovertools-deploy.service /etc/systemd/system/
-sudo cp /opt/rovertools/app/deploy/rovertools-deploy.timer   /etc/systemd/system/
+sudo cp /home/deploy/app/deploy/rovertools-deploy.service /etc/systemd/system/
+sudo cp /home/deploy/app/deploy/rovertools-deploy.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now rovertools-deploy.timer
 
@@ -763,7 +762,7 @@ is not used — drop `/home/deploy/.ssh/id_ci` and remove `deploy` from sshd's `
 
 ### Secrets
 
-Never in the image, never in git. They live in `/opt/rovertools/app/.env`, mode 600, read by
+Never in the image, never in git. They live in `/home/deploy/app/.env`, mode 600, read by
 compose `env_file`. The set the app expects (from `.env.example`):
 
 - `DATABASE_URL` — Supabase pooler URI (section 7a).
@@ -785,7 +784,7 @@ Every build is tagged `rovertools-api:<short-sha>` and the last few are kept on 
 rollback is redeploying an earlier one — same start-first swap, backwards:
 
 ```bash
-cd /opt/rovertools/app
+cd /home/deploy/app
 IMAGE=rovertools-api:<old-sha> docker rollout -f docker-compose.prod.yml api
 # or, if that image was already pruned, check out the commit and rebuild:
 #   git checkout <old-sha> && deploy/deploy.sh --force   (then `git checkout main` when done)
@@ -974,7 +973,7 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 
 **Open / to do:**
 
-- Wire the box (section 9): add the read-only Deploy key, clone to `/opt/rovertools/app`,
+- Wire the box (section 9): add the read-only Deploy key, clone to `/home/deploy/app`,
   fill `.env`, optionally install `docker-rollout`, install and enable the systemd timer.
 - Retire the old inbound CI key: delete `/home/deploy/.ssh/id_ci` and drop `deploy` from
   `AllowUsers`.

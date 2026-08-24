@@ -5,13 +5,13 @@
 # out. No GitHub Actions, no registry — the image never leaves the box.
 #
 # Layout on the box:
-#   /opt/rovertools/app          git checkout (this repo; read-only deploy key)
-#   /opt/rovertools/app/.env     secrets, git-ignored, mode 600 (survives git reset)
-# Run by:  systemd timer, or by hand:  /opt/rovertools/app/deploy/deploy.sh [--force]
+#   /home/deploy/app          git checkout (this repo; read-only deploy key)
+#   /home/deploy/app/.env     secrets, git-ignored, mode 600 (survives git reset)
+# Run by:  systemd timer, or by hand:  /home/deploy/app/deploy/deploy.sh [--force]
 #   --force rebuilds and redeploys even when origin/main has not moved.
 set -euo pipefail
 
-APP_DIR="/opt/rovertools/app"
+APP_DIR="/home/deploy/app"
 COMPOSE="docker-compose.prod.yml"
 IMAGE_REPO="rovertools-api"
 KEEP_IMAGES=5
