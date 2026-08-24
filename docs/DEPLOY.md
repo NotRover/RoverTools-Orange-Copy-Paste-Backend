@@ -474,6 +474,16 @@ sudo systemctl restart systemd-journald
 exists (persistent storage active). Without this, `Storage=auto` keeps logs in a volatile ring
 buffer that a reboot wipes — the opposite of "read them anytime."
 
+Container logs are written by the Docker daemon into the **system** journal, which an ordinary
+user cannot read. So `journalctl -t rovertools-api` shows `-- No entries --` for `ubuntu` until
+it can read the system journal — add it to the log groups (takes effect on next login):
+
+```bash
+sudo usermod -aG adm,systemd-journal ubuntu
+```
+
+Until you re-login, prefix reads with `sudo`. `sudo journalctl -t rovertools-api` always works.
+
 ---
 
 Redis is **not** installed on the host — it ships as a compose service (section 9). At this
@@ -647,10 +657,9 @@ moment builds accumulate. Render hid that by building on its own machines; the s
 equivalent that spends nothing on GitHub is to build on the VPS you already pay for. GitHub's
 only job is hosting the repo; the box pulls it read-only.
 
-**Status: files written (backend branch `deploy/vps-docker`), not yet deployed or run.** The
-box has Docker and the `ubuntu` login user (already in `docker`, section 4); what remains is
-the one-time wiring below. The repo files are the source of truth — this section explains them and the parts that
-live nowhere else.
+**Status: live on the box since 2026-08-24** (merged to `main`, deployed and verified —
+section 15). The wiring below is what was done once; the repo files are the source of truth,
+and this section explains them and the parts that live nowhere else.
 
 ### How a deploy flows
 
@@ -1024,16 +1033,13 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 
 **Open / to do:**
 
-- Wire the box (section 9): add the read-only Deploy key, clone to `~/app`, fill `.env`,
-  optionally install `docker-rollout`, install and enable the systemd timer.
+- **Client cutover release (section 11)** — the desktop app still ships the old Render URL as
+  its compiled default; a release repoints it at `https://rovertools-temp.ctx.cl`.
+- Install the optional `docker-rollout` plugin (section 9 step 4) for start-first swaps — until
+  then deploys use `docker compose up -d`, a few-second HTTP blip.
 - Retire the old push-deploy `deploy` user if the box still carries it: `sudo userdel -r
   deploy`, drop `deploy` from `AllowUsers`, `sudo rm -rf /opt/rovertools`.
-- Run the first deploy and work the verification drills (section 10).
-- Client cutover release (section 11).
-
-(The backend files — `Dockerfile`, `docker-compose.prod.yml`, `Caddyfile`, `.dockerignore`,
-`deploy/deploy.sh`, `deploy/rovertools-deploy.{service,timer}` — are written on the
-`deploy/vps-docker` branch.)
+- Move off the temp FreeDNS name to a permanent domain when ready (Caddyfile + `PUBLIC_BASE_URL`).
 
 ---
 
@@ -1066,6 +1072,13 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   healthcheck), `docker-compose.prod.yml` (local build), `Caddyfile`, `.dockerignore`,
   `deploy/deploy.sh`, `deploy/rovertools-deploy.{service,timer}`; removed `render.yaml`;
   repointed `public_base_url` and the README/ARCHITECTURE notes off Render. Not yet deployed.
+- **2026-08-24 — first live deploy.** Ran as `ubuntu` in `~/app`: read-only deploy key, clone,
+  `.env`, systemd poll timer, first `docker compose up`. Two fixes surfaced on the real box and
+  could not have on the Windows workstation: the `Caddyfile` needed the block form of
+  `dynamic a` (the inline `resolvers` failed to parse and crash-looped caddy), and container
+  logs moved to the persistent `journald` driver so they survive a rollout (section 5.8, 12).
+  `https://rovertools-temp.ctx.cl/internal/healthz` returns 200 with `db` and `redis` ok, valid
+  TLS, `via: 1.1 Caddy`. Backend is live; client cutover still pending (section 11).
 
 ---
 
