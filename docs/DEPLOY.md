@@ -759,6 +759,10 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   container's IP instead of caching the dead one. No retry directives — see "What zero
   downtime means here" for why they do not help with a single container.
 - **`deploy/deploy.sh`** — the poll+build+deploy script (run from the checkout by the timer).
+  After `up -d` it also **validates and reloads Caddy**, because `up -d` does not recreate a
+  container whose only change is its mounted config, and it **pings the Kuma Push monitor**
+  on success (and `status=down` from an exit trap on failure) so a broken pipeline alerts
+  instead of going quiet. Both exist because both failures already happened - section 15.
 - **`deploy/rovertools-deploy.{service,timer}`** — the systemd units that poll ~every 90s.
 
 **Why the Redis flags** (`--save "" --appendonly no --requirepass --maxmemory 256mb
@@ -823,6 +827,8 @@ Never in the image, never in git. They live in `~/app/.env` (`/home/ubuntu/app/.
 - `BREVO_API_KEY`, `EMAIL_FROM` (or the SMTP set).
 - `ADMIN_API_KEY`.
 - `APP_ENV=production`, `DOCS_ENABLED=false`.
+- `KUMA_PUSH_URL` — optional, read by `deploy/deploy.sh` only (never by the app). The deploy
+  heartbeat, section 12. Omit it and the ping is a no-op.
 - **`PUBLIC_BASE_URL=https://rovertools-temp.ctx.cl`** — the base of every user-facing link
   (invites, password-reset redirect). `APP_CORS_ORIGINS` already lists the Tauri client
   origins and does not change.
@@ -921,10 +927,37 @@ status-code monitor stays green through a database outage. Use a **keyword** mon
 |---|---|---|---|
 | API (public path) | HTTP(s) - Keyword | `https://rovertools-temp.ctx.cl/internal/healthz` | `"status":"ok"` |
 | API (direct) | HTTP(s) - Keyword | `http://api:8000/internal/healthz` | `"status":"ok"` |
+| Deploy pipeline | Push | (see below) | - |
 
-Both, because the pair localises a fault: public failing while direct passes means Caddy, TLS,
-or DNS; both failing means the app, Postgres, or Redis. The HTTPS monitor also tracks
-certificate expiry on its own.
+Both HTTP monitors, because the pair localises a fault: public failing while direct passes
+means Caddy, TLS, or DNS; both failing means the app, Postgres, or Redis. The HTTPS monitor
+also tracks certificate expiry on its own.
+
+**The deploy heartbeat (Push monitor).** The two checks above watch the *service*. They say
+nothing about the *pipeline*, and a pipeline that stops working is silent by nature: the
+timer runs, the script fails early, the running containers keep serving the old image, and
+everything looks fine until someone notices a merged commit never shipped. That has already
+happened here twice (section 15). `deploy/deploy.sh` closes it by pinging a Kuma **Push**
+monitor at the end of every successful run, including the quiet no-op poll where nothing had
+changed, and pinging `status=down` from an exit trap when the script fails. No ping inside the
+window means the deploy is broken or the timer stopped, and Kuma alerts either way.
+
+Set it up once:
+
+1. In Kuma: **Add New Monitor** -> type **Push** -> name `Deploy pipeline`. Set **Heartbeat
+   Interval** to `300` (the timer polls every ~90s, so 5 minutes tolerates a slow build and a
+   couple of missed pings) and **Retries** to `1`. Copy the push URL it shows.
+2. On the box, append it to `.env` (mode 600, git-ignored) and re-run the deploy:
+
+```bash
+cd ~/app
+echo 'KUMA_PUSH_URL=<paste the push URL>' >> .env
+./deploy/deploy.sh --force
+```
+
+The monitor should go green within a poll. `KUMA_PUSH_URL` is **optional** — leave it out and
+`kuma_ping` is a no-op, so the deploy works unchanged on a box without Kuma. It is also the
+one "secret" here that is not one: it grants nothing but the ability to ping a monitor.
 
 **Notifications: do not use email.** OVH filters outbound SMTP (the same reason the app sends
 through Brevo's HTTPS API, section 13), so Kuma's SMTP notifier will silently fail to deliver.
@@ -1192,6 +1225,18 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   moving the config to `caddy/Caddyfile` and mounting the **directory**, and by adding a
   `caddy reload` step to `deploy.sh` so config changes ship with the code as section 9 always
   claimed they did.
+- **2026-08-24 — closing the class, not the instance.** Three failures this month shared one
+  shape: something was broken and nothing said so. The `docker rollout` guard exited 0 without
+  the plugin; the Caddyfile went inert behind a single-file bind mount; and during the retry
+  experiment the config being measured was a stale one, which is why the measurement was
+  confusing before it was conclusive. Two structural changes rather than three patches. **(a)
+  No single-file bind mounts** — the only host path left in `docker-compose.prod.yml` is the
+  `./caddy` *directory*; every other mount is a named volume, so no container can pin an inode
+  that git will replace. **(b) The deploy reports on itself** — `deploy.sh` validates the Caddy
+  config before reloading it, and pings a Kuma Push monitor on success and `status=down` from
+  an exit trap on failure. Silence is now the alarm: no ping in five minutes means the script
+  broke or the timer stopped. The heartbeat is what would have caught the `docker rollout`
+  bug, which exited 125 and told nobody.
 
 ---
 
