@@ -4,18 +4,25 @@
 # poll of origin/main; on a new commit it rebuilds the image locally and rolls it
 # out. No GitHub Actions, no registry — the image never leaves the box.
 #
-# Layout on the box:
-#   /home/deploy/app          git checkout (this repo; read-only deploy key)
-#   /home/deploy/app/.env     secrets, git-ignored, mode 600 (survives git reset)
-# Run by:  systemd timer, or by hand:  /home/deploy/app/deploy/deploy.sh [--force]
+# Layout on the box (wherever you cloned the repo, e.g. ~/app):
+#   <checkout>/       git checkout (this repo; read-only deploy key ~/.ssh/id_repo)
+#   <checkout>/.env   secrets, git-ignored, mode 600 (survives git reset)
+# Run by:  systemd timer, or by hand:  ~/app/deploy/deploy.sh [--force]
 #   --force rebuilds and redeploys even when origin/main has not moved.
 set -euo pipefail
 
-APP_DIR="/home/deploy/app"
+# Resolve the checkout from this script's own location (deploy/ is one level down),
+# so it works whatever user or home the repo lives in.
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE="docker-compose.prod.yml"
 IMAGE_REPO="rovertools-api"
 KEEP_IMAGES=5
 FORCE="${1:-}"
+
+# Pull with the read-only deploy key by default (manual runs and the timer alike),
+# unless the caller already set GIT_SSH_COMMAND.
+: "${GIT_SSH_COMMAND:=ssh -i $HOME/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new}"
+export GIT_SSH_COMMAND
 
 # One deploy at a time — a build can outlast the poll interval.
 exec 9>/tmp/rovertools-deploy.lock

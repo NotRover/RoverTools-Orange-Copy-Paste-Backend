@@ -234,23 +234,22 @@ a break.
   connection; clients reconnect on their own. Narrow it to reboot-only-when-required if that
   blip ever matters.
 
-### Docker + the deploy user
+### Docker + who runs the deploy
 
 - **Docker** — Ubuntu's own packages (`docker.io 29.1.3`, `docker-compose-v2 2.40.3`), not
   Docker's apt repo. Chosen so security patches flow through the unattended-upgrades already
   set up, with no third-party repo/key to maintain. `ubuntu` is in the `docker` group.
   `docker-buildx` deliberately left out — the plain builder is enough for the on-box build.
-- **`deploy` user** — a **local service account** that owns the checkout and runs the deploy
-  timer (section 9). No sudo, in the `docker` group, and — because deploys are polled, not
-  pushed — **no inbound SSH at all**: the box reaches out to GitHub, nothing reaches in. Its
-  only key is an **outbound, read-only** repo deploy key, `/home/deploy/.ssh/id_repo`, used
-  for `git fetch`; the matching public key is a read-only Deploy key on the GitHub repo.
-  - `/home/deploy/app` (deploy-owned) is the git checkout; `.env` lives inside it,
-    git-ignored, mode 600 (a `git reset --hard` leaves ignored files alone).
-  - **Historical:** an earlier design used an inbound, forced-command-locked CI key
-    (`/home/deploy/.ssh/id_ci`) for a GitHub Actions push-deploy. That was dropped for the
-    poll model (no Actions minutes, no registry storage); delete that key and drop `deploy`
-    from `AllowUsers` so the account cannot be logged into.
+- **Runs as `ubuntu`** — the login user owns the checkout (`~/app`) and runs the deploy
+  timer. Because deploys are **polled**, nothing logs in to deploy, so a dedicated service
+  account buys little; the box reaches **out** to GitHub with an **outbound, read-only** repo
+  deploy key (`~/.ssh/id_repo`), and nothing reaches in. `.env` lives inside the checkout,
+  git-ignored, mode 600 (a `git reset --hard` leaves ignored files alone).
+  - **Historical:** earlier designs added a separate `deploy` user — first with an inbound,
+    forced-command-locked CI key (`id_ci`) for a GitHub Actions push-deploy, then as a no-SSH
+    service account. Both were dropped for the simpler "run as `ubuntu`, poll git" model. On a
+    box carrying that user, remove it: `sudo userdel -r deploy`, drop `deploy` from
+    `AllowUsers`, `sudo rm -rf /opt/rovertools`.
 
 ---
 
@@ -422,28 +421,24 @@ docker.sock` — the new group is not active in the shell that added it. `newgrp
 logging out and back in) fixes it. Note `docker` group membership is root-equivalent
 (section 4).
 
-### 5.6 Deploy service account
+### 5.6 Read-only deploy key
 
-A local account that owns the checkout and runs the deploy timer. No sudo, in `docker`, and
-**no inbound SSH** — it only reaches out to GitHub with a read-only deploy key.
+The deploy runs as `ubuntu` (section 4), so the outbound key that `git fetch` uses lives in
+`ubuntu`'s home. It is **read-only** — the box only ever pulls — and never leaves the box.
 
 ```bash
-sudo useradd -m -s /bin/bash deploy
-sudo usermod -aG docker deploy
-# outbound, read-only key for `git fetch`:
-sudo -u deploy ssh-keygen -t ed25519 -N '' -f /home/deploy/.ssh/id_repo -C 'rovertools-box-readonly'
-sudo -u deploy cat /home/deploy/.ssh/id_repo.pub
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_repo -C 'rovertools-box-readonly'
+cat ~/.ssh/id_repo.pub
 #   -> add that PUBLIC key as a READ-ONLY Deploy key on the GitHub repo.
 ```
 
 The rest of the wiring — cloning the repo, `.env`, the optional `docker-rollout` plugin, and
-the systemd timer — is in section 9, since it depends on the repo files. Note there is **no**
-inbound key and no `AllowUsers` change: `deploy` is not meant to be logged into.
+the systemd timer — is in section 9, since it depends on the repo files.
 
-**Historical:** an earlier design gave `deploy` an inbound, forced-command-locked CI key
-(`id_ci`) for a GitHub Actions push-deploy. The poll model dropped it (section 9); on a box
-provisioned under the old design, delete `/home/deploy/.ssh/id_ci` and remove `deploy` from
-`AllowUsers`.
+**Historical:** an earlier design added a separate `deploy` user with an inbound,
+forced-command-locked CI key (`id_ci`) for a GitHub Actions push-deploy. The poll model
+dropped it. On a box provisioned under the old design, remove the whole account:
+`sudo userdel -r deploy`, drop `deploy` from `AllowUsers`, `sudo rm -rf /opt/rovertools`.
 
 ### 5.7 Domain (FreeDNS)
 
@@ -632,8 +627,8 @@ equivalent that spends nothing on GitHub is to build on the VPS you already pay 
 only job is hosting the repo; the box pulls it read-only.
 
 **Status: files written (backend branch `deploy/vps-docker`), not yet deployed or run.** The
-box has Docker and the `deploy` account (section 4); what remains is the one-time wiring
-below. The repo files are the source of truth — this section explains them and the parts that
+box has Docker and the `ubuntu` login user (already in `docker`, section 4); what remains is
+the one-time wiring below. The repo files are the source of truth — this section explains them and the parts that
 live nowhere else.
 
 ### How a deploy flows
@@ -719,35 +714,36 @@ eviction is safe *only because* the backend re-`SET`s presence keys on every hea
 
 ### One-time box wiring (still to do)
 
-Nothing below has been run yet. The `deploy` account owns everything; it needs **no inbound
-SSH** and **no sudo** — a local service account that reaches out to GitHub.
+Runs as the login user (`ubuntu`), which is already in the `docker` group, in `~/app`. No
+separate service account: polling means nothing logs in to deploy, so a dedicated user buys
+little here and adds friction. The box reaches **out** to GitHub with a read-only deploy key;
+nothing reaches in.
 
 ```bash
 # 1. A read-only deploy key so the box can pull the private repo (outbound):
-sudo -u deploy ssh-keygen -t ed25519 -N '' -f /home/deploy/.ssh/id_repo -C 'rovertools-box-readonly'
-sudo -u deploy cat /home/deploy/.ssh/id_repo.pub
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_repo -C 'rovertools-box-readonly'
+cat ~/.ssh/id_repo.pub
 #   -> add that PUBLIC key in GitHub: repo -> Settings -> Deploy keys -> Add (read-only, NO write).
 
-# 2. Clone the repo into the deploy user's home (it owns ~, so no /opt or sudo mkdir):
-sudo -u deploy env GIT_SSH_COMMAND='ssh -i /home/deploy/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' \
-  git clone git@github.com:Spectrewolf8/RoverTools-Smart-Clipboard-App-Backend.git /home/deploy/app
+# 2. Clone the repo into ~/app with that key:
+GIT_SSH_COMMAND='ssh -i ~/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' \
+  git clone git@github.com:Spectrewolf8/RoverTools-Smart-Clipboard-App-Backend.git ~/app
 
 # 3. Secrets — .env lives INSIDE the checkout (git-ignored, so `git reset --hard` keeps it):
-sudo -u deploy install -m 600 /dev/null /home/deploy/app/.env    # then fill it (see Secrets below)
+install -m 600 /dev/null ~/app/.env    # then fill it (see Secrets below)
 
 # 4. Optional: the docker-rollout plugin for start-first swaps (without it, deploys still work
 #    with a few-second blip). It is a third-party single-file script the box will run, so pick
 #    a specific released tag from github.com/Wowu/docker-rollout/releases and read it first:
-sudo -u deploy mkdir -p /home/deploy/.docker/cli-plugins
+mkdir -p ~/.docker/cli-plugins
 ROLLOUT_TAG=<a reviewed release tag, e.g. v0.9.0>
-sudo -u deploy curl -fsSL \
-  "https://raw.githubusercontent.com/Wowu/docker-rollout/${ROLLOUT_TAG}/docker-rollout" \
-  -o /home/deploy/.docker/cli-plugins/docker-rollout
-sudo -u deploy chmod +x /home/deploy/.docker/cli-plugins/docker-rollout
+curl -fsSL "https://raw.githubusercontent.com/Wowu/docker-rollout/${ROLLOUT_TAG}/docker-rollout" \
+  -o ~/.docker/cli-plugins/docker-rollout
+chmod +x ~/.docker/cli-plugins/docker-rollout
 
 # 5. Install the systemd timer:
-sudo cp /home/deploy/app/deploy/rovertools-deploy.service /etc/systemd/system/
-sudo cp /home/deploy/app/deploy/rovertools-deploy.timer   /etc/systemd/system/
+sudo cp ~/app/deploy/rovertools-deploy.service /etc/systemd/system/
+sudo cp ~/app/deploy/rovertools-deploy.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now rovertools-deploy.timer
 
@@ -756,14 +752,15 @@ sudo systemctl start rovertools-deploy.service
 journalctl -u rovertools-deploy.service -f     # watch it build and come up
 ```
 
-Then verify (section 10). Because polling replaces inbound CI, the old forced-command CI key
-is not used — drop `/home/deploy/.ssh/id_ci` and remove `deploy` from sshd's `AllowUsers`
-(section 4) so `deploy` cannot be logged into at all.
+The systemd unit hardcodes `User=ubuntu` and `/home/ubuntu/app`; edit both if you clone
+elsewhere. If the box still carries the retired push-deploy `deploy` user, remove it now:
+`sudo userdel -r deploy`, drop `deploy` from sshd's `AllowUsers` (section 4), and
+`sudo rm -rf /opt/rovertools`.
 
 ### Secrets
 
-Never in the image, never in git. They live in `/home/deploy/app/.env`, mode 600, read by
-compose `env_file`. The set the app expects (from `.env.example`):
+Never in the image, never in git. They live in `~/app/.env` (`/home/ubuntu/app/.env`), mode
+600, read by compose `env_file`. The set the app expects (from `.env.example`):
 
 - `DATABASE_URL` — Supabase pooler URI (section 7a).
 - `REDIS_URL` = `redis://:<password>@redis:6379/0`; `REDIS_PASSWORD` also set for the redis
@@ -784,7 +781,7 @@ Every build is tagged `rovertools-api:<short-sha>` and the last few are kept on 
 rollback is redeploying an earlier one — same start-first swap, backwards:
 
 ```bash
-cd /home/deploy/app
+cd ~/app
 IMAGE=rovertools-api:<old-sha> docker rollout -f docker-compose.prod.yml api
 # or, if that image was already pruned, check out the commit and rebuild:
 #   git checkout <old-sha> && deploy/deploy.sh --force   (then `git checkout main` when done)
@@ -965,18 +962,19 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   the VPS doing the build. Rejected alternatives: GitHub Actions + GHCR push (the cost we are
   avoiding); a self-hosted Actions runner (unlimited minutes but still a runner daemon + the
   Actions dependency); a webhook receiver (instant, but an inbound endpoint + HMAC to secure).
-- **Deploy identity** — `deploy` as a **local service account** with an outbound read-only
-  git key, over an inbound forced-command CI key. Polling removed the need for any inbound
-  path, which is strictly less surface.
+- **Deploy identity** — runs as the `ubuntu` login user (already in `docker`) with an outbound
+  read-only git key, over both an inbound forced-command CI key and a separate no-SSH service
+  account. Polling removed any inbound path, so a dedicated user bought little; this is strictly
+  less surface and less friction.
 - **Redis** — a compose service, not a host package, so it is versioned and torn
   down/rebuilt with the stack.
 
 **Open / to do:**
 
-- Wire the box (section 9): add the read-only Deploy key, clone to `/home/deploy/app`,
-  fill `.env`, optionally install `docker-rollout`, install and enable the systemd timer.
-- Retire the old inbound CI key: delete `/home/deploy/.ssh/id_ci` and drop `deploy` from
-  `AllowUsers`.
+- Wire the box (section 9): add the read-only Deploy key, clone to `~/app`, fill `.env`,
+  optionally install `docker-rollout`, install and enable the systemd timer.
+- Retire the old push-deploy `deploy` user if the box still carries it: `sudo userdel -r
+  deploy`, drop `deploy` from `AllowUsers`, `sudo rm -rf /opt/rovertools`.
 - Run the first deploy and work the verification drills (section 10).
 - Client cutover release (section 11).
 
@@ -1001,9 +999,10 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   password with `passwd` looked like it broke SSH; it had not. The workstation prompt wants
   the *key passphrase*. Both are documented in section 2. KVM console login with the `ubuntu`
   password confirmed working.
-- **2026-08-24 — Docker + deploy user + domain.** Installed Docker (Ubuntu packages),
-  created the `deploy` user, and pointed `rovertools-temp.ctx.cl` (FreeDNS) at the box. No
-  application containers running yet.
+- **2026-08-24 — Docker + domain.** Installed Docker (Ubuntu packages) and pointed
+  `rovertools-temp.ctx.cl` (FreeDNS) at the box. A `deploy` service account was created here
+  under the push-deploy design, then dropped when the deploy moved to run as `ubuntu`; remove
+  it if the box still has it. No application containers running yet.
 - **2026-08-24 — docs consolidated.** The Render/Supabase/R2 runbook and the two parent-repo
   VPS docs (`VPS-RUNBOOK.md`, `DEPLOY-VPS.md`) folded into this single file; the Render path
   was retired.
