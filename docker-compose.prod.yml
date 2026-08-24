@@ -42,6 +42,20 @@ services:
       options:
         tag: rovertools-api
 
+  # Uptime Kuma — self-hosted status dashboard (docs/DEPLOY.md section 12).
+  # No host port: Caddy publishes it on the status subdomain. The Docker socket is
+  # deliberately NOT mounted — container monitors would need root-equivalent access,
+  # the same objection that ruled out docker-rollout; HTTP checks cover the stack.
+  kuma:
+    image: louislam/uptime-kuma:1
+    restart: unless-stopped
+    volumes:
+      - kuma_data:/app/data
+    logging:
+      driver: journald
+      options:
+        tag: rovertools-kuma
+
   redis:
     image: redis:8-alpine
     restart: unless-stopped
@@ -66,3 +80,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  kuma_data:      # monitor definitions + history (SQLite); back this up, not the image
