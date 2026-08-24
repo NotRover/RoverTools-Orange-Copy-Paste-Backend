@@ -1,7 +1,8 @@
 # Orange Clipboard — Backend Deployment
 
 **Owns:** the self-hosted OVH VPS that runs the sync backend and Redis — how to reach it,
-recover it, harden it, and deploy the API onto it (Docker Compose + Caddy + CI/CD). Also
+recover it, harden it, and deploy the API onto it (Docker Compose + Caddy, deployed by a
+git poll on the box). Also
 the external services the backend depends on (Supabase, R2) and the migration discipline.
 **Not here:** the wire contract — routes, payloads, DDL, socket events, crypto envelope —
 which is [ARCHITECTURE.md](ARCHITECTURE.md); client internals (the app's own
@@ -30,7 +31,7 @@ forever; if that ever happens, rotate it, do not edit it out.
 6. [What you are deploying](#6-what-you-are-deploying)
 7. [External services — Supabase and R2](#7-external-services--supabase-and-r2)
 8. [Database migrations](#8-database-migrations)
-9. [Deployment — Docker Compose + Caddy + CI/CD](#9-deployment--docker-compose--caddy--cicd)
+9. [Deployment — build-on-box, polled from git](#9-deployment--build-on-box-polled-from-git)
 10. [Verify the deployment](#10-verify-the-deployment)
 11. [Point the desktop app at it](#11-point-the-desktop-app-at-it)
 12. [Ongoing operations](#12-ongoing-operations)
@@ -56,7 +57,7 @@ forever; if that ever happens, rotate it, do not edit it out.
 | Timezone | UTC |
 | Admin user | `ubuntu` (passwordless `sudo`) |
 | `root` | locked — no root login by any path, including the console |
-| Deploy user | `deploy` (no sudo, in `docker` group, key locked to one command) |
+| Deploy runs as | `ubuntu` in `~/app`, pulling with a read-only deploy key (section 4) |
 
 ---
 
@@ -680,8 +681,10 @@ push to main ─▶ GitHub (repo only)
   (plus `:latest`). It never leaves the box — no registry, no push, no Actions.
 - Deploys land within a couple of minutes of a push. No inbound endpoint, no webhook secret,
   no CI credentials on the box — the attack surface stays exactly "outbound git + Docker".
-- Config travels with the code: `docker-compose.prod.yml`, `Caddyfile`, and `deploy.sh` all
-  live in the checkout, so a change to any of them ships on the next poll like app code does.
+- Config travels with the code: `docker-compose.prod.yml`, `caddy/Caddyfile`, and `deploy.sh`
+  all live in the checkout, so a change to any of them ships on the next poll like app code
+  does. For the Caddyfile that takes a deliberate reload step in `deploy.sh` - see the trap
+  below.
 
 ### What "zero downtime" means here
 
@@ -751,11 +754,15 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   build context.
 - **`docker-compose.prod.yml`** — `caddy` (published 80/443), `api` (`build: .`, tagged
   `${IMAGE}`, no host port), `redis` (no host port). The dev `docker-compose.yml` is untouched.
-- **`Caddyfile`** — `rovertools-temp.ctx.cl`, auto TLS. The `dynamic a` upstream (via Docker
+- **`caddy/Caddyfile`** — `rovertools-temp.ctx.cl` and the status site, auto TLS. The `dynamic a` upstream (via Docker
   DNS `127.0.0.11`) re-resolves `api` per request, so after a recreate Caddy finds the new
   container's IP instead of caching the dead one. No retry directives — see "What zero
   downtime means here" for why they do not help with a single container.
 - **`deploy/deploy.sh`** — the poll+build+deploy script (run from the checkout by the timer).
+  After `up -d` it also **validates and reloads Caddy**, because `up -d` does not recreate a
+  container whose only change is its mounted config, and it **pings the Kuma Push monitor**
+  on success (and `status=down` from an exit trap on failure) so a broken pipeline alerts
+  instead of going quiet. Both exist because both failures already happened - section 15.
 - **`deploy/rovertools-deploy.{service,timer}`** — the systemd units that poll ~every 90s.
 
 **Why the Redis flags** (`--save "" --appendonly no --requirepass --maxmemory 256mb
@@ -820,6 +827,8 @@ Never in the image, never in git. They live in `~/app/.env` (`/home/ubuntu/app/.
 - `BREVO_API_KEY`, `EMAIL_FROM` (or the SMTP set).
 - `ADMIN_API_KEY`.
 - `APP_ENV=production`, `DOCS_ENABLED=false`.
+- `KUMA_PUSH_URL` — optional, read by `deploy/deploy.sh` only (never by the app). The deploy
+  heartbeat, section 12. Omit it and the ping is a no-op.
 - **`PUBLIC_BASE_URL=https://rovertools-temp.ctx.cl`** — the base of every user-facing link
   (invites, password-reset redirect). `APP_CORS_ORIGINS` already lists the Tauri client
   origins and does not change.
@@ -918,10 +927,37 @@ status-code monitor stays green through a database outage. Use a **keyword** mon
 |---|---|---|---|
 | API (public path) | HTTP(s) - Keyword | `https://rovertools-temp.ctx.cl/internal/healthz` | `"status":"ok"` |
 | API (direct) | HTTP(s) - Keyword | `http://api:8000/internal/healthz` | `"status":"ok"` |
+| Deploy pipeline | Push | (see below) | - |
 
-Both, because the pair localises a fault: public failing while direct passes means Caddy, TLS,
-or DNS; both failing means the app, Postgres, or Redis. The HTTPS monitor also tracks
-certificate expiry on its own.
+Both HTTP monitors, because the pair localises a fault: public failing while direct passes
+means Caddy, TLS, or DNS; both failing means the app, Postgres, or Redis. The HTTPS monitor
+also tracks certificate expiry on its own.
+
+**The deploy heartbeat (Push monitor).** The two checks above watch the *service*. They say
+nothing about the *pipeline*, and a pipeline that stops working is silent by nature: the
+timer runs, the script fails early, the running containers keep serving the old image, and
+everything looks fine until someone notices a merged commit never shipped. That has already
+happened here twice (section 15). `deploy/deploy.sh` closes it by pinging a Kuma **Push**
+monitor at the end of every successful run, including the quiet no-op poll where nothing had
+changed, and pinging `status=down` from an exit trap when the script fails. No ping inside the
+window means the deploy is broken or the timer stopped, and Kuma alerts either way.
+
+Set it up once:
+
+1. In Kuma: **Add New Monitor** -> type **Push** -> name `Deploy pipeline`. Set **Heartbeat
+   Interval** to `300` (the timer polls every ~90s, so 5 minutes tolerates a slow build and a
+   couple of missed pings) and **Retries** to `1`. Copy the push URL it shows.
+2. On the box, append it to `.env` (mode 600, git-ignored) and re-run the deploy:
+
+```bash
+cd ~/app
+echo 'KUMA_PUSH_URL=<paste the push URL>' >> .env
+./deploy/deploy.sh --force
+```
+
+The monitor should go green within a poll. `KUMA_PUSH_URL` is **optional** — leave it out and
+`kuma_ping` is a no-op, so the deploy works unchanged on a box without Kuma. It is also the
+one "secret" here that is not one: it grants nothing but the ability to ping a monitor.
 
 **Notifications: do not use email.** OVH filters outbound SMTP (the same reason the app sends
 through Brevo's HTTPS API, section 13), so Kuma's SMTP notifier will silently fail to deliver.
@@ -1065,6 +1101,16 @@ hour, so configuring custom SMTP is what makes signup and reset mail dependable.
 `AWS_REGION=auto`, and the endpoint is the account-level R2 URL. Presigned PUTs expire in 5
 minutes and GETs in 1 hour, so a badly skewed client clock also breaks uploads.
 
+**A Caddyfile change does not take effect, and `caddy reload` says "config is unchanged".**
+The container is reading a stale copy. A *single-file* bind mount binds the inode, and `git
+pull` replaces the file rather than editing it in place, so the container keeps the inode it
+started with - `validate` and `reload` inside the container then both operate on the old
+file. Fixed by mounting the `caddy/` **directory** instead (`./caddy:/etc/caddy:ro`), which
+resolves the path fresh, plus a reload step in `deploy.sh`. If you meet this on a container
+predating that fix, `docker compose -f docker-compose.prod.yml up -d --force-recreate caddy`.
+Symptom to recognise: the file on disk clearly has your change, `caddy validate` passes, and
+the reload logs `"config is unchanged"`.
+
 **Two builds of one commit differ.** Fixed once the `Dockerfile` builds `--frozen` from
 `uv.lock` (section 9). Until then, the image installs with `uv pip install -e .` resolved
 from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
@@ -1170,6 +1216,27 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   through a Postgres outage. Email notifiers are unusable (OVH filters SMTP) — use an HTTPS
   notifier. Kuma cannot report a whole-box outage since it shares the box; pair it with a free
   external check (section 12).
+- **2026-08-24 — the Caddyfile was never actually shipping.** Adding Kuma surfaced it: the new
+  site block was on disk and on the right commit, yet `caddy validate` passed and `caddy
+  reload` logged `"config is unchanged"`. `docker-compose.prod.yml` bind-mounted the *single
+  file* `./Caddyfile`, which binds an inode; `git pull` replaces the file, so the running
+  container kept reading the copy it started with, and every Caddyfile change since the last
+  container recreate had been silently inert (applying only at the next reboot). Fixed by
+  moving the config to `caddy/Caddyfile` and mounting the **directory**, and by adding a
+  `caddy reload` step to `deploy.sh` so config changes ship with the code as section 9 always
+  claimed they did.
+- **2026-08-24 — closing the class, not the instance.** Three failures this month shared one
+  shape: something was broken and nothing said so. The `docker rollout` guard exited 0 without
+  the plugin; the Caddyfile went inert behind a single-file bind mount; and during the retry
+  experiment the config being measured was a stale one, which is why the measurement was
+  confusing before it was conclusive. Two structural changes rather than three patches. **(a)
+  No single-file bind mounts** — the only host path left in `docker-compose.prod.yml` is the
+  `./caddy` *directory*; every other mount is a named volume, so no container can pin an inode
+  that git will replace. **(b) The deploy reports on itself** — `deploy.sh` validates the Caddy
+  config before reloading it, and pings a Kuma Push monitor on success and `status=down` from
+  an exit trap on failure. Silence is now the alarm: no ping in five minutes means the script
+  broke or the timer stopped. The heartbeat is what would have caught the `docker rollout`
+  bug, which exited 125 and told nobody.
 
 ---
 
