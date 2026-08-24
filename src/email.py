@@ -127,15 +127,15 @@ def _send_smtp(to_address: str, subject: str, html_body: str, text_body: str) ->
                 server.login(settings.smtp_user, settings.smtp_password)
             server.sendmail(settings.email_from, to_address, msg.as_string())
     except (TimeoutError, OSError) as exc:
-        # Reached the network and got nothing back. On Render this is almost
-        # always the platform, not the credentials: free web services are
-        # blocked from ports 25, 465 and 587, and port 25 is blocked on every
-        # plan. Say so, because the raw error is a bare timeout that reads like
-        # a wrong host.
+        # Reached the network and got nothing back. This is almost always the
+        # host blocking outbound SMTP, not the credentials: many providers block
+        # port 25 outright, and OVH (our VPS host) filters the submission ports
+        # too. Say so, because the raw error is a bare timeout that reads like a
+        # wrong host.
         raise RuntimeError(
             f"SMTP connection to {settings.smtp_host}:{settings.smtp_port} failed "
             f"({type(exc).__name__}: {exc}). If this host blocks outbound SMTP "
-            f"(Render free instances block 25, 465 and 587), set EMAIL_PROVIDER=brevo "
+            f"(OVH filters 25 and the submission ports), set EMAIL_PROVIDER=brevo "
             f"and send over HTTPS instead."
         ) from exc
     logger.info("SMTP: delivered to %s (subject=%r)", to_address, subject)
