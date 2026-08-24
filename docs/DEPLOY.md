@@ -673,7 +673,7 @@ push to main ─▶ GitHub (repo only)
    systemd timer ─▶ deploy.sh:  origin/main moved?
                                    ├─ no  → exit (quiet no-op, the common case)
                                    └─ yes → git reset --hard → docker compose build api
-                                            → docker rollout api  (start-first swap)
+                                            → docker compose up -d  (recreate api)
 ```
 
 - The image is **built on the box** from the checkout and tagged `rovertools-api:<short-sha>`
@@ -685,19 +685,27 @@ push to main ─▶ GitHub (repo only)
 
 ### What "zero downtime" means here
 
-On a single host it means **start-first**: the new container comes up and passes its
-`HEALTHCHECK` *before* the old one is removed (`docker rollout`). That splits in two:
+There is one `api` container, and a deploy recreates it — so there is a ~3s gap with no
+backend. We do **not** run an overlap tool (docker-rollout/Swarm); instead Caddy absorbs the
+gap, which splits the story in two:
 
-- **HTTP** — effectively uninterrupted; Caddy holds and retries across the swap.
-- **WebSockets** — the old container's sockets drop once, when it is removed, and clients
-  reconnect. That single reconnect per deploy is the accepted cost; the bar was "not offline
-  for long", not literally zero. The presence heartbeat (`PING_INTERVAL = 25s`,
-  `src/realtime.py`) keeps a socket under any 100s idle timeout and re-`SET`s presence on
-  reconnect.
+- **HTTP** — no errors. Caddy is set to hold a request and retry the upstream for up to 10s,
+  every 250ms (`lb_try_duration` / `lb_try_interval` in the `Caddyfile`), re-resolving `api`
+  through Docker DNS each interval. A request that lands mid-swap arrives a couple seconds
+  late instead of 502ing; retrying a dial that never connected is safe for any method. This is
+  "no failed requests", not literally zero-latency — the accepted trade for keeping the stack
+  a plain `docker compose up -d` with nothing third-party running as root.
+- **WebSockets** — the old container's open sockets drop once, when it is removed, and clients
+  reconnect (a new handshake mid-gap is retried like any HTTP request). The presence heartbeat
+  (`PING_INTERVAL = 25s`, `src/realtime.py`) keeps a socket under any 100s idle timeout and
+  re-`SET`s presence on reconnect.
 
-If the `docker-rollout` plugin is not installed, `deploy.sh` falls back to `docker compose
-up -d` — a few-second HTTP blip instead of a clean swap. The plugin is an enhancement, not a
-dependency.
+**Why not docker-rollout / Swarm.** True zero-gap needs two `api` containers overlapping.
+`docker-rollout` is a third-party single-file script run with Docker (root) access — declined
+on trust grounds; Swarm is a cluster orchestrator whose weight is hard to justify on one host.
+For a single VPS with infrequent deploys, the Caddy retry covers the case that matters (no
+failed HTTP) at zero added surface. `deploy.sh` still *uses* `docker rollout` if someone
+vendors the plugin later, but nothing installs it.
 
 ### Architecture
 
@@ -728,10 +736,12 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   build context.
 - **`docker-compose.prod.yml`** — `caddy` (published 80/443), `api` (`build: .`, tagged
   `${IMAGE}`, no host port), `redis` (no host port). The dev `docker-compose.yml` is untouched.
-- **`Caddyfile`** — `rovertools-temp.ctx.cl`, auto TLS. The `dynamic a api 8000` upstream
-  (via Docker DNS `127.0.0.11`) is what makes rolling work: without it Caddy resolves `api`
-  once at startup and never sees the second replica.
-- **`deploy/deploy.sh`** — the poll+build+rollout script (run from the checkout by the timer).
+- **`Caddyfile`** — `rovertools-temp.ctx.cl`, auto TLS. The `dynamic a` upstream (via Docker
+  DNS `127.0.0.11`) re-resolves `api` on each request so it always finds the current
+  container. `lb_try_duration 10s` / `lb_try_interval 250ms` make Caddy hold and retry across
+  the deploy recreate gap instead of 502ing — the reason no overlap tool is needed for HTTP
+  ("What zero downtime means here").
+- **`deploy/deploy.sh`** — the poll+build+deploy script (run from the checkout by the timer).
 - **`deploy/rovertools-deploy.{service,timer}`** — the systemd units that poll ~every 90s.
 
 **Why the Redis flags** (`--save "" --appendonly no --requirepass --maxmemory 256mb
@@ -762,14 +772,10 @@ GIT_SSH_COMMAND='ssh -i ~/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChe
 # 3. Secrets — .env lives INSIDE the checkout (git-ignored, so `git reset --hard` keeps it):
 install -m 600 /dev/null ~/app/.env    # then fill it (see Secrets below)
 
-# 4. Optional: the docker-rollout plugin for start-first swaps (without it, deploys still work
-#    with a few-second blip). It is a third-party single-file script the box will run, so pick
-#    a specific released tag from github.com/Wowu/docker-rollout/releases and read it first:
-mkdir -p ~/.docker/cli-plugins
-ROLLOUT_TAG=<a reviewed release tag, e.g. v0.9.0>
-curl -fsSL "https://raw.githubusercontent.com/Wowu/docker-rollout/${ROLLOUT_TAG}/docker-rollout" \
-  -o ~/.docker/cli-plugins/docker-rollout
-chmod +x ~/.docker/cli-plugins/docker-rollout
+# 4. (No docker-rollout.) We deliberately do NOT install it — Caddy's retry absorbs the
+#    recreate gap instead ("What zero downtime means here"). If you ever want true container
+#    overlap, vendor a reviewed tag from github.com/Wowu/docker-rollout/releases into
+#    ~/.docker/cli-plugins/docker-rollout (chmod +x); deploy.sh will use it automatically.
 
 # 5. Install the systemd timer:
 sudo cp ~/app/deploy/rovertools-deploy.service /etc/systemd/system/
@@ -808,11 +814,11 @@ Never in the image, never in git. They live in `~/app/.env` (`/home/ubuntu/app/.
 ### Rollback
 
 Every build is tagged `rovertools-api:<short-sha>` and the last few are kept on the box, so a
-rollback is redeploying an earlier one — same start-first swap, backwards:
+rollback is redeploying an earlier one — same recreate, backwards (Caddy smooths it as usual):
 
 ```bash
 cd ~/app
-IMAGE=rovertools-api:<old-sha> docker rollout -f docker-compose.prod.yml api
+IMAGE=rovertools-api:<old-sha> docker compose -f docker-compose.prod.yml up -d api
 # or, if that image was already pruned, check out the commit and rebuild:
 #   git checkout <old-sha> && deploy/deploy.sh --force   (then `git checkout main` when done)
 ```
@@ -1014,8 +1020,13 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   changing one Caddyfile hostname + `PUBLIC_BASE_URL`), and a Cloudflare Tunnel (zero
   inbound ports but another hop in the WebSocket path and a daemon to keep up). Temp name
   first to bring the pipeline up for free.
-- **Deploy stack** — Docker Compose + Caddy + `docker-rollout`, over systemd + host-Caddy.
-  The draw is tagged images and one-step rollback.
+- **Deploy stack** — Docker Compose + Caddy, on a systemd poll. The draw is tagged images and
+  one-step rollback.
+- **Deploy rollover** — plain `docker compose up -d` recreate, with **Caddy retrying across
+  the ~3s gap** (`lb_try_duration`), over an overlap tool. `docker-rollout` was declined on
+  trust (a third-party script with Docker/root access); Docker Swarm was declined as
+  cluster-weight on one host. The trade: a few requests take a couple seconds longer during a
+  deploy, versus zero failed requests. See "What zero downtime means here".
 - **Build + delivery** — **build on the box, polled from git**, over GitHub Actions +
   GHCR. A private repo's Actions minutes and (worse) its 500 MB Packages storage both cost
   money as builds pile up; building on the VPS we already pay for spends nothing on GitHub,
@@ -1036,8 +1047,6 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 - **Client cutover release (section 11)** — `DEFAULT_SERVER_URL` is repointed at
   `https://rovertools-temp.ctx.cl` in source, but it reaches users only in a client release,
   which has not shipped yet.
-- Install the optional `docker-rollout` plugin (section 9 step 4) for start-first swaps — until
-  then deploys use `docker compose up -d`, a few-second HTTP blip.
 - Retire the old push-deploy `deploy` user if the box still carries it: `sudo userdel -r
   deploy`, drop `deploy` from `AllowUsers`, `sudo rm -rf /opt/rovertools`.
 - Move off the temp FreeDNS name to a permanent domain when ready (Caddyfile + `PUBLIC_BASE_URL`).
@@ -1080,6 +1089,13 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   logs moved to the persistent `journald` driver so they survive a rollout (section 5.8, 12).
   `https://rovertools-temp.ctx.cl/internal/healthz` returns 200 with `db` and `redis` ok, valid
   TLS, `via: 1.1 Caddy`. Backend is live; client cutover still pending (section 11).
+- **2026-08-24 — deploy rollover settled on Caddy retry, not docker-rollout.** Weighed
+  docker-rollout (declined: third-party script with Docker/root access) and Docker Swarm
+  (declined: cluster-weight on one host). Chose plain `docker compose up -d` with Caddy holding
+  and retrying HTTP across the ~3s recreate gap (`lb_try_duration`), confirmed against Caddy's
+  docs that dynamic upstreams are re-queried every retry iteration and dial failures are always
+  retried. Trade: a few requests run a couple seconds late per deploy, no failed requests.
+  Verify on the box with `watch -n1 curl ... /internal/healthz` during `deploy.sh --force`.
 
 ---
 

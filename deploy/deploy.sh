@@ -51,10 +51,13 @@ docker compose -f "$COMPOSE" build api
 docker tag "$IMAGE" "${IMAGE_REPO}:latest"
 
 if [[ -n "$RUNNING" ]] && docker rollout --help >/dev/null 2>&1; then
+	# Only taken if someone has vendored the docker-rollout plugin; we don't
+	# install it by default (see docs/DEPLOY.md section 9).
 	docker rollout -f "$COMPOSE" api          # start-first swap (new up + healthy, then old out)
 else
-	# First deploy (brings up caddy + redis too), or the rollout plugin is absent
-	# (plain recreate is a few-second HTTP blip; WebSockets reconnect regardless).
+	# The default path. Recreating the single `api` leaves a ~3s gap; Caddy holds
+	# and retries HTTP across it (lb_try_duration in the Caddyfile), so requests
+	# arrive a little late instead of 502ing. Open WebSockets drop once, reconnect.
 	docker compose -f "$COMPOSE" up -d
 fi
 
