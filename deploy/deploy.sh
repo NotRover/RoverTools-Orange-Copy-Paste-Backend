@@ -36,7 +36,11 @@ cd "$APP_DIR"
 # stopped running pings nothing, so Kuma alerts. A deploy that breaks silently and is
 # only noticed by hand is the failure mode this exists to catch.
 # tr strips surrounding quotes and a stray CR, so a hand-edited .env still parses.
+# The %%?* strips any query string: Kuma shows its push URL with a sample
+# ?status=up&msg=OK&ping= attached, and curl -G would then append a SECOND status=,
+# which Kuma parses as an array - so a down ping would never read as down.
 KUMA_PUSH_URL="$(sed -n 's/^KUMA_PUSH_URL=//p' .env 2>/dev/null | tail -n1 | tr -d '\r\"')"
+KUMA_PUSH_URL="${KUMA_PUSH_URL%%\?*}"
 
 kuma_ping() {  # kuma_ping <up|down> [message]
 	[[ -n "${KUMA_PUSH_URL:-}" ]] || return 0

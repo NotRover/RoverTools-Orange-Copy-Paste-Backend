@@ -947,7 +947,10 @@ Set it up once:
 1. In Kuma: **Add New Monitor** -> type **Push** -> name `Deploy pipeline`. Set **Heartbeat
    Interval** to `300` (the timer polls every ~90s, so 5 minutes tolerates a slow build and a
    couple of missed pings) and **Retries** to `1`. Copy the push URL it shows.
-2. On the box, append it to `.env` (mode 600, git-ignored) and re-run the deploy:
+2. **Save the monitor.** Kuma shows the push URL on the edit screen before you save, and a
+   token from an unsaved monitor returns 404. Copy the URL after saving; paste it whole -
+   the sample `?status=up&msg=OK&ping=` query it carries is stripped by the script.
+3. On the box, append it to `.env` (mode 600, git-ignored) and re-run the deploy:
 
 ```bash
 cd ~/app
