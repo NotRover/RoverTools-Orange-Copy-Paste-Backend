@@ -840,6 +840,31 @@ during the switch — anyone who has not updated is offline until they do. Make 
 
 ## 12. Ongoing operations
 
+**Inspecting logs.** Two separate surfaces: the deploy runner (systemd) and the running app
+(Docker). The deploy runner tells you whether a poll picked up a commit and whether the
+build/rollout succeeded:
+
+```bash
+journalctl -u rovertools-deploy.service -f              # live, follow (Ctrl-C to stop)
+journalctl -u rovertools-deploy.service -n 100 --no-pager   # last run's output
+systemctl status rovertools-deploy.timer               # poll active? last / next fire
+```
+
+The app containers carry the actual API/proxy/redis output. Run these from `~/app` (they
+need the compose file); swap `api` for `caddy` (TLS / proxy) or `redis`:
+
+```bash
+cd ~/app
+docker compose -f docker-compose.prod.yml logs -f api        # API, live
+docker compose -f docker-compose.prod.yml logs --tail 200 api
+docker compose -f docker-compose.prod.yml logs -f            # all three services
+docker compose -f docker-compose.prod.yml ps                 # up? health, restarts
+```
+
+The API logs to stdout, so `docker compose logs` is the whole story — no log file inside the
+container. Bound the window with `--since 10m` (or `--since '1h'`). During a rolling swap you
+will briefly see two `api` containers; `logs api` shows both, which is expected.
+
 **Schema changes.** Author the Alembic revision and review it, then apply it yourself
 (section 8) *before* the deploy that needs it — a green deploy is not evidence anything
 migrated. Because a rolling deploy runs **old and new code against one DB at the same time**,

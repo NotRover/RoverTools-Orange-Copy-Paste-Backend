@@ -7,7 +7,12 @@ rovertools-temp.ctx.cl {
 		# Re-resolve `api` on each request via Docker's embedded DNS (127.0.0.11)
 		# so both containers are used during a rollout. Without `dynamic a`, Caddy
 		# resolves `api` once at startup and never sees the second replica.
-		dynamic a api 8000
-		resolvers 127.0.0.11
+		# `resolvers` is a subdirective of `dynamic a`, so it must sit inside its
+		# block — not directly under reverse_proxy.
+		dynamic a {
+			name api
+			port 8000
+			resolvers 127.0.0.11
+		}
 	}
 }
