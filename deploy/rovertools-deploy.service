@@ -10,8 +10,8 @@ Requires=docker.service
 [Service]
 Type=oneshot
 User=deploy
-WorkingDirectory=/opt/rovertools/app
-ExecStart=/bin/bash /opt/rovertools/app/deploy/deploy.sh
+WorkingDirectory=/home/deploy/app
+ExecStart=/bin/bash /home/deploy/app/deploy/deploy.sh
 # git over SSH to GitHub with the read-only deploy key, non-interactive.
 Environment=GIT_SSH_COMMAND=ssh -i /home/deploy/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
 TimeoutStartSec=600
