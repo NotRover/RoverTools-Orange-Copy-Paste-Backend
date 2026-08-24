@@ -858,13 +858,13 @@ ciphertext. It needs the API base URL and Supabase credentials for sign-in. The 
 authenticates against Supabase directly and forwards the access token as an opaque string —
 it never inspects the JWT, so the asymmetric-key change in section 7a needs no client change.
 
-**The compiled-in default is still the old Render URL.** `DEFAULT_SERVER_URL` in
-`orange-copy-paste-clipboard-app-rust/src-tauri/src/sync/config.rs` is baked in at build
-time. An existing install can be repointed by editing `sync_server_url` in `settings.json`,
-but every normal user follows the baked-in default, so moving the backend needs a **client
-release**. The old Render service is retired, so there is no endpoint running in parallel
-during the switch — anyone who has not updated is offline until they do. Make sure
-`APP_CORS_ORIGINS` includes the app's origin (`tauri://localhost` by default).
+**`DEFAULT_SERVER_URL` in `orange-copy-paste-clipboard-app-rust/src-tauri/src/sync/config.rs`
+now points at `https://rovertools-temp.ctx.cl`** — repointed off Render in source, but baked in
+at build time, so it reaches users only in a **client release** (none shipped yet). An existing
+install can be repointed sooner by editing `sync_server_url` in `settings.json`. The old Render
+service is retired, so there is no endpoint running in parallel during the switch — anyone who
+has not updated is offline until they do. Make sure `APP_CORS_ORIGINS` includes the app's origin
+(`tauri://localhost` by default).
 
 ---
 
@@ -1033,8 +1033,9 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 
 **Open / to do:**
 
-- **Client cutover release (section 11)** — the desktop app still ships the old Render URL as
-  its compiled default; a release repoints it at `https://rovertools-temp.ctx.cl`.
+- **Client cutover release (section 11)** — `DEFAULT_SERVER_URL` is repointed at
+  `https://rovertools-temp.ctx.cl` in source, but it reaches users only in a client release,
+  which has not shipped yet.
 - Install the optional `docker-rollout` plugin (section 9 step 4) for start-first swaps — until
   then deploys use `docker compose up -d`, a few-second HTTP blip.
 - Retire the old push-deploy `deploy` user if the box still carries it: `sudo userdel -r
