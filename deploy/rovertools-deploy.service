@@ -1,6 +1,7 @@
 # Install to /etc/systemd/system/rovertools-deploy.service (see docs/DEPLOY.md section 9).
-# One-shot deploy check, driven by rovertools-deploy.timer. Runs as the deploy
-# service account (in the docker group; no sudo, no inbound SSH).
+# One-shot deploy check, driven by rovertools-deploy.timer. Runs as the login user
+# that owns the checkout (in the docker group). Adjust User= and the paths if you
+# cloned somewhere other than /home/ubuntu/app.
 [Unit]
 Description=RoverTools backend: poll origin/main and deploy on change
 After=docker.service network-online.target
@@ -9,9 +10,8 @@ Requires=docker.service
 
 [Service]
 Type=oneshot
-User=deploy
-WorkingDirectory=/home/deploy/app
-ExecStart=/bin/bash /home/deploy/app/deploy/deploy.sh
-# git over SSH to GitHub with the read-only deploy key, non-interactive.
-Environment=GIT_SSH_COMMAND=ssh -i /home/deploy/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
+User=ubuntu
+WorkingDirectory=/home/ubuntu/app
+ExecStart=/bin/bash /home/ubuntu/app/deploy/deploy.sh
+# deploy.sh defaults GIT_SSH_COMMAND to ~/.ssh/id_repo, so no key path is needed here.
 TimeoutStartSec=600
