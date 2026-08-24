@@ -198,7 +198,7 @@ docker-compose exec db createdb -U postgres clipboard_test
 
 ## Deployment
 
-The backend is self-hosted on a small VPS in Docker: Caddy (TLS + reverse proxy) in front of the stateless FastAPI service, with Redis co-located for realtime fan-out and presence. Supabase (Postgres + Auth) and Cloudflare R2 (blobs) stay external. Deploys are pull-based with no CI service or registry: a systemd timer on the box polls `main`, and on a new commit it builds the image locally and rolls it out with a start-first swap, so realtime clients reconnect at most once per deploy.
+The backend is self-hosted on a small VPS in Docker: Caddy (TLS + reverse proxy) in front of the stateless FastAPI service, with Redis co-located for realtime fan-out and presence. Supabase (Postgres + Auth) and Cloudflare R2 (blobs) stay external. Deploys are pull-based with no CI service or registry: a systemd timer on the box polls `main`, and on a new commit it builds the image locally and recreates the container. There is one replica, so a deploy has a ~1-3s window where a request can get a 502 and realtime clients reconnect once — accepted deliberately rather than running an overlap tool ([`docs/DEPLOY.md`](docs/DEPLOY.md)).
 
 The `Dockerfile` builds from the lockfile and honours `$PORT`, so the image also runs unchanged under plain `docker run`. The full walkthrough — hardening the box, provisioning Supabase and R2, applying migrations, the compose/Caddy/deploy setup, verification, and pointing the desktop app at it — is in [`docs/DEPLOY.md`](docs/DEPLOY.md).
 

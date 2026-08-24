@@ -5,7 +5,8 @@
 # origin/main. See docs/DEPLOY.md section 9.
 #   - api is built here (`build: .`) and tagged ${IMAGE}; a per-commit tag makes
 #     rollback exact. It publishes NO host port; only Caddy reaches it over the
-#     compose network, which is also what lets two run during a start-first swap.
+#     compose network. One replica: a deploy recreates it, with a ~1-3s 502
+#     window accepted rather than run an overlap tool (docs/DEPLOY.md section 9).
 #   - redis publishes NO host port; it holds only pub/sub + presence, persistence off.
 services:
   caddy:

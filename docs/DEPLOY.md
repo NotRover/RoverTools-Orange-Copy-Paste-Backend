@@ -432,8 +432,8 @@ cat ~/.ssh/id_repo.pub
 #   -> add that PUBLIC key as a READ-ONLY Deploy key on the GitHub repo.
 ```
 
-The rest of the wiring — cloning the repo, `.env`, the optional `docker-rollout` plugin, and
-the systemd timer — is in section 9, since it depends on the repo files.
+The rest of the wiring — cloning the repo, `.env`, and the systemd timer — is in section 9,
+since it depends on the repo files.
 
 **Historical:** an earlier design added a separate `deploy` user with an inbound,
 forced-command-locked CI key (`id_ci`) for a GitHub Actions push-deploy. The poll model
@@ -779,10 +779,9 @@ GIT_SSH_COMMAND='ssh -i ~/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChe
 # 3. Secrets — .env lives INSIDE the checkout (git-ignored, so `git reset --hard` keeps it):
 install -m 600 /dev/null ~/app/.env    # then fill it (see Secrets below)
 
-# 4. (No docker-rollout.) We deliberately do NOT install it — Caddy's retry absorbs the
-#    recreate gap instead ("What zero downtime means here"). If you ever want true container
-#    overlap, that is a deliberate change: vendor a reviewed tag from
-#    github.com/Wowu/docker-rollout/releases AND add the rollout branch back to deploy.sh.
+# 4. (Nothing to install for rollovers.) The ~1-3s 502 window per deploy is accepted; see
+#    "What zero downtime means here" for what was tried and rejected. Adding real overlap
+#    later is a deliberate change to deploy.sh, not a plugin drop-in.
 
 # 5. Install the systemd timer:
 sudo cp ~/app/deploy/rovertools-deploy.service /etc/systemd/system/
@@ -857,10 +856,20 @@ Check, in order:
 - If `ADMIN_API_KEY` is set, `/internal/metrics` with `X-Admin-Key` returns 200 (503 means
   the key is unset).
 
-When the pipeline is live, also run the drills: **rollout** (push a trivial change, watch
-`docker rollout` health-gate the new container and drop the old — HTTP never errors, the
-client reconnects once); **rollback** (redeploy the previous SHA); **reboot** (`sudo reboot`,
-confirm the stack comes back on its own via `restart: unless-stopped`).
+Also run the drills. **Deploy** — push a trivial change (or `deploy/deploy.sh --force`) and
+watch the swap; measure the gap rather than assume it:
+
+```bash
+cd ~/app && ./deploy/deploy.sh --force >/tmp/deploy.log 2>&1 &
+while kill -0 $! 2>/dev/null; do
+  curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" https://rovertools-temp.ctx.cl/internal/healthz
+  sleep 0.3
+done
+```
+
+Expect 200s with **two 502s** at the recreate (one immediate, one ~3s dial timeout) — that is
+the known, accepted window, not a regression. Then **rollback** (redeploy the previous SHA) and
+**reboot** (`sudo reboot`, confirm the stack returns on its own via `restart: unless-stopped`).
 
 ---
 
