@@ -49,23 +49,65 @@ BOX="$(hostname)"
 # Trailing whitespace is stripped because a CR from an editor would corrupt the URL.
 ALERT_DISCORD_WEBHOOK="$(sed -n 's/^ALERT_DISCORD_WEBHOOK=//p' .env 2>/dev/null | tail -n1 | tr -d '"' | sed 's/[[:space:]]*$//')"
 
-notify() {  # notify <colour> <title> <text>
+# Which step we are on, so a failure can say where it died instead of just that it did.
+STAGE="startup"
+
+# Wall-clock start and the pre-pull commit, both carried across the re-exec below.
+# Without DEPLOY_PREV the re-exec'd process compares HEAD against itself and reports
+# an empty commit list - which is what made the first notifications say nothing.
+T0="${DEPLOY_T0:-$(date +%s)}"
+export DEPLOY_T0="$T0"
+
+# Discord embed fields, accumulated as name/value pairs. Unit and record separators
+# rather than any printable delimiter, so a commit subject can contain anything.
+FIELDS=""
+field() { FIELDS="${FIELDS}${1}"$''"${2}"$''; }
+
+# The JSON is built by python3 reading environment variables, not by string-pasting in
+# bash. Commit subjects contain quotes, backslashes and non-ASCII; a hand-rolled shell
+# escaper gets one of those wrong eventually and the webhook silently 400s. python3 is
+# present on Ubuntu by default; if it ever is not, say so rather than dying inside the
+# error handler.
+notify() {  # notify <colour> <title> <description>   (fields come from $FIELDS)
 	[[ -n "${ALERT_DISCORD_WEBHOOK:-}" ]] || return 0
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "deploy: python3 missing, no notification sent" >&2
+		return 0
+	fi
 	local body
-	body="$(printf '{"username":"deploy","embeds":[{"title":"%s","description":"%s","color":%s}]}' "$2" "$3" "$1")"
-	curl -sS -m 10 -o /dev/null -X POST -H 'Content-Type: application/json' -d "$body" "$ALERT_DISCORD_WEBHOOK" || echo 'deploy: notify failed (non-fatal)'
+	body="$(NF_COLOR="$1" NF_TITLE="$2" NF_DESC="$3" NF_FIELDS="$FIELDS" NF_BOX="$BOX" python3 -c '
+import json, os
+fields = []
+for chunk in os.environ.get("NF_FIELDS", "").split(""):
+    if not chunk.strip():
+        continue
+    name, _, value = chunk.partition("")
+    fields.append({"name": name, "value": value or "-", "inline": len(value) < 40})
+embed = {
+    "title": os.environ["NF_TITLE"][:256],
+    "color": int(os.environ["NF_COLOR"]),
+    "footer": {"text": os.environ["NF_BOX"]},
+}
+desc = os.environ.get("NF_DESC", "")
+if desc:
+    embed["description"] = desc[:4000]
+if fields:
+    embed["fields"] = fields[:25]
+print(json.dumps({"username": "deploy", "embeds": [embed]}))
+')"
+	curl -sS -m 10 -o /dev/null -X POST -H 'Content-Type: application/json' -d "$body" "$ALERT_DISCORD_WEBHOOK" </dev/null || echo 'deploy: notify failed (non-fatal)'
 }
 
-# Any non-zero exit reports itself. Not fired by the re-exec below: exec replaces the
-# process image without running EXIT traps.
-trap 'rc=$?; (( rc != 0 )) && notify 15158332 "Deploy FAILED on ${BOX}" "exit ${rc} - journalctl -u rovertools-deploy.service -n 50"; exit $rc' EXIT
+trap 'rc=$?; if (( rc != 0 )); then FIELDS=""; field "Failed at" "$STAGE"; field "Exit code" "$rc"; field "Commit" "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; field "Look here" "journalctl -u rovertools-deploy.service -n 50"; notify 15158332 "Deploy FAILED on ${BOX}" "The stack is untouched or half-rolled; check before assuming either."; fi; exit $rc' EXIT
 
 # Nothing pings a monitor here: the notify() calls above are the report. A oneshot
 # unit is idle by design, so its systemd state cannot distinguish a healthy pipeline
 # from a stopped timer (section 15).
+STAGE="git fetch"
 git fetch --quiet origin main
 LOCAL="$(git rev-parse HEAD)"
 REMOTE="$(git rev-parse origin/main)"
+PREV="${DEPLOY_PREV:-$LOCAL}"
 RUNNING="$(docker compose -f "$COMPOSE" ps -q api || true)"
 
 # The common poll result: nothing new and the stack is up. Quiet no-op.
@@ -85,6 +127,7 @@ git reset --hard --quiet origin/main
 if [[ -z "${DEPLOY_REEXEC:-}" && "$SELF_HASH" != "$(sha256sum "$SELF" | cut -d' ' -f1)" ]]; then
 	echo "deploy: deploy.sh changed, re-running the updated script"
 	export DEPLOY_REEXEC=1
+	export DEPLOY_PREV="$PREV"
 	exec bash "$SELF" --force
 fi
 
@@ -92,6 +135,7 @@ SHA="$(git rev-parse --short HEAD)"
 export IMAGE="${IMAGE_REPO}:${SHA}"
 
 # Build locally; compose tags the result as $IMAGE (the service's `image:` field).
+STAGE="docker build"
 docker compose -f "$COMPOSE" build api
 docker tag "$IMAGE" "${IMAGE_REPO}:latest"
 
@@ -100,6 +144,7 @@ docker tag "$IMAGE" "${IMAGE_REPO}:latest"
 # gets a 502 and open WebSockets drop once. Accepted deliberately: no overlap tool
 # (docker-rollout/Swarm), and a Caddy retry was tried and measured not to help.
 # See docs/DEPLOY.md section 9.
+STAGE="container rollout"
 docker compose -f "$COMPOSE" up -d
 
 # Ship Caddyfile changes too. `up -d` does not recreate caddy when only the
@@ -111,12 +156,15 @@ docker compose -f "$COMPOSE" up -d
 # Reload is atomic: an invalid config is rejected and the running one keeps
 # serving, so a bad Caddyfile fails the deploy instead of taking the site down.
 # -T because there is no TTY under systemd.
+CADDY_STATE="skipped"
+STAGE="caddy reload"
 if [[ -n "$(docker compose -f "$COMPOSE" ps -q caddy)" ]]; then
 	# Validate first so a broken config fails here with a readable error. Reload is
 	# atomic regardless (an invalid config is rejected and the old one keeps serving);
 	# this just makes the failure obvious instead of a terse reload error.
 	docker compose -f "$COMPOSE" exec -T caddy caddy validate --config /etc/caddy/Caddyfile
 	docker compose -f "$COMPOSE" exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+	CADDY_STATE="reloaded"
 fi
 
 # Ship Netdata config from the repo. It cannot be bind-mounted: the entrypoint
@@ -127,6 +175,7 @@ fi
 # rather than retyped into a volume by hand. Secrets stay out: the Discord webhook
 # comes from ALERT_DISCORD_WEBHOOK in .env via the container's environment.
 # Restart only when something actually changed - netdata does not re-read on its own.
+STAGE="netdata config"
 if [[ -n "$(docker compose -f "$COMPOSE" ps -q netdata)" ]]; then
 	NETDATA_SEEN=0; NETDATA_DIRTY=0
 	# fd 3, not stdin. `docker compose exec` reads stdin even with -T, so a loop fed
@@ -161,5 +210,44 @@ docker images "${IMAGE_REPO}" --format '{{.ID}} {{.Tag}}' \
 	| awk '$2 != "latest"' | tail -n +$((KEEP_IMAGES + 1)) | awk '{print $1}' \
 	| xargs -r docker rmi -f >/dev/null 2>&1 || true
 
-notify 3066993 "Deployed on ${BOX}" "rovertools-api:${SHA}"
+STAGE="reporting"
+
+# What actually shipped. An embed saying only "deployed" is what prompted this: the
+# useful facts are which commits, which files, whether anything crossed the wire
+# contract, and how long the API was being recreated.
+LOG="$(git log --no-merges --pretty=format:'%h %s' "${PREV}..HEAD" 2>/dev/null | head -n 8 || true)"
+NCOMMITS="$(git rev-list --count "${PREV}..HEAD" 2>/dev/null || echo 0)"
+NFILES="$(git diff --name-only "${PREV}..HEAD" 2>/dev/null | wc -l | tr -d ' ')"
+MIGRATIONS="$(git diff --name-only "${PREV}..HEAD" -- migrations/ 2>/dev/null | wc -l | tr -d ' ')"
+TOOK=$(( $(date +%s) - T0 ))
+
+if [[ -n "$LOG" ]]; then
+	DESC="\`\`\`
+${LOG}
+\`\`\`"
+	if [[ "$NCOMMITS" -gt 8 ]]; then
+		DESC="${DESC}
+...and $((NCOMMITS - 8)) more"
+	fi
+else
+	DESC="Forced redeploy - no new commits, same code rebuilt."
+fi
+
+FIELDS=""
+field "Image" "${IMAGE}"
+field "Commits" "${NCOMMITS} (${PREV:0:7} -> ${SHA})"
+field "Files changed" "${NFILES}"
+field "Took" "${TOOK}s"
+field "Config" "caddy ${CADDY_STATE}, netdata ${NETDATA_SEEN:-0} checked / ${NETDATA_DIRTY:-0} updated"
+
+# A deploy never runs Alembic (see docs/DEPLOY.md). If a revision shipped in this range
+# the database is now behind the code, and the symptom is a live route 500ing on a
+# missing relation - worth an amber embed rather than a green one nobody rereads.
+COLOUR=3066993
+if [[ "$MIGRATIONS" -gt 0 ]]; then
+	COLOUR=16159744
+	field "MIGRATIONS" "${MIGRATIONS} revision file(s) shipped and NOT applied. Run the Migrate database workflow before trusting the new routes."
+fi
+
+notify "$COLOUR" "Deployed ${IMAGE}" "$DESC"
 echo "deploy: done ${IMAGE}"

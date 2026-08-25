@@ -1079,15 +1079,22 @@ Network interfaces are filtered to the real uplink, because Docker gives every c
 network a bridge and every container a veth, each of which otherwise becomes a menu entry
 named after a hash; disks drop loopback, ramdisk and device-mapper entries.
 
+The third is `apps = no`. apps.plugin charts every application, user and user group
+separately - 644 + 168 + 154 + 46 charts here, roughly 90% of what survived the other cuts,
+answering nothing the per-container charts do not. Per-process detail is what `htop` and
+`docker stats` are for, and both are already on the box.
+
 What is deliberately kept, because it is the list you would want during an incident: CPU,
 RAM and swap, disk space and IO, network throughput, per-container CPU/memory/IO for all
-five services, per-application resource use, and the two API health checks. Unit state is
+five services, and the two API health checks. Unit state is
 narrowed to the units worth alarming on in `netdata/conf/go.d/systemdunits.conf` rather than
 all of them.
 
-The agent **ignores config keys it does not recognise**, so a mistake here is silent and
-leaves the noise in place rather than breaking anything. Count charts before and after
-instead of trusting the file:
+The agent does not fail on a key it does not recognise, but it does **say so** - the config
+it serves back at `/netdata.conf` marks an unknown key `found in the config file, but is not
+used`, and annotates a renamed one with `migrated from`. That is the only reliable way to
+tell a working setting from a typo, because a wrong key simply leaves the noise in place.
+Check both the count and the served config:
 
 ```bash
 cd ~/app
@@ -1102,8 +1109,20 @@ there is something to say - the ~90s no-op polls are silent:
 
 | When | Message |
 |------|---------|
-| A commit deployed | Green **Deployed on `<host>`**, with the image tag (`rovertools-api:<sha>`) |
-| Any non-zero exit | Red **Deploy FAILED on `<host>`**, with the exit code and the `journalctl` line to run |
+| A commit deployed | Green **Deployed `rovertools-api:<sha>`**, with the commit subjects that shipped (up to 8, then a count), the commit range, files changed, wall-clock duration, and whether Caddy reloaded and how many Netdata config files were installed |
+| The range shipped a migration | The same, **amber**, with a `MIGRATIONS` field naming how many revision files arrived. A deploy never runs Alembic, so the database is now behind the code and the symptom is a live route 500ing on a missing relation |
+| Any non-zero exit | Red **Deploy FAILED on `<host>`**, naming the **stage** it died in (`git fetch`, `docker build`, `container rollout`, `caddy reload`, `netdata config`), the exit code, the commit, and the `journalctl` line to run |
+
+The embed JSON is built by `python3` reading environment variables, not by pasting strings
+together in shell. Commit subjects contain quotes, backslashes and non-ASCII; a hand-rolled
+shell escaper gets one of those wrong eventually, and the failure mode is a webhook silently
+rejecting the post. If `python3` is ever missing the deploy says so and carries on rather
+than dying inside its own error handler.
+
+Two values are carried across the self-re-exec (section 5.4) in the environment: the
+**pre-pull commit** and the **start time**. Without the first, the re-exec'd process compares
+HEAD against itself and reports an empty commit list - which is exactly why the first
+notifications said nothing but the image tag.
 
 The failure path is an `EXIT` trap, so it covers every way the script can die - a failed
 `git fetch`, a broken build, a container that will not come up - not just the errors someone
