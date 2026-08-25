@@ -1065,7 +1065,9 @@ hardware we do not own and kernel counters nobody will act on. `netdata/conf/net
 switches those off. The single biggest cut by far is **`apps = no`** - see below. Per-systemd-
 service cgroup charts are also gone (22 units, 7 charts each) via
 `cgroups to match as systemd services = !*`, which is what governs them in Netdata v2 after
-the old `enable systemd services` switch was removed. Anomaly detection is off too: a model
+the old `enable systemd services` switch was removed. Note those were cgroup resource charts,
+not unit state - unit state is a separate plugin that does not run here at all (see the gaps
+below). Anomaly detection is off too: a model
 per dimension costs real CPU and memory here, and produces a second thing to interpret rather
 than an answer.
 
@@ -1191,13 +1193,21 @@ why; read it rather than inferring success from silence.
 | Public URL fails while the container is fine (Caddy, TLS, DNS) | `api_public` fails, `api_direct` passes | Red |
 | A container is killed, restarts, or eats CPU/memory | Netdata cgroup alarms | Amber then red |
 | Disk fills, RAM or swap runs out, load spikes | Netdata system alarms | Amber then red |
-| A watched unit fails (`docker`, `ssh`, `fail2ban`, `nftables`) | Netdata `systemdunits` | Red |
 | Any of the above recovers | Netdata | Green |
 
 Nothing pings you for a routine ~90s poll that found no new commit, and nothing pings you
-for the categories trimmed above. Two gaps remain, both known: **the box being down or off
-the network** (everything here runs on it - see the external check below), and **anything
-inside Supabase**, which is not this box at all.
+for the categories trimmed above. Three gaps remain, all known:
+
+- **The box being down or off the network.** Everything above runs on it. The external check
+  below is the only thing that catches this.
+- **Anything inside Supabase**, which is not this box at all.
+- **systemd unit state.** `fail2ban` or `nftables` dying is silent. The `systemd-units`
+  plugin is its own plugin (not a go.d module, whatever older notes say) and it produces
+  nothing in this container, because it talks to systemd over D-Bus and `/run/systemd` is
+  not mounted. Closing this means mounting the host's systemd socket *and* filtering to a
+  few units, or every unit on the box lands back on the dashboard. Not done; the units that
+  would take the service down with them (`docker`, the API container) are already covered
+  by the container and health-check alarms.
 
 **Rotate the webhook if it has been pasted anywhere shared.** Anyone holding the URL can post
 into that channel. Regenerating is one click in Discord, then replace the line in `.env` and
