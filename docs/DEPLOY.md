@@ -1062,12 +1062,12 @@ Postgres or Redis.
 **The dashboard is trimmed, on purpose.** Netdata's defaults collect everything a machine
 *could* have, which on a small VPS means the handful of charts that matter are buried under
 hardware we do not own and kernel counters nobody will act on. `netdata/conf/netdata.conf`
-switches those off. The single biggest cut is the **per-systemd-unit charts** - about 1900 of
-them on this box. They come from the go.d `systemdunits` collector, which charts every unit
-it can see, so the trim is an include list in `netdata/conf/go.d/systemdunits.conf` naming
-the handful worth alarming on. Not the cgroups plugin: it already skips `*.service` cgroups
-by default, and Netdata v2 removed the `enable systemd services` switch that older guides
-still tell you to set.
+switches those off. The single biggest cut by far is **`apps = no`** - see below. Per-systemd-
+service cgroup charts are also gone (22 units, 7 charts each) via
+`cgroups to match as systemd services = !*`, which is what governs them in Netdata v2 after
+the old `enable systemd services` switch was removed. Anomaly detection is off too: a model
+per dimension costs real CPU and memory here, and produces a second thing to interpret rather
+than an answer.
 
 The second is `netdata monitoring = no`: the agent's charts about *itself* - dbengine
 compression ratio, database pages, worker thread timings, query latency. That is the whole
@@ -1079,7 +1079,7 @@ Network interfaces are filtered to the real uplink, because Docker gives every c
 network a bridge and every container a veth, each of which otherwise becomes a menu entry
 named after a hash; disks drop loopback, ramdisk and device-mapper entries.
 
-The third is `apps = no`. apps.plugin charts every application, user and user group
+The big one is `apps = no`. apps.plugin charts every application, user and user group
 separately - 644 + 168 + 154 + 46 charts here, roughly 90% of what survived the other cuts,
 answering nothing the per-container charts do not. Per-process detail is what `htop` and
 `docker stats` are for, and both are already on the box.
@@ -1553,12 +1553,25 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   and a red one from an `EXIT` trap on any non-zero exit, covering every way the script can
   die rather than the errors someone anticipated. A failed post is non-fatal; a broken
   notifier must not break a deploy. **(b)** The dashboard shipped with Netdata's defaults and
-  was unreadable for it - roughly 1900 of its charts were the cgroups plugin's per-systemd-
-  unit families, on top of pressure stall, IPv6/NFS/SCTP stacks, ZFS, Btrfs, RAID, batteries,
-  ECC and NUMA on a virtual machine that has none of them. `netdata/conf/netdata.conf` now
+  was unreadable for it - about 1900 charts, on top of pressure stall, IPv6/NFS/SCTP stacks,
+  ZFS, Btrfs, RAID, batteries, ECC and NUMA on a virtual machine that has none of them. `netdata/conf/netdata.conf` now
   turns those off and ships from git like the rest. Note that unrecognised keys are ignored
   silently, so this is a change that must be verified by counting charts, not by reading the
   file - the same rule that produced the two entries above it.
+- **2026-08-25 - the 1900 charts were apps.plugin, guessed at twice as something else.**
+  A `grep -c systemd` over the charts JSON returned 1903, and that number was read as
+  "1900 systemd charts" - first blamed on the cgroups plugin, then on the go.d systemdunits
+  collector. It was neither: grep counts string occurrences across every field of every
+  chart, not charts. Counting properly (`cut -d. -f1 | uniq -c`) put it beyond argument -
+  **apps.plugin**, at 644 per-application, 168 per-user, 154 per-usergroup and 46 file-
+  descriptor charts, about 90% of the total. Per-systemd-service cgroup charts were real but
+  small (22 units, 7 each) and needed a different key again, `cgroups to match as systemd
+  services`, because v2 dropped `enable systemd services`. Two things this bought that the
+  guessing did not: the chart list also shows every configured **alarm**, which finally
+  answered "what am I notified about" from evidence, and it showed the API's chart families
+  briefly missing right after a restart - the cgroups plugin rediscovers containers on a 10s
+  cycle, so a count taken seconds after a deploy under-reports. Measure the thing, and know
+  what your measurement counts.
 - **2026-08-25 - the config installer ate its own worklist.** The netdata trim above shipped,
   deployed cleanly, printed nothing, exited 0 - and installed neither file. The loop was
   `while read CFG; do ... done < <(find ...)`, so the worklist arrived on **stdin**, and
