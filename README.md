@@ -159,12 +159,13 @@ src/
 ├─ auth/                # profiles, bootstrap, devices, public keys; tokens.py verifies JWTs
 ├─ sync/                # push/pull/cursor/status + last-write-wins service
 ├─ settings/            # encrypted per-user settings blob
-├─ groups/              # pool groups, sharing.py (Live Share), invites.py (addressed invites)
+├─ spaces/              # spaces, invites, join approval, space-key distribution
 ├─ blobs/               # presigned upload/download (s3.py), quota accounting
 ├─ announcements/       # server-authored messages to users
-└─ admin/               # probes and the versioned management API
+├─ admin/               # probes and the versioned management API
+└─ web/                 # human-facing HTML pages (templates/)
 
-migrations/versions/    # Alembic 0001…0012
+migrations/versions/    # Alembic 0001…0019
 tests/                  # pytest: auth, sync, blobs, space invites, announcements
 docs/                   # ARCHITECTURE.md, DEPLOY.md, ANNOUNCEMENTS.md
 ```
