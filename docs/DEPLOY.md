@@ -831,12 +831,13 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   After `up -d` it also **validates and reloads Caddy**, because `up -d` does not recreate a
   container whose only change is its mounted config. It runs `caddy validate` then `reload`
   after `up -d`, because a Caddyfile change ships as a config edit that recreates nothing.
-  It no longer pings anything: a failed run exits non-zero, systemd marks the unit failed,
-  and Netdata alarms on that (section 12).
+  It **reports on itself to Discord** - green on a deploy, red on any non-zero exit via an
+  `EXIT` trap - rather than leaving a broken pipeline to be noticed (section 12).
 - **`deploy/rovertools-deploy.{service,timer}`** — the systemd units that poll ~every 90s.
-- **`netdata/conf/**`** — Netdata config, mirroring `/etc/netdata/`: collector jobs in
-  `go.d/`, notifications in `health_alarm_notify.conf`. Installed into the `netdataconfig`
-  volume by `deploy.sh`, not bind-mounted (section 12), so it ships from git regardless.
+- **`netdata/conf/**`** — Netdata config, mirroring `/etc/netdata/`: agent settings and the
+  noise trim in `netdata.conf`, collector jobs in `go.d/`, notifications in
+  `health_alarm_notify.conf`. Installed into the `netdataconfig` volume by `deploy.sh`, not
+  bind-mounted (section 12), so it ships from git regardless.
 
 **Why the Redis flags** (`--save "" --appendonly no --requirepass --maxmemory 256mb
 --maxmemory-policy volatile-ttl`): it holds only pub/sub + presence, so persistence off (an
@@ -1043,7 +1044,7 @@ that comes up unprotected.
 
 | Check | Where | Why it is not the default |
 |---|---|---|
-| `api_direct` -> `http://api:8000/internal/healthz` | `netdata/go.d/httpcheck.conf` | Matches the **body** for `"status":"ok"` |
+| `api_direct` -> `http://api:8000/internal/healthz` | `netdata/conf/go.d/httpcheck.conf` | Matches the **body** for `"status":"ok"` |
 | `api_public` -> `https://rovertools-temp.ctx.cl/internal/healthz` | same | Same match, through Caddy and TLS |
 
 Neither is bind-mounted. Netdata's entrypoint copies stock config into `/etc/netdata` on
@@ -1058,13 +1059,59 @@ would stay green straight through a database outage. Two jobs because the pair l
 fault: public failing while direct passes means Caddy, TLS or DNS; both failing means the app,
 Postgres or Redis.
 
-**The deploy pipeline monitors itself through systemd.** A pipeline that stops working is
-silent by nature: the timer fires, the script fails early, the old containers keep serving,
-and nothing looks wrong until someone notices a merged commit never shipped. That happened
-twice here (section 15). `deploy.sh` no longer pings anything - instead a failed run exits
-non-zero, systemd marks `rovertools-deploy.service` **failed**, and Netdata's systemd-units
-collector alarms on the failed state. Same guarantee, no bespoke heartbeat, and it covers
-every unit on the box rather than just this one.
+**The dashboard is trimmed, on purpose.** Netdata's defaults collect everything a machine
+*could* have, which on a small VPS means the handful of charts that matter are buried under
+hardware we do not own and kernel counters nobody will act on. `netdata/conf/netdata.conf`
+switches those off. The single biggest cut is `enable systemd services = no` under
+`[plugin:cgroups]`: that plugin builds a full chart family **per systemd unit**, about 1900
+charts on this box. Docker containers keep theirs.
+
+The second is `netdata monitoring = no`: the agent's charts about *itself* - dbengine
+compression ratio, database pages, worker thread timings, query latency. That is the whole
+"Netdata Monitoring" menu, and it answers questions about the monitoring tool rather than
+about the box. Also gone: pressure stall, interrupts and softirqs, deep TCP kernel counters
+(out-of-order segments, SYN cookies, ECN) and conntrack, IPv6/SCTP/NFS/IPVS stacks, statsd,
+eBPF, ZFS, Btrfs, software RAID, batteries, ECC, Infiniband, NUMA, entropy and SysV IPC.
+Network interfaces are filtered to the real uplink, because Docker gives every compose
+network a bridge and every container a veth, each of which otherwise becomes a menu entry
+named after a hash; disks drop loopback, ramdisk and device-mapper entries.
+
+What is deliberately kept, because it is the list you would want during an incident: CPU,
+RAM and swap, disk space and IO, network throughput, per-container CPU/memory/IO for all
+five services, per-application resource use, and the two API health checks. Unit state is
+narrowed to the units worth alarming on in `netdata/conf/go.d/systemdunits.conf` rather than
+all of them.
+
+The agent **ignores config keys it does not recognise**, so a mistake here is silent and
+leaves the noise in place rather than breaking anything. Count charts before and after
+instead of trusting the file:
+
+```bash
+cd ~/app
+docker compose -f docker-compose.prod.yml exec -T netdata   curl -s 'localhost:19999/api/v1/charts' | grep -o '"id":"' | wc -l
+```
+
+**The deploy reports on itself.** A pipeline that stops working is silent by nature: the
+timer fires, the script fails early, the old containers keep serving, and nothing looks
+wrong until someone notices a merged commit never shipped. That happened twice here
+(section 15). So `deploy.sh` posts to the same Discord channel as the alarms, and only when
+there is something to say - the ~90s no-op polls are silent:
+
+| When | Message |
+|------|---------|
+| A commit deployed | Green **Deployed on `<host>`**, with the image tag (`rovertools-api:<sha>`) |
+| Any non-zero exit | Red **Deploy FAILED on `<host>`**, with the exit code and the `journalctl` line to run |
+
+The failure path is an `EXIT` trap, so it covers every way the script can die - a failed
+`git fetch`, a broken build, a container that will not come up - not just the errors someone
+thought to handle. It does not fire on the self-re-exec (section 5.4), because `exec`
+replaces the process image without running traps.
+
+This is deliberately independent of Netdata. `rovertools-deploy.service` is a oneshot that is
+inactive between runs, and inferring "the pipeline is healthy" from a unit that is *supposed*
+to be idle most of the time is exactly the kind of indirect guarantee that failed us twice.
+The thing doing the work reports on the work. The webhook is read from `.env` and a failed
+post is non-fatal - a broken notifier must never break a deploy.
 
 **Notifications.** Alarms reach Discord through a **custom sender** defined in
 `netdata/conf/health_alarm_notify.conf` in the repo. Two decisions worth knowing:
@@ -1104,6 +1151,24 @@ docker compose -f docker-compose.prod.yml exec -T netdata   bash -c '/usr/libexe
 Three messages should arrive - warning, critical, recovered. If none do, that command says
 why; read it rather than inferring success from silence.
 
+**What actually reaches you, and what does not.** The whole point of the setup, in one table:
+
+| You get pinged when | From | Colour |
+|---|---|---|
+| A commit deployed | `deploy.sh` | Green |
+| A deploy failed, for any reason | `deploy.sh` exit trap | Red |
+| The API stops answering, or answers 200 with a degraded body | Netdata `httpcheck` | Red |
+| Public URL fails while the container is fine (Caddy, TLS, DNS) | `api_public` fails, `api_direct` passes | Red |
+| A container is killed, restarts, or eats CPU/memory | Netdata cgroup alarms | Amber then red |
+| Disk fills, RAM or swap runs out, load spikes | Netdata system alarms | Amber then red |
+| A watched unit fails (`docker`, `ssh`, `fail2ban`, `nftables`) | Netdata `systemdunits` | Red |
+| Any of the above recovers | Netdata | Green |
+
+Nothing pings you for a routine ~90s poll that found no new commit, and nothing pings you
+for the categories trimmed above. Two gaps remain, both known: **the box being down or off
+the network** (everything here runs on it - see the external check below), and **anything
+inside Supabase**, which is not this box at all.
+
 **Rotate the webhook if it has been pasted anywhere shared.** Anyone holding the URL can post
 into that channel. Regenerating is one click in Discord, then replace the line in `.env` and
 re-run the deploy. The blast radius is spam in one channel, not access to the box - but it is
@@ -1118,9 +1183,10 @@ one alongside this; it is the one piece that cannot live on the box.
 **Retention and footprint.** Netdata's default database tiers keep roughly a day of
 per-second data and months of downsampled history, sized to what the `netdatalib` volume can
 take. On this box (3.7 GiB RAM, 38 GB disk) that is comfortable, but it is the largest thing
-in the stack by memory. If it ever crowds the API, cut retention in `netdata.conf`
-(`docker compose exec netdata ./edit-config netdata.conf`) rather than dropping collectors -
-the charts are the reason it is here.
+in the stack by memory. The collector trim above already removed most of the cost; if it ever
+crowds the API again, cut retention in `netdata/conf/netdata.conf` and deploy - editing it in
+the container instead (`./edit-config`) puts the box out of step with git, which is the exact
+drift `netdata/conf/**` exists to prevent.
 
 **Netdata Cloud stays unclaimed.** `DISABLE_TELEMETRY=1` is set and no claim token is
 configured, so the agent talks to nobody. Claiming it would put the box's metrics on someone
@@ -1399,8 +1465,9 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   `kuma_data` volume, `deploy/host-health.sh` and its timer, and the push-heartbeat plumbing in
   `deploy.sh`. What each of those guaranteed still holds, by a different route - the healthz
   **body** match moved into `netdata/go.d/httpcheck.conf` (a status-code check would still stay
-  green through a Postgres outage), and the deploy heartbeat became the systemd-units alarm on
-  a failed `rovertools-deploy.service`, which covers every unit rather than one. Two costs,
+  green through a Postgres outage), and the deploy heartbeat was replaced - first by a
+  systemd-units alarm, then, when that proved to rest on a unit that is idle by design, by
+  the deploy reporting to Discord directly (see the last entry). Two costs,
   both accepted deliberately: Netdata needs the host read-only (`/proc`, `/sys`, `/`,
   `/var/log`) plus `SYS_PTRACE`, which is *more* box access than Kuma ever had, and its
   dashboard has no login, so Caddy basic auth is now load-bearing rather than a nicety. The
@@ -1454,6 +1521,22 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   successful both times. `deploy.sh` now hashes itself before the pull and re-execs the new
   copy with `--force` when it changed, guarded by `DEPLOY_REEXEC` against looping. The lock
   is kept across the exec by testing `/proc/self/fd/9` rather than assuming.
+- **2026-08-25 - deploy alerting rested on an idle unit; the dashboard buried its own
+  signal.** Two loose ends from the Kuma removal, closed together. **(a)** The claim that a
+  broken pipeline would alarm through Netdata's systemd-units collector was inferred, not
+  tested, and it was the wrong shape regardless: `rovertools-deploy.service` is a oneshot
+  that is *supposed* to be inactive between polls, so reading health from its state means
+  reading a signal that looks identical whether the timer is working or stopped. Replaced
+  with the direct thing - `deploy.sh` posts a green embed naming the image on a real deploy
+  and a red one from an `EXIT` trap on any non-zero exit, covering every way the script can
+  die rather than the errors someone anticipated. A failed post is non-fatal; a broken
+  notifier must not break a deploy. **(b)** The dashboard shipped with Netdata's defaults and
+  was unreadable for it - roughly 1900 of its charts were the cgroups plugin's per-systemd-
+  unit families, on top of pressure stall, IPv6/NFS/SCTP stacks, ZFS, Btrfs, RAID, batteries,
+  ECC and NUMA on a virtual machine that has none of them. `netdata/conf/netdata.conf` now
+  turns those off and ships from git like the rest. Note that unrecognised keys are ignored
+  silently, so this is a change that must be verified by counting charts, not by reading the
+  file - the same rule that produced the two entries above it.
 
 ---
 
