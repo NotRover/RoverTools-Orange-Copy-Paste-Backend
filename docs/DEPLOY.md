@@ -1364,6 +1364,16 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   the container only when the content changed. The file still ships from git and still
   arrives by the deploy, which was the point of not bind-mounting a single file in the first
   place - the constraint moved, the guarantee did not.
+- **2026-08-25 - measured a memory scare, found no memory problem and no swap.** htop's bar
+  looked full and the box was reported to be "reaching memory caps". It was not: 939 MB used
+  of 3.7 GB with **2.8 GB available**, all five containers together under 300 MB (api 118,
+  netdata 135, caddy 13, redis 6, dockerproxy 4). The full-looking bar was page cache, which
+  Linux hands back on demand, and the repeated 106 MB `dockerd` / 141 MB `python` rows were
+  threads of one process each, not copies - htop was in thread view. Nothing was tuned:
+  trimming Netdata's retention would have blinded the monitoring just installed, in exchange
+  for nothing. The real finding was `Swap: 0B` - no runway between healthy and the OOM killer
+  picking the API container. Added a 2 GB swap file with `vm.swappiness=10` (section 5.9).
+  Read the numbers, not the bar.
 
 ---
 
