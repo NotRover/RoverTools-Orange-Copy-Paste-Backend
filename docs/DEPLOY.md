@@ -1102,8 +1102,20 @@ there is something to say - the ~90s no-op polls are silent:
 
 | When | Message |
 |------|---------|
-| A commit deployed | Green **Deployed on `<host>`**, with the image tag (`rovertools-api:<sha>`) |
-| Any non-zero exit | Red **Deploy FAILED on `<host>`**, with the exit code and the `journalctl` line to run |
+| A commit deployed | Green **Deployed `rovertools-api:<sha>`**, with the commit subjects that shipped (up to 8, then a count), the commit range, files changed, wall-clock duration, and whether Caddy reloaded and how many Netdata config files were installed |
+| The range shipped a migration | The same, **amber**, with a `MIGRATIONS` field naming how many revision files arrived. A deploy never runs Alembic, so the database is now behind the code and the symptom is a live route 500ing on a missing relation |
+| Any non-zero exit | Red **Deploy FAILED on `<host>`**, naming the **stage** it died in (`git fetch`, `docker build`, `container rollout`, `caddy reload`, `netdata config`), the exit code, the commit, and the `journalctl` line to run |
+
+The embed JSON is built by `python3` reading environment variables, not by pasting strings
+together in shell. Commit subjects contain quotes, backslashes and non-ASCII; a hand-rolled
+shell escaper gets one of those wrong eventually, and the failure mode is a webhook silently
+rejecting the post. If `python3` is ever missing the deploy says so and carries on rather
+than dying inside its own error handler.
+
+Two values are carried across the self-re-exec (section 5.4) in the environment: the
+**pre-pull commit** and the **start time**. Without the first, the re-exec'd process compares
+HEAD against itself and reports an empty commit list - which is exactly why the first
+notifications said nothing but the image tag.
 
 The failure path is an `EXIT` trap, so it covers every way the script can die - a failed
 `git fetch`, a broken build, a container that will not come up - not just the errors someone
