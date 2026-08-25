@@ -38,11 +38,31 @@ cd "$APP_DIR"
 # Our own fingerprint, taken before the pull can replace the file underneath us.
 SELF="$APP_DIR/deploy/deploy.sh"
 SELF_HASH="$(sha256sum "$SELF" | cut -d' ' -f1)"
+BOX="$(hostname)"
 
-# No heartbeat ping here any more: Uptime Kuma is gone (section 15). A failing run
-# exits non-zero, systemd marks rovertools-deploy.service failed, and Netdata's
-# systemd-units collector alarms on that - so the pipeline still announces itself
-# without this script knowing anything about the monitoring stack.
+# Deploy notifications, to the same Discord channel Netdata alarms use. The deploy
+# reports on itself rather than relying on something else noticing: a oneshot unit
+# that is inactive between runs is a weak thing to infer health from, and a pipeline
+# that breaks quietly is the failure mode that cost us most this month (section 15).
+# Only a real deploy or a failure sends - the ~90s no-op polls stay silent.
+# The webhook is optional: no value means deploys stay silent, never that they fail.
+# Trailing whitespace is stripped because a CR from an editor would corrupt the URL.
+ALERT_DISCORD_WEBHOOK="$(sed -n 's/^ALERT_DISCORD_WEBHOOK=//p' .env 2>/dev/null | tail -n1 | tr -d '"' | sed 's/[[:space:]]*$//')"
+
+notify() {  # notify <colour> <title> <text>
+	[[ -n "${ALERT_DISCORD_WEBHOOK:-}" ]] || return 0
+	local body
+	body="$(printf '{"username":"deploy","embeds":[{"title":"%s","description":"%s","color":%s}]}' "$2" "$3" "$1")"
+	curl -sS -m 10 -o /dev/null -X POST -H 'Content-Type: application/json' -d "$body" "$ALERT_DISCORD_WEBHOOK" || echo 'deploy: notify failed (non-fatal)'
+}
+
+# Any non-zero exit reports itself. Not fired by the re-exec below: exec replaces the
+# process image without running EXIT traps.
+trap 'rc=$?; (( rc != 0 )) && notify 15158332 "Deploy FAILED on ${BOX}" "exit ${rc} - journalctl -u rovertools-deploy.service -n 50"; exit $rc' EXIT
+
+# Nothing pings a monitor here: the notify() calls above are the report. A oneshot
+# unit is idle by design, so its systemd state cannot distinguish a healthy pipeline
+# from a stopped timer (section 15).
 git fetch --quiet origin main
 LOCAL="$(git rev-parse HEAD)"
 REMOTE="$(git rev-parse origin/main)"
@@ -108,17 +128,32 @@ fi
 # comes from ALERT_DISCORD_WEBHOOK in .env via the container's environment.
 # Restart only when something actually changed - netdata does not re-read on its own.
 if [[ -n "$(docker compose -f "$COMPOSE" ps -q netdata)" ]]; then
-	while IFS= read -r CFG; do
+	NETDATA_SEEN=0; NETDATA_DIRTY=0
+	# fd 3, not stdin. `docker compose exec` reads stdin even with -T, so a loop fed
+	# through stdin has its remaining filenames eaten by the first exec - the loop then
+	# ends after one iteration, prints nothing and exits 0. That is what shipped the
+	# netdata.conf trim as a no-op (section 15). The inner commands get /dev/null too.
+	while IFS= read -r CFG <&3; do
+		NETDATA_SEEN=$((NETDATA_SEEN + 1))
 		DEST="/etc/netdata/${CFG#netdata/conf/}"
-		HAVE="$(docker compose -f "$COMPOSE" exec -T netdata cat "$DEST" 2>/dev/null || true)"
+		HAVE="$(docker compose -f "$COMPOSE" exec -T netdata cat "$DEST" </dev/null 2>/dev/null || true)"
 		if [[ "$HAVE" != "$(cat "$CFG")" ]]; then
 			echo "deploy: installing ${DEST}"
-			docker compose -f "$COMPOSE" exec -T netdata mkdir -p "$(dirname "$DEST")"
-			docker compose -f "$COMPOSE" cp "$CFG" "netdata:${DEST}"
-			NETDATA_DIRTY=1
+			docker compose -f "$COMPOSE" exec -T netdata mkdir -p "$(dirname "$DEST")" </dev/null
+			docker compose -f "$COMPOSE" cp "$CFG" "netdata:${DEST}" </dev/null
+			NETDATA_DIRTY=$((NETDATA_DIRTY + 1))
 		fi
-	done < <(find netdata/conf -type f -name '*.conf' | sort)
-	[[ -n "${NETDATA_DIRTY:-}" ]] && docker compose -f "$COMPOSE" restart netdata
+	done 3< <(find netdata/conf -type f -name "*.conf" | sort)
+	# Always say what happened. "Nothing printed" has meant "silently did nothing" twice
+	# here, so the count is the difference between a no-op and a working no-change run.
+	echo "deploy: netdata config ${NETDATA_SEEN} checked, ${NETDATA_DIRTY} updated"
+	if (( NETDATA_SEEN == 0 )); then
+		echo "deploy: no netdata config found under netdata/conf - refusing to call that fine" >&2
+		exit 1
+	fi
+	if (( NETDATA_DIRTY > 0 )); then
+		docker compose -f "$COMPOSE" restart netdata
+	fi
 fi
 
 # Keep the last few tagged images for rollback; drop older ones. Best-effort.
@@ -126,4 +161,5 @@ docker images "${IMAGE_REPO}" --format '{{.ID}} {{.Tag}}' \
 	| awk '$2 != "latest"' | tail -n +$((KEEP_IMAGES + 1)) | awk '{print $1}' \
 	| xargs -r docker rmi -f >/dev/null 2>&1 || true
 
+notify 3066993 "Deployed on ${BOX}" "rovertools-api:${SHA}"
 echo "deploy: done ${IMAGE}"
