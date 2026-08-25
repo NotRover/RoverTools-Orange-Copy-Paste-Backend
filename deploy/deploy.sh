@@ -128,17 +128,32 @@ fi
 # comes from ALERT_DISCORD_WEBHOOK in .env via the container's environment.
 # Restart only when something actually changed - netdata does not re-read on its own.
 if [[ -n "$(docker compose -f "$COMPOSE" ps -q netdata)" ]]; then
-	while IFS= read -r CFG; do
+	NETDATA_SEEN=0; NETDATA_DIRTY=0
+	# fd 3, not stdin. `docker compose exec` reads stdin even with -T, so a loop fed
+	# through stdin has its remaining filenames eaten by the first exec - the loop then
+	# ends after one iteration, prints nothing and exits 0. That is what shipped the
+	# netdata.conf trim as a no-op (section 15). The inner commands get /dev/null too.
+	while IFS= read -r CFG <&3; do
+		NETDATA_SEEN=$((NETDATA_SEEN + 1))
 		DEST="/etc/netdata/${CFG#netdata/conf/}"
-		HAVE="$(docker compose -f "$COMPOSE" exec -T netdata cat "$DEST" 2>/dev/null || true)"
+		HAVE="$(docker compose -f "$COMPOSE" exec -T netdata cat "$DEST" </dev/null 2>/dev/null || true)"
 		if [[ "$HAVE" != "$(cat "$CFG")" ]]; then
 			echo "deploy: installing ${DEST}"
-			docker compose -f "$COMPOSE" exec -T netdata mkdir -p "$(dirname "$DEST")"
-			docker compose -f "$COMPOSE" cp "$CFG" "netdata:${DEST}"
-			NETDATA_DIRTY=1
+			docker compose -f "$COMPOSE" exec -T netdata mkdir -p "$(dirname "$DEST")" </dev/null
+			docker compose -f "$COMPOSE" cp "$CFG" "netdata:${DEST}" </dev/null
+			NETDATA_DIRTY=$((NETDATA_DIRTY + 1))
 		fi
-	done < <(find netdata/conf -type f -name '*.conf' | sort)
-	[[ -n "${NETDATA_DIRTY:-}" ]] && docker compose -f "$COMPOSE" restart netdata
+	done 3< <(find netdata/conf -type f -name "*.conf" | sort)
+	# Always say what happened. "Nothing printed" has meant "silently did nothing" twice
+	# here, so the count is the difference between a no-op and a working no-change run.
+	echo "deploy: netdata config ${NETDATA_SEEN} checked, ${NETDATA_DIRTY} updated"
+	if (( NETDATA_SEEN == 0 )); then
+		echo "deploy: no netdata config found under netdata/conf - refusing to call that fine" >&2
+		exit 1
+	fi
+	if (( NETDATA_DIRTY > 0 )); then
+		docker compose -f "$COMPOSE" restart netdata
+	fi
 fi
 
 # Keep the last few tagged images for rollback; drop older ones. Best-effort.

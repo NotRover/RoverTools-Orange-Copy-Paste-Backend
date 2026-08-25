@@ -1062,9 +1062,12 @@ Postgres or Redis.
 **The dashboard is trimmed, on purpose.** Netdata's defaults collect everything a machine
 *could* have, which on a small VPS means the handful of charts that matter are buried under
 hardware we do not own and kernel counters nobody will act on. `netdata/conf/netdata.conf`
-switches those off. The single biggest cut is `enable systemd services = no` under
-`[plugin:cgroups]`: that plugin builds a full chart family **per systemd unit**, about 1900
-charts on this box. Docker containers keep theirs.
+switches those off. The single biggest cut is the **per-systemd-unit charts** - about 1900 of
+them on this box. They come from the go.d `systemdunits` collector, which charts every unit
+it can see, so the trim is an include list in `netdata/conf/go.d/systemdunits.conf` naming
+the handful worth alarming on. Not the cgroups plugin: it already skips `*.service` cgroups
+by default, and Netdata v2 removed the `enable systemd services` switch that older guides
+still tell you to set.
 
 The second is `netdata monitoring = no`: the agent's charts about *itself* - dbengine
 compression ratio, database pages, worker thread timings, query latency. That is the whole
@@ -1537,6 +1540,18 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   turns those off and ships from git like the rest. Note that unrecognised keys are ignored
   silently, so this is a change that must be verified by counting charts, not by reading the
   file - the same rule that produced the two entries above it.
+- **2026-08-25 - the config installer ate its own worklist.** The netdata trim above shipped,
+  deployed cleanly, printed nothing, exited 0 - and installed neither file. The loop was
+  `while read CFG; do ... done < <(find ...)`, so the worklist arrived on **stdin**, and
+  `docker compose exec` reads stdin even with `-T`. The first iteration's `cat` drained the
+  remaining filenames; the loop ended after one file. Sorted first was `go.d/httpcheck.conf`,
+  already installed and byte-identical, so the one iteration that ran printed nothing either.
+  `set -e` does not catch it: the loop succeeded, and the dirty-flag line after it is exempt
+  as the non-final command of an `&&` list. Fixed by feeding the loop on **fd 3** and giving
+  every inner command `</dev/null`. The lesson is the one this section keeps repeating in a
+  new costume - **so the installer now always prints `N checked, M updated`, and exits
+  non-zero if it finds nothing to check.** Silence had been indistinguishable from a healthy
+  no-change run three times; it no longer is.
 
 ---
 
