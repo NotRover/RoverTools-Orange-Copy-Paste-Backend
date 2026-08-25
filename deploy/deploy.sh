@@ -24,11 +24,20 @@ FORCE="${1:-}"
 : "${GIT_SSH_COMMAND:=ssh -i $HOME/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new}"
 export GIT_SSH_COMMAND
 
-# One deploy at a time — a build can outlast the poll interval.
-exec 9>/tmp/rovertools-deploy.lock
-flock -n 9 || { echo "deploy: another run in progress, skipping"; exit 0; }
+# One deploy at a time — a build can outlast the poll interval. Testing fd 9 rather
+# than assuming: an open fd survives exec, so after the re-exec below this process
+# already holds the lock and must not release and re-race for it. If it somehow did
+# not survive, this re-acquires instead of running unlocked.
+if [[ ! -e /proc/self/fd/9 ]]; then
+	exec 9>/tmp/rovertools-deploy.lock
+	flock -n 9 || { echo "deploy: another run in progress, skipping"; exit 0; }
+fi
 
 cd "$APP_DIR"
+
+# Our own fingerprint, taken before the pull can replace the file underneath us.
+SELF="$APP_DIR/deploy/deploy.sh"
+SELF_HASH="$(sha256sum "$SELF" | cut -d' ' -f1)"
 
 # No heartbeat ping here any more: Uptime Kuma is gone (section 15). A failing run
 # exits non-zero, systemd marks rovertools-deploy.service failed, and Netdata's
@@ -46,6 +55,18 @@ fi
 
 echo "deploy: ${LOCAL:0:12} -> ${REMOTE:0:12}"
 git reset --hard --quiet origin/main
+
+# Bash reads this script from the handle it opened at startup, so the copy executing
+# right now is the PRE-pull one. Without this, a change to deploy.sh takes effect only
+# on the NEXT poll - and worse, a step added here does nothing on the very deploy that
+# introduced it, silently. That cost three debugging rounds; see section 15.
+# --force because the reset already moved HEAD, so a fresh run would find no diff and
+# quietly no-op. DEPLOY_REEXEC guards against looping if the hash somehow keeps moving.
+if [[ -z "${DEPLOY_REEXEC:-}" && "$SELF_HASH" != "$(sha256sum "$SELF" | cut -d' ' -f1)" ]]; then
+	echo "deploy: deploy.sh changed, re-running the updated script"
+	export DEPLOY_REEXEC=1
+	exec bash "$SELF" --force
+fi
 
 SHA="$(git rev-parse --short HEAD)"
 export IMAGE="${IMAGE_REPO}:${SHA}"
@@ -78,22 +99,25 @@ if [[ -n "$(docker compose -f "$COMPOSE" ps -q caddy)" ]]; then
 	docker compose -f "$COMPOSE" exec -T caddy caddy reload --config /etc/caddy/Caddyfile
 fi
 
-# Ship Netdata collector config. It cannot be bind-mounted: the entrypoint copies
-# stock config into /etc/netdata on every start, and a read-only mount under that
-# path makes the cp fail and the container crash-loop (section 15). So the file
-# lives in git and the deploy installs it into the netdataconfig volume, which
-# keeps it shipped-by-the-deploy rather than something you remember to copy.
-# Restart only when it actually changed - go.d does not re-read on its own.
+# Ship Netdata config from the repo. It cannot be bind-mounted: the entrypoint
+# copies stock config into /etc/netdata on every start, and a read-only mount under
+# that path makes the cp fail and the container crash-loop (section 15). So the
+# files live in git under netdata/conf/ (mirroring /etc/netdata/) and the deploy
+# installs them, which keeps the whole monitoring setup reproducible from the repo
+# rather than retyped into a volume by hand. Secrets stay out: the Discord webhook
+# comes from ALERT_DISCORD_WEBHOOK in .env via the container's environment.
+# Restart only when something actually changed - netdata does not re-read on its own.
 if [[ -n "$(docker compose -f "$COMPOSE" ps -q netdata)" ]]; then
-	for CFG in netdata/go.d/*.conf; do
-		DEST="/etc/netdata/go.d/$(basename "$CFG")"
+	while IFS= read -r CFG; do
+		DEST="/etc/netdata/${CFG#netdata/conf/}"
 		HAVE="$(docker compose -f "$COMPOSE" exec -T netdata cat "$DEST" 2>/dev/null || true)"
 		if [[ "$HAVE" != "$(cat "$CFG")" ]]; then
 			echo "deploy: installing ${DEST}"
+			docker compose -f "$COMPOSE" exec -T netdata mkdir -p "$(dirname "$DEST")"
 			docker compose -f "$COMPOSE" cp "$CFG" "netdata:${DEST}"
 			NETDATA_DIRTY=1
 		fi
-	done
+	done < <(find netdata/conf -type f -name '*.conf' | sort)
 	[[ -n "${NETDATA_DIRTY:-}" ]] && docker compose -f "$COMPOSE" restart netdata
 fi
 
