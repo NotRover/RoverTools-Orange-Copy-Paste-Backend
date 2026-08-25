@@ -1090,11 +1090,19 @@ five services, and the two API health checks. Unit state is
 narrowed to the units worth alarming on in `netdata/conf/go.d/systemdunits.conf` rather than
 all of them.
 
-The agent does not fail on a key it does not recognise, but it does **say so** - the config
-it serves back at `/netdata.conf` marks an unknown key `found in the config file, but is not
-used`, and annotates a renamed one with `migrated from`. That is the only reliable way to
-tell a working setting from a typo, because a wrong key simply leaves the noise in place.
-Check both the count and the served config:
+The agent does not fail on a key it does not recognise, but it usually **says so** - the
+config it serves back at `/netdata.conf` marks an unknown key `found in the config file, but
+is not used`, and annotates a renamed one with `migrated from`. **`[plugins]` is the
+exception, and it is a trap:** that section takes an arbitrary plugin name as a key, so a
+misspelled plugin is accepted in silence and simply does nothing. Never write a plugin name
+from memory - read it off the `plugin=` field of the charts you want gone:
+
+```bash
+cd ~/app
+docker compose -f docker-compose.prod.yml exec -T netdata   curl -s 'localhost:19999/api/v1/charts' | python3 -c "import json,sys; d=json.load(sys.stdin)['charts']; s={}; [s.__setitem__((c.get('plugin'),c.get('module')), s.get((c.get('plugin'),c.get('module')),0)+1) for c in d.values()]; [print('%4d  %-22s %s' % (n,p,m)) for (p,m),n in sorted(s.items(), key=lambda x:-x[1])]"
+```
+
+Then check both the count and the served config:
 
 ```bash
 cd ~/app
