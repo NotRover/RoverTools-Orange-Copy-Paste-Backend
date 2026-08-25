@@ -53,7 +53,7 @@ forever; if that ever happens, rotate it, do not edit it out.
 | IPv6 | `2001:db8::1` |
 | Domain | `rovertools-temp.ctx.cl` (FreeDNS, temporary/shared) -> `203.0.113.10` |
 | OS | Ubuntu 26.04 LTS (resolute) |
-| Size | 2 vCPU - 3.7 GiB RAM - 38 GB disk |
+| Size | 2 vCPU - 3.7 GiB RAM - 38 GB disk, plus a 2 GB swap file (section 5.9) |
 | Timezone | UTC |
 | Admin user | `ubuntu` (passwordless `sudo`) |
 | `root` | locked — no root login by any path, including the console |
@@ -486,6 +486,43 @@ sudo usermod -aG adm,systemd-journal ubuntu
 Until you re-login, prefix reads with `sudo`. `sudo journalctl -t rovertools-api` always works.
 
 ---
+
+### 5.9 Swap file
+
+The VPS ships with **no swap at all** (`free -h` shows `Swap: 0B`). That is not a memory
+problem - this box idles around 940 MB used of 3.7 GB with 2.8 GB available, and all five
+containers together are under 300 MB - it is a *runway* problem. With no swap the kernel goes
+straight from "fine" to the OOM killer choosing a victim, and the fattest target on this box
+is the API container. 2 GB of swap on a 38 GB disk turns "the API is terminated mid-request"
+into "things get briefly slow".
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+swapon --show && free -h
+```
+
+Make it survive a reboot. **`nofail` matters**: without it, a missing or corrupt swap file can
+hold up boot, and this box has no console-free way back in if it does not come up (section 3):
+
+```bash
+echo '/swapfile none swap sw,nofail 0 0' | sudo tee -a /etc/fstab
+sudo findmnt --verify --verbose | tail -5   # sanity-check fstab BEFORE trusting a reboot
+```
+
+Then tell the kernel to treat swap as an emergency reserve rather than something to use
+eagerly - the default of 60 will swap out idle pages while RAM is free, which on a box with a
+latency-sensitive API is the wrong trade:
+
+```bash
+echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-swappiness.conf
+sudo sysctl --system | grep -i swappiness
+```
+
+Swap in use is a **signal, not a solution**. If Netdata starts showing swap consistently
+occupied, something is genuinely growing and the answer is to find it, not to add more swap.
 
 Redis is **not** installed on the host — it ships as a compose service (section 9). At this
 point the box is hardened and deploy-ready; the application stack (Docker Compose + Caddy +
