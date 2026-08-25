@@ -24,11 +24,20 @@ FORCE="${1:-}"
 : "${GIT_SSH_COMMAND:=ssh -i $HOME/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new}"
 export GIT_SSH_COMMAND
 
-# One deploy at a time — a build can outlast the poll interval.
-exec 9>/tmp/rovertools-deploy.lock
-flock -n 9 || { echo "deploy: another run in progress, skipping"; exit 0; }
+# One deploy at a time — a build can outlast the poll interval. Testing fd 9 rather
+# than assuming: an open fd survives exec, so after the re-exec below this process
+# already holds the lock and must not release and re-race for it. If it somehow did
+# not survive, this re-acquires instead of running unlocked.
+if [[ ! -e /proc/self/fd/9 ]]; then
+	exec 9>/tmp/rovertools-deploy.lock
+	flock -n 9 || { echo "deploy: another run in progress, skipping"; exit 0; }
+fi
 
 cd "$APP_DIR"
+
+# Our own fingerprint, taken before the pull can replace the file underneath us.
+SELF="$APP_DIR/deploy/deploy.sh"
+SELF_HASH="$(sha256sum "$SELF" | cut -d' ' -f1)"
 
 # No heartbeat ping here any more: Uptime Kuma is gone (section 15). A failing run
 # exits non-zero, systemd marks rovertools-deploy.service failed, and Netdata's
@@ -46,6 +55,18 @@ fi
 
 echo "deploy: ${LOCAL:0:12} -> ${REMOTE:0:12}"
 git reset --hard --quiet origin/main
+
+# Bash reads this script from the handle it opened at startup, so the copy executing
+# right now is the PRE-pull one. Without this, a change to deploy.sh takes effect only
+# on the NEXT poll - and worse, a step added here does nothing on the very deploy that
+# introduced it, silently. That cost three debugging rounds; see section 15.
+# --force because the reset already moved HEAD, so a fresh run would find no diff and
+# quietly no-op. DEPLOY_REEXEC guards against looping if the hash somehow keeps moving.
+if [[ -z "${DEPLOY_REEXEC:-}" && "$SELF_HASH" != "$(sha256sum "$SELF" | cut -d' ' -f1)" ]]; then
+	echo "deploy: deploy.sh changed, re-running the updated script"
+	export DEPLOY_REEXEC=1
+	exec bash "$SELF" --force
+fi
 
 SHA="$(git rev-parse --short HEAD)"
 export IMAGE="${IMAGE_REPO}:${SHA}"

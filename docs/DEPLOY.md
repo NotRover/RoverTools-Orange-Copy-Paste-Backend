@@ -825,6 +825,9 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   container's IP instead of caching the dead one. No retry directives — see "What zero
   downtime means here" for why they do not help with a single container.
 - **`deploy/deploy.sh`** — the poll+build+deploy script (run from the checkout by the timer).
+  It **re-execs itself** when the pull changed it: bash reads a script from the handle it
+  opened at startup, so without that, a change to this file lands only on the next poll -
+  and a step added here does nothing on the deploy that introduced it (section 15).
   After `up -d` it also **validates and reloads Caddy**, because `up -d` does not recreate a
   container whose only change is its mounted config. It runs `caddy validate` then `reload`
   after `up -d`, because a Caddyfile change ships as a config edit that recreates nothing.
@@ -1440,6 +1443,17 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   `ALERT_DISCORD_WEBHOOK` from `.env` - named that way because the stock config assigns
   `DISCORD_WEBHOOK_URL=""` before ours is sourced and would otherwise shadow it. A rebuilt box
   now arrives already watching itself, needing only two values in `.env`.
+- **2026-08-25 - the deploy script was always one run behind itself.** Bash reads a script
+  from the file handle it opened at startup, and `git reset --hard` replaces `deploy.sh` with
+  a new inode, so the running copy is always the pre-pull one. Any change to the deploy
+  itself took effect on the *next* poll. That is mildly confusing on its own and actively
+  dangerous combined with a step that no-ops silently: when the collector-config loop moved
+  from `netdata/go.d/*.conf` to `netdata/conf/`, the old loop globbed a path that no longer
+  existed, compared empty against empty, found nothing to do and printed nothing - so the
+  deploy that shipped the notification config installed none of it, twice, and looked
+  successful both times. `deploy.sh` now hashes itself before the pull and re-execs the new
+  copy with `--force` when it changed, guarded by `DEPLOY_REEXEC` against looping. The lock
+  is kept across the exec by testing `/proc/self/fd/9` rather than assuming.
 
 ---
 
