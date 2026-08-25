@@ -959,7 +959,15 @@ docker compose -f docker-compose.prod.yml exec caddy printenv METRICS_AUTH_HASH
 ```
 
 That must print the whole `$2a$14$...` string with single `$`. If it prints nothing, the
-escaping is wrong. Caddy also **refuses to start** if `METRICS_AUTH_HASH` is unset entirely,
+escaping is wrong. Then prove it end to end - **both** lines, because a 401 on its own is
+also what a blank hash produces:
+
+```bash
+curl -s -o /dev/null -w 'no-auth %{http_code} (expect 401)
+' https://rovertools-status.ctx.cl
+curl -s -o /dev/null -u admin -w 'with-auth %{http_code} (expect 200)
+' https://rovertools-status.ctx.cl
+``` Caddy also **refuses to start** if `METRICS_AUTH_HASH` is unset entirely,
 which is deliberate: a missing password should be a site that does not come up, not a site
 that comes up unprotected.
 
