@@ -79,6 +79,10 @@ services:
     environment:
       - DOCKER_HOST=dockerproxy:2375
       - DISABLE_TELEMETRY=1         # no anonymous stats; Netdata Cloud stays unclaimed
+      # Discord alarm webhook, read by netdata/conf/health_alarm_notify.conf. Named
+      # ALERT_ rather than DISCORD_WEBHOOK_URL on purpose: the stock notify config
+      # assigns DISCORD_WEBHOOK_URL="" before ours is sourced, which would shadow it.
+      - ALERT_DISCORD_WEBHOOK=${ALERT_DISCORD_WEBHOOK:-}
     volumes:
       - netdataconfig:/etc/netdata
       - netdatalib:/var/lib/netdata

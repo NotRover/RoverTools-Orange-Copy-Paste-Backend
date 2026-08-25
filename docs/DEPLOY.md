@@ -265,6 +265,33 @@ section 4; this section is the doing.
 **The golden rule applies to every SSH/firewall step:** keep the working session open, and
 prove the change in a brand-new session before closing it (section 3).
 
+**The whole path, in order.** Everything below plus the stack sections, so a rebuild is one
+list rather than a hunt. Nothing here is optional except where marked:
+
+| # | Step | Section |
+|---|---|---|
+| 1 | First access from the OVH panel | 5.0 |
+| 2 | Install and **prove** your SSH key, before any lockdown | 5.1 |
+| 3 | SSH lockdown: key-only, no root, named users | 5.2 |
+| 4 | Patch, then firewall (deny by default) | 5.3 |
+| 5 | Brute-force protection + unattended upgrades | 5.4 |
+| 6 | Docker, and the user that runs the deploy | 5.5 |
+| 7 | Read-only deploy key for the repo | 5.6 |
+| 8 | DNS: both hostnames, before first deploy | 5.7 |
+| 9 | Persistent, capped journal for container logs | 5.8 |
+| 10 | Swap file (2 GB, `nofail`, swappiness 10) | 5.9 |
+| 11 | Supabase and R2 (external, unchanged by a rebuild) | 7 |
+| 12 | `.env` on the box, mode 600 | 9, Secrets |
+| 13 | Clone, systemd deploy timer, first deploy | 9 |
+| 14 | Apply migrations deliberately - the deploy never does | 8 |
+| 15 | Verify: TLS, healthz body, `via: 1.1 Caddy` | 10 |
+| 16 | Metrics auth hash + Discord webhook into `.env` | 12 |
+| 17 | Point the desktop app at it | 11 |
+
+Steps 1-10 build the box; 11-17 put the backend on it. The monitoring stack needs no manual
+setup beyond step 16: Netdata's collector and notification config live in `netdata/conf/` in
+the repo and the deploy installs them, so a rebuilt box arrives already watching itself.
+
 ### 5.0 First access (OVH)
 
 Provision VPS-1 with Ubuntu 26.04. OVH creates the `ubuntu` account with **passwordless
@@ -804,7 +831,8 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   It no longer pings anything: a failed run exits non-zero, systemd marks the unit failed,
   and Netdata alarms on that (section 12).
 - **`deploy/rovertools-deploy.{service,timer}`** — the systemd units that poll ~every 90s.
-- **`netdata/go.d/*.conf`** — Netdata collector config. Installed into the `netdataconfig`
+- **`netdata/conf/**`** — Netdata config, mirroring `/etc/netdata/`: collector jobs in
+  `go.d/`, notifications in `health_alarm_notify.conf`. Installed into the `netdataconfig`
   volume by `deploy.sh`, not bind-mounted (section 12), so it ships from git regardless.
 
 **Why the Redis flags** (`--save "" --appendonly no --requirepass --maxmemory 256mb
@@ -1035,19 +1063,48 @@ non-zero, systemd marks `rovertools-deploy.service` **failed**, and Netdata's sy
 collector alarms on the failed state. Same guarantee, no bespoke heartbeat, and it covers
 every unit on the box rather than just this one.
 
-**Notifications: do not use email.** OVH filters outbound SMTP (the same reason the app sends
-through Brevo's HTTPS API, section 13), so any mail-based alert will silently fail to deliver.
-Netdata's notifications live in `health_alarm_notify.conf` inside the `netdataconfig` volume;
-edit it in place and use an HTTPS method - Discord, Telegram, ntfy, Slack:
+**Notifications.** Alarms reach Discord through a **custom sender** defined in
+`netdata/conf/health_alarm_notify.conf` in the repo. Two decisions worth knowing:
+
+- **Not email.** OVH filters outbound SMTP (the same reason the app sends through Brevo's
+  HTTPS API, section 13), so `SEND_EMAIL="NO"`. Any mail-based alert fails silently.
+- **Not the stock Discord sender.** It works, but its message is a wall of italic prose.
+  `SEND_DISCORD="NO"` and `SEND_CUSTOM="YES"` instead; the custom sender posts a colour-coded
+  embed - red critical, amber warning, green recovered - with the value, chart and previous
+  state as separate fields. Severity is carried by the embed colour, so the text stays plain
+  ASCII and reads on a phone. Only one of the two senders may be enabled, or every alarm
+  arrives twice.
+
+The config is a **minimal override**: `alarm-notify.sh` sources the stock file first and this
+one second, so anything not named here keeps its stock behaviour.
+
+**The webhook is the only part not in git.** Create it in Discord (Server Settings ->
+Integrations -> Webhooks -> pick a channel -> Copy Webhook URL), then:
 
 ```bash
 cd ~/app
-docker compose -f docker-compose.prod.yml exec netdata   ./edit-config health_alarm_notify.conf
-docker compose -f docker-compose.prod.yml restart netdata
+echo 'ALERT_DISCORD_WEBHOOK=<paste the webhook URL>' >> .env
+./deploy/deploy.sh --force
 ```
 
-Send yourself a test alarm before trusting it. **Until a notifier is configured, Netdata is a
-dashboard you have to remember to open, not an alarm.**
+It is passed to the container by `docker-compose.prod.yml` and read by the sender. The name
+matters: the stock notify config assigns `DISCORD_WEBHOOK_URL=""` before ours is sourced, so
+reusing that name would shadow the value with an empty string.
+
+**Test it, do not assume it.** Netdata ships a test path that fires all three states:
+
+```bash
+cd ~/app
+docker compose -f docker-compose.prod.yml exec -T netdata   bash -c '/usr/libexec/netdata/plugins.d/alarm-notify.sh test'
+```
+
+Three messages should arrive - warning, critical, recovered. If none do, that command says
+why; read it rather than inferring success from silence.
+
+**Rotate the webhook if it has been pasted anywhere shared.** Anyone holding the URL can post
+into that channel. Regenerating is one click in Discord, then replace the line in `.env` and
+re-run the deploy. The blast radius is spam in one channel, not access to the box - but it is
+free to fix.
 
 **What this still cannot tell you.** Netdata runs on the box it watches, so if the VPS is down
 or off the network, the dashboard is down with it and no alert is sent. A **free external
@@ -1251,8 +1308,6 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 - Retire the old push-deploy `deploy` user if the box still carries it: `sudo userdel -r
   deploy`, drop `deploy` from `AllowUsers`, `sudo rm -rf /opt/rovertools`.
 - Move off the temp FreeDNS name to a permanent domain when ready (Caddyfile + `PUBLIC_BASE_URL`).
-- **Configure a Netdata notifier** (`health_alarm_notify.conf`, an HTTPS method - section 12).
-  Until then every alarm is something you have to go and look at.
 - **Add a free external uptime check** on the public healthz with a `"status":"ok"` keyword
   match. Nothing on the box can report the box being down.
 
@@ -1374,6 +1429,17 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   for nothing. The real finding was `Swap: 0B` - no runway between healthy and the OOM killer
   picking the API container. Added a 2 GB swap file with `vm.swappiness=10` (section 5.9).
   Read the numbers, not the bar.
+- **2026-08-25 - notifications made readable, and reproducible.** The stock Discord sender
+  worked but wrote a paragraph of italic prose per alarm. Replaced with a custom sender
+  (`SEND_DISCORD="NO"`, `SEND_CUSTOM="YES"`) posting a colour-coded embed: value, chart and
+  previous state as fields, severity carried by the embed colour so the text stays plain
+  ASCII. The bigger problem was that `health_alarm_notify.conf` lived only in the
+  `netdataconfig` volume - typed in by hand, and gone the moment the box is rebuilt. Netdata
+  config now lives in `netdata/conf/` in the repo, mirroring `/etc/netdata/`, and `deploy.sh`
+  installs the whole tree rather than just `go.d`. The webhook stays out of git, arriving as
+  `ALERT_DISCORD_WEBHOOK` from `.env` - named that way because the stock config assigns
+  `DISCORD_WEBHOOK_URL=""` before ours is sourced and would otherwise shadow it. A rebuilt box
+  now arrives already watching itself, needing only two values in `.env`.
 
 ---
 

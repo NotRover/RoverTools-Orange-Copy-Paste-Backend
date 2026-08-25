@@ -6,4 +6,5 @@ caddy/Caddyfile   text eol=lf
 docker-compose*.yml text eol=lf
 deploy/rovertools-deploy.service text eol=lf
 deploy/rovertools-deploy.timer   text eol=lf
-netdata/go.d/*.conf text eol=lf
+netdata/conf/**/*.conf   text eol=lf
+netdata/conf/*.conf      text eol=lf
