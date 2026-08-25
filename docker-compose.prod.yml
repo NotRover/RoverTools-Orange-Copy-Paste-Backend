@@ -57,6 +57,11 @@ services:
   # because the agent dashboard has no authentication of its own and exposes
   # processes, listening ports and container internals.
   #
+  # Collector config is NOT bind-mounted: the entrypoint copies stock config into
+  # /etc/netdata on every start, and a read-only mount anywhere under it makes that
+  # cp fail and the container crash-loop. deploy.sh installs netdata/go.d/*.conf into
+  # the netdataconfig volume instead, so the file still ships from git.
+  #
   # The host mounts are what make it a metrics agent rather than a health checker;
   # there is no subset of them that still yields CPU, memory and disk. They are
   # read-only, and the container gets no route to the Docker socket - container
@@ -78,7 +83,6 @@ services:
       - netdataconfig:/etc/netdata
       - netdatalib:/var/lib/netdata
       - netdatacache:/var/cache/netdata
-      - ./netdata/go.d:/etc/netdata/go.d:ro   # our collector config; a DIRECTORY, see section 13
       - /:/host/root:ro,rslave
       - /etc/passwd:/host/etc/passwd:ro
       - /etc/group:/host/etc/group:ro

@@ -767,6 +767,8 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   It no longer pings anything: a failed run exits non-zero, systemd marks the unit failed,
   and Netdata alarms on that (section 12).
 - **`deploy/rovertools-deploy.{service,timer}`** — the systemd units that poll ~every 90s.
+- **`netdata/go.d/*.conf`** — Netdata collector config. Installed into the `netdataconfig`
+  volume by `deploy.sh`, not bind-mounted (section 12), so it ships from git regardless.
 
 **Why the Redis flags** (`--save "" --appendonly no --requirepass --maxmemory 256mb
 --maxmemory-policy volatile-ttl`): it holds only pub/sub + presence, so persistence off (an
@@ -967,6 +969,12 @@ that comes up unprotected.
 |---|---|---|
 | `api_direct` -> `http://api:8000/internal/healthz` | `netdata/go.d/httpcheck.conf` | Matches the **body** for `"status":"ok"` |
 | `api_public` -> `https://rovertools-temp.ctx.cl/internal/healthz` | same | Same match, through Caddy and TLS |
+
+Neither is bind-mounted. Netdata's entrypoint copies stock config into `/etc/netdata` on
+every start, so a read-only mount anywhere under that path makes the copy fail and the
+container crash-loop. `deploy.sh` installs these files into the `netdataconfig` volume
+instead and restarts Netdata only when their content changed - so they ship from git with
+the code, without a step you have to remember.
 
 The body match is the whole point. `/internal/healthz` returns **200 even when degraded** - a
 dead Postgres or Redis shows only in the body (`src/admin/router.py`) - so a status-code check
@@ -1302,6 +1310,15 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   closed, so nothing was exposed - but the only way to tell that state from a working one
   from outside is to try logging in. Every `$` must be doubled in `.env`. Verify with
   `docker compose exec caddy printenv METRICS_AUTH_HASH` rather than inferring it from a 401.
+- **2026-08-25 — Netdata crash-looped on its own config mount.** The collector config was
+  bind-mounted read-only at `/etc/netdata/go.d`, and Netdata's entrypoint copies stock config
+  into `/etc/netdata` on every start: `cp: preserving times for '/etc/netdata/go.d':
+  Read-only file system`, then exit, then restart, forever. Mounting it read-write is worse -
+  Netdata would write dozens of stock files into the git checkout. Netdata's config genuinely
+  lives in a volume, so `deploy.sh` now installs `netdata/go.d/*.conf` into it and restarts
+  the container only when the content changed. The file still ships from git and still
+  arrives by the deploy, which was the point of not bind-mounting a single file in the first
+  place - the constraint moved, the guarantee did not.
 
 ---
 

@@ -78,6 +78,25 @@ if [[ -n "$(docker compose -f "$COMPOSE" ps -q caddy)" ]]; then
 	docker compose -f "$COMPOSE" exec -T caddy caddy reload --config /etc/caddy/Caddyfile
 fi
 
+# Ship Netdata collector config. It cannot be bind-mounted: the entrypoint copies
+# stock config into /etc/netdata on every start, and a read-only mount under that
+# path makes the cp fail and the container crash-loop (section 15). So the file
+# lives in git and the deploy installs it into the netdataconfig volume, which
+# keeps it shipped-by-the-deploy rather than something you remember to copy.
+# Restart only when it actually changed - go.d does not re-read on its own.
+if [[ -n "$(docker compose -f "$COMPOSE" ps -q netdata)" ]]; then
+	for CFG in netdata/go.d/*.conf; do
+		DEST="/etc/netdata/go.d/$(basename "$CFG")"
+		HAVE="$(docker compose -f "$COMPOSE" exec -T netdata cat "$DEST" 2>/dev/null || true)"
+		if [[ "$HAVE" != "$(cat "$CFG")" ]]; then
+			echo "deploy: installing ${DEST}"
+			docker compose -f "$COMPOSE" cp "$CFG" "netdata:${DEST}"
+			NETDATA_DIRTY=1
+		fi
+	done
+	[[ -n "${NETDATA_DIRTY:-}" ]] && docker compose -f "$COMPOSE" restart netdata
+fi
+
 # Keep the last few tagged images for rollback; drop older ones. Best-effort.
 docker images "${IMAGE_REPO}" --format '{{.ID}} {{.Tag}}' \
 	| awk '$2 != "latest"' | tail -n +$((KEEP_IMAGES + 1)) | awk '{print $1}' \
