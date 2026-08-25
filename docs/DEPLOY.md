@@ -1079,15 +1079,22 @@ Network interfaces are filtered to the real uplink, because Docker gives every c
 network a bridge and every container a veth, each of which otherwise becomes a menu entry
 named after a hash; disks drop loopback, ramdisk and device-mapper entries.
 
+The third is `apps = no`. apps.plugin charts every application, user and user group
+separately - 644 + 168 + 154 + 46 charts here, roughly 90% of what survived the other cuts,
+answering nothing the per-container charts do not. Per-process detail is what `htop` and
+`docker stats` are for, and both are already on the box.
+
 What is deliberately kept, because it is the list you would want during an incident: CPU,
 RAM and swap, disk space and IO, network throughput, per-container CPU/memory/IO for all
-five services, per-application resource use, and the two API health checks. Unit state is
+five services, and the two API health checks. Unit state is
 narrowed to the units worth alarming on in `netdata/conf/go.d/systemdunits.conf` rather than
 all of them.
 
-The agent **ignores config keys it does not recognise**, so a mistake here is silent and
-leaves the noise in place rather than breaking anything. Count charts before and after
-instead of trusting the file:
+The agent does not fail on a key it does not recognise, but it does **say so** - the config
+it serves back at `/netdata.conf` marks an unknown key `found in the config file, but is not
+used`, and annotates a renamed one with `migrated from`. That is the only reliable way to
+tell a working setting from a typo, because a wrong key simply leaves the noise in place.
+Check both the count and the served config:
 
 ```bash
 cd ~/app
