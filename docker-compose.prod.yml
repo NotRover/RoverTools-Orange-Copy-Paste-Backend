@@ -23,9 +23,11 @@ services:
       - api
     # Credentials for the metrics site's basic auth. The hash is generated with
     # `docker run --rm -it caddy:2-alpine caddy hash-password` and lives in .env - see
-    # docs/DEPLOY.md section 12. Compose substitutes it verbatim, so a bcrypt
-    # hash's $ characters need no escaping here. The `:?` is deliberate: an unset
-    # hash must fail the deploy loudly, not start Caddy with the metrics site open.
+    # docs/DEPLOY.md section 12. Compose interpolates .env VALUES, so every $ in the
+    # bcrypt hash must be doubled to $$ in .env or it expands to nothing and Caddy
+    # gets a blank hash - which fails closed, refusing you as well as everyone else.
+    # The `:?` is deliberate: an unset hash must fail the deploy loudly, not start
+    # Caddy with the metrics site wide open.
     environment:
       - METRICS_AUTH_USER=${METRICS_AUTH_USER:-admin}
       - METRICS_AUTH_HASH=${METRICS_AUTH_HASH:?set METRICS_AUTH_HASH in .env}

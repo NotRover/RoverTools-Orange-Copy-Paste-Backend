@@ -935,14 +935,30 @@ would be no `caddy` container to exec into. Paste the whole `$2a$...` string:
 ```bash
 cd ~/app
 printf 'METRICS_AUTH_USER=admin
-METRICS_AUTH_HASH=<paste the hash>
+METRICS_AUTH_HASH=<paste the hash, every $ doubled>
 ' >> .env
 ./deploy/deploy.sh --force
 ```
 
-Compose substitutes the value verbatim, so the `$` characters in a bcrypt hash need no
-escaping. Caddy **refuses to start** if `METRICS_AUTH_HASH` is unset, which is deliberate:
-the failure mode of a missing password should be a site that does not come up, not a site
+**Double every `$` in the hash.** Compose interpolates values it reads out of `.env`, so a
+bcrypt hash pasted raw is read as three variable references and arrives **blank**:
+
+```
+METRICS_AUTH_HASH=$2a$14$K3q...      # WRONG - $2a, $14, $K3q... all expand to nothing
+METRICS_AUTH_HASH=$$2a$$14$$K3q...   # right
+```
+
+A blank hash fails closed: Caddy answers 401 to everyone, including you, which looks exactly
+like working auth from the outside. Prove the value arrived instead of assuming it:
+
+```bash
+cd ~/app
+docker compose -f docker-compose.prod.yml exec caddy printenv METRICS_AUTH_HASH
+```
+
+That must print the whole `$2a$14$...` string with single `$`. If it prints nothing, the
+escaping is wrong. Caddy also **refuses to start** if `METRICS_AUTH_HASH` is unset entirely,
+which is deliberate: a missing password should be a site that does not come up, not a site
 that comes up unprotected.
 
 **What it watches beyond the machine.** Two additions to the stock config, both in the repo:
@@ -1279,6 +1295,13 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   dashboard has no login, so Caddy basic auth is now load-bearing rather than a nicety. The
   Docker socket is still not mounted into anything web-facing: container names come from
   `dockerproxy`, allowlisted to `GET /containers`.
+- **2026-08-25 — the metrics password arrived blank.** First deploy of the Netdata site
+  answered 401 to everyone, which reads as working basic auth and is not: Compose interpolates
+  the values it reads out of `.env`, so `METRICS_AUTH_HASH=$2a$14$K3q...` expanded `$2a`,
+  `$14` and `$K3q...` as three unset variables and handed Caddy an empty hash. It failed
+  closed, so nothing was exposed - but the only way to tell that state from a working one
+  from outside is to try logging in. Every `$` must be doubled in `.env`. Verify with
+  `docker compose exec caddy printenv METRICS_AUTH_HASH` rather than inferring it from a 401.
 
 ---
 
