@@ -727,10 +727,10 @@ script), not proxy tuning.
                           WS proxy)  |
                                      \--------> redis  (pub/sub + presence) [in-compose]
                                  \
-                                  \----------> kuma   (status dashboard)    [in-compose]
+                                  \----------> netdata (metrics dashboard)  [in-compose]
 
    rovertools-temp.ctx.cl   -> api
-   rovertools-status.ctx.cl -> kuma
+   rovertools-status.ctx.cl -> netdata (basic auth)
 ```
 
 - **Caddy** — the only container with published ports (80/443). Automatic TLS, proxies
@@ -739,7 +739,9 @@ script), not proxy tuning.
   the compose network). One replica; a deploy recreates it.
 - **redis** — internal network, **no published port**, `requirepass`, persistence off. Not
   recreated on an `api` deploy, so presence is not needlessly flushed.
-- **kuma** — Uptime Kuma, **no** host port, data in the `kuma_data` volume, no Docker socket.
+- **netdata** — metrics agent, **no** host port, behind Caddy basic auth. Reads the host
+  read-only (`/proc`, `/sys`, `/`, `/var/log`) and gets container names from **dockerproxy**,
+  a read-only allowlisted Docker socket proxy that is not web-facing.
   Watches the stack from inside it, which is why an external check still matters (section 12).
 
 ### The files (backend repo)
@@ -760,13 +762,11 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   downtime means here" for why they do not help with a single container.
 - **`deploy/deploy.sh`** — the poll+build+deploy script (run from the checkout by the timer).
   After `up -d` it also **validates and reloads Caddy**, because `up -d` does not recreate a
-  container whose only change is its mounted config, and it **pings the Kuma Push monitor**
-  on success (and `status=down` from an exit trap on failure) so a broken pipeline alerts
-  instead of going quiet. Both exist because both failures already happened - section 15.
+  container whose only change is its mounted config. It runs `caddy validate` then `reload`
+  after `up -d`, because a Caddyfile change ships as a config edit that recreates nothing.
+  It no longer pings anything: a failed run exits non-zero, systemd marks the unit failed,
+  and Netdata alarms on that (section 12).
 - **`deploy/rovertools-deploy.{service,timer}`** — the systemd units that poll ~every 90s.
-- **`deploy/host-health.sh`** + **`deploy/rovertools-health.{service,timer}`** — pushes disk,
-  memory, load and stopped-container state to Kuma every 5 minutes (section 12). Independent
-  of the deploy: it reports whether the *box* is healthy, not whether a deploy ran.
 
 **Why the Redis flags** (`--save "" --appendonly no --requirepass --maxmemory 256mb
 --maxmemory-policy volatile-ttl`): it holds only pub/sub + presence, so persistence off (an
@@ -830,8 +830,8 @@ Never in the image, never in git. They live in `~/app/.env` (`/home/ubuntu/app/.
 - `BREVO_API_KEY`, `EMAIL_FROM` (or the SMTP set).
 - `ADMIN_API_KEY`.
 - `APP_ENV=production`, `DOCS_ENABLED=false`.
-- `KUMA_PUSH_URL` — optional, read by `deploy/deploy.sh` only (never by the app). The deploy
-  heartbeat, section 12. Omit it and the ping is a no-op.
+- `METRICS_AUTH_USER`, `METRICS_AUTH_HASH` — read by **Caddy**, never by the app. Basic auth
+  for the Netdata dashboard (section 12). Caddy refuses to start without the hash, on purpose.
 - **`PUBLIC_BASE_URL=https://rovertools-temp.ctx.cl`** — the base of every user-facing link
   (invites, password-reset redirect). `APP_CORS_ORIGINS` already lists the Tauri client
   origins and does not change.
@@ -911,111 +911,91 @@ has not updated is offline until they do. Make sure `APP_CORS_ORIGINS` includes 
 
 ## 12. Ongoing operations
 
-**Monitoring (Uptime Kuma).** Runs as the `kuma` service in the prod stack, published by Caddy
-at `https://rovertools-status.ctx.cl`, with its data in the `kuma_data` volume. One-time setup:
+**Monitoring (Netdata).** Runs as the `netdata` service in the prod stack, published by Caddy
+at `https://rovertools-status.ctx.cl` behind basic auth, with its metrics database in the
+`netdatalib` volume. It replaced Uptime Kuma, which answered "is it up" and nothing else
+(section 15). Out of the box it charts CPU, memory, disk space and IO, network, pressure
+stall, systemd unit states, and per-container CPU/memory/IO for every service in the stack -
+at one-second resolution, with alarms already defined for the things that matter.
 
-1. **Register the DNS name first** (FreeDNS, an A record for `rovertools-status` at the box's
-   IPv4) — deploying before it resolves leaves Caddy retrying a cert it cannot validate.
-2. Deploy (`deploy/deploy.sh --force`, or wait for the poll), then **open the URL immediately
-   and create the admin account**. Kuma's setup page is unauthenticated until the first user
-   exists, so whoever loads it first claims the instance. Turn on **2FA** in Profile ->
-   Security straight after; this is a public login page.
-3. Add the monitors below.
+**Basic auth is not optional.** The agent dashboard has no login of its own and reports
+processes, listening ports, disk layout and container internals. Published bare, it is a free
+reconnaissance page for the box. Generate the hash on the box and put it in `.env` - nobody
+needs to see the password but you:
 
-**The monitor that matters, and the trap in it.** `/internal/healthz` returns **200 even when
-degraded** — a dead Postgres or Redis shows only in the body (`src/admin/router.py`). A plain
-status-code monitor stays green through a database outage. Use a **keyword** monitor:
+```bash
+docker run --rm -it caddy:2-alpine caddy hash-password
+```
 
-| Monitor | Type | Target | Keyword |
-|---|---|---|---|
-| API (public path) | HTTP(s) - Keyword | `https://rovertools-temp.ctx.cl/internal/healthz` | `"status":"ok"` |
-| API (direct) | HTTP(s) - Keyword | `http://api:8000/internal/healthz` | `"status":"ok"` |
-| Redis | TCP Port | `redis` : `6379` | - |
-| Deploy pipeline | Push | (see below) | - |
-| Host health | Push | (see below) | - |
-
-Both HTTP monitors, because the pair localises a fault: public failing while direct passes
-means Caddy, TLS, or DNS; both failing means the app, Postgres, or Redis. The HTTPS monitor
-also tracks certificate expiry on its own. Kuma sits on the compose network, so `api` and
-`redis` resolve by service name — the direct and TCP checks need no published port. Do not
-add a monitor for Kuma itself: a dashboard cannot report its own absence.
-
-**The deploy heartbeat (Push monitor).** The two checks above watch the *service*. They say
-nothing about the *pipeline*, and a pipeline that stops working is silent by nature: the
-timer runs, the script fails early, the running containers keep serving the old image, and
-everything looks fine until someone notices a merged commit never shipped. That has already
-happened here twice (section 15). `deploy/deploy.sh` closes it by pinging a Kuma **Push**
-monitor at the end of every successful run, including the quiet no-op poll where nothing had
-changed, and pinging `status=down` from an exit trap when the script fails. No ping inside the
-window means the deploy is broken or the timer stopped, and Kuma alerts either way.
-
-Set it up once:
-
-1. In Kuma: **Add New Monitor** -> type **Push** -> name `Deploy pipeline`. Set **Heartbeat
-   Interval** to `300` (the timer polls every ~90s, so 5 minutes tolerates a slow build and a
-   couple of missed pings) and **Retries** to `1`. Copy the push URL it shows.
-2. **Save the monitor.** Kuma shows the push URL on the edit screen before you save, and a
-   token from an unsaved monitor returns 404. Copy the URL after saving; paste it whole -
-   the sample `?status=up&msg=OK&ping=` query it carries is stripped by the script.
-3. On the box, append it to `.env` (mode 600, git-ignored) and re-run the deploy:
+It prompts, so the password never reaches your shell history. This runs a throwaway
+container rather than `exec`-ing into the running one on purpose: `METRICS_AUTH_HASH` is
+required by the compose file, so while it is unset **every** compose command fails - there
+would be no `caddy` container to exec into. Paste the whole `$2a$...` string:
 
 ```bash
 cd ~/app
-echo 'KUMA_PUSH_URL=<paste the push URL>' >> .env
+printf 'METRICS_AUTH_USER=admin
+METRICS_AUTH_HASH=<paste the hash>
+' >> .env
 ./deploy/deploy.sh --force
 ```
 
-The monitor should go green within a poll. `KUMA_PUSH_URL` is **optional** — leave it out and
-`kuma_ping` is a no-op, so the deploy works unchanged on a box without Kuma. It is also the
-one "secret" here that is not one: it grants nothing but the ability to ping a monitor.
+Compose substitutes the value verbatim, so the `$` characters in a bcrypt hash need no
+escaping. Caddy **refuses to start** if `METRICS_AUTH_HASH` is unset, which is deliberate:
+the failure mode of a missing password should be a site that does not come up, not a site
+that comes up unprotected.
 
-**Host health (Push monitor).** Kuma is an uptime monitor, not a metrics agent: it has no view
-of disk, memory, load, or a container that exited, and the container monitors that would give
-it one need the Docker socket — refused for a web-facing service (section 9). `deploy/host-health.sh`
-supplies those facts from outside the container instead. A timer runs it every 5 minutes; it
-pushes `status=down` when a compose service is not running, disk on `/` is at 85% or more, or
-memory is at 92% or more, and `status=up` otherwise. Either way the message carries the
-numbers, so a **green** beat reading `disk 78% mem 41% load 0.2 svc 4/4` is an early warning
-you can read at a glance — which is the point, since disk filling up is the most common way a
-small VPS dies (images, journal, volumes).
+**What it watches beyond the machine.** Two additions to the stock config, both in the repo:
 
-Set it up the same way: **Add New Monitor** -> **Push** -> name `Host health`, Heartbeat
-Interval `330` (a little over the 5-minute timer), Retries `1`, then **save** and copy the URL.
-Install the timer and wire the URL:
+| Check | Where | Why it is not the default |
+|---|---|---|
+| `api_direct` -> `http://api:8000/internal/healthz` | `netdata/go.d/httpcheck.conf` | Matches the **body** for `"status":"ok"` |
+| `api_public` -> `https://rovertools-temp.ctx.cl/internal/healthz` | same | Same match, through Caddy and TLS |
+
+The body match is the whole point. `/internal/healthz` returns **200 even when degraded** - a
+dead Postgres or Redis shows only in the body (`src/admin/router.py`) - so a status-code check
+would stay green straight through a database outage. Two jobs because the pair localises a
+fault: public failing while direct passes means Caddy, TLS or DNS; both failing means the app,
+Postgres or Redis.
+
+**The deploy pipeline monitors itself through systemd.** A pipeline that stops working is
+silent by nature: the timer fires, the script fails early, the old containers keep serving,
+and nothing looks wrong until someone notices a merged commit never shipped. That happened
+twice here (section 15). `deploy.sh` no longer pings anything - instead a failed run exits
+non-zero, systemd marks `rovertools-deploy.service` **failed**, and Netdata's systemd-units
+collector alarms on the failed state. Same guarantee, no bespoke heartbeat, and it covers
+every unit on the box rather than just this one.
+
+**Notifications: do not use email.** OVH filters outbound SMTP (the same reason the app sends
+through Brevo's HTTPS API, section 13), so any mail-based alert will silently fail to deliver.
+Netdata's notifications live in `health_alarm_notify.conf` inside the `netdataconfig` volume;
+edit it in place and use an HTTPS method - Discord, Telegram, ntfy, Slack:
 
 ```bash
 cd ~/app
-echo 'HEALTH_PUSH_URL=<paste the push URL>' >> .env
-sudo cp deploy/rovertools-health.service deploy/rovertools-health.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now rovertools-health.timer
-./deploy/host-health.sh          # run once now, so the monitor goes green immediately
+docker compose -f docker-compose.prod.yml exec netdata   ./edit-config health_alarm_notify.conf
+docker compose -f docker-compose.prod.yml restart netdata
 ```
 
-Read its history with `journalctl -u rovertools-health.service -n 20 --no-pager`. The
-thresholds are constants at the top of the script; raise `DISK_LIMIT` only if you have
-decided the disk is meant to run that full.
+Send yourself a test alarm before trusting it. **Until a notifier is configured, Netdata is a
+dashboard you have to remember to open, not an alarm.**
 
-**What Kuma still will not give you: graphs.** These monitors answer "is it up, and is
-anything close to a limit" — not "what did memory do overnight". If you want time-series
-charts of CPU, RAM, disk and per-container usage, that is a different tool (Beszel is the
-light one; Netdata the thorough one), and both want more of the box than Kuma does. Add one
-only if you find yourself wanting history you do not have.
+**What this still cannot tell you.** Netdata runs on the box it watches, so if the VPS is down
+or off the network, the dashboard is down with it and no alert is sent. A **free external
+check** (UptimeRobot, Better Stack) hitting `https://rovertools-temp.ctx.cl/internal/healthz`
+with a keyword match on `"status":"ok"` is the only thing that catches a whole-box outage. Run
+one alongside this; it is the one piece that cannot live on the box.
 
-**Notifications: do not use email.** OVH filters outbound SMTP (the same reason the app sends
-through Brevo's HTTPS API, section 13), so Kuma's SMTP notifier will silently fail to deliver.
-Use an HTTPS-based notifier — Telegram, Discord, ntfy, Pushover — or Brevo SMTP on port 2525
-if you want mail. Send a test notification and confirm it arrives before trusting it.
+**Retention and footprint.** Netdata's default database tiers keep roughly a day of
+per-second data and months of downsampled history, sized to what the `netdatalib` volume can
+take. On this box (3.7 GiB RAM, 38 GB disk) that is comfortable, but it is the largest thing
+in the stack by memory. If it ever crowds the API, cut retention in `netdata.conf`
+(`docker compose exec netdata ./edit-config netdata.conf`) rather than dropping collectors -
+the charts are the reason it is here.
 
-**What this cannot tell you.** Kuma runs on the box it watches, so if the VPS is down or off
-the network, the dashboard is down with it and no alert is sent. A **free external check**
-(UptimeRobot, Better Stack) hitting the same keyword URL is the only thing that catches a
-whole-box outage; run one alongside this. Kuma covers the common cases — app crashed,
-dependency unreachable, cert expiring, a deploy that broke the service.
-
-**No Docker socket.** Kuma's container monitors need `/var/run/docker.sock`, which is
-root-equivalent access for a web-facing service — the same objection that ruled out
-docker-rollout (section 9). HTTP checks cover the stack; `docker compose ps` covers the rest.
+**Netdata Cloud stays unclaimed.** `DISABLE_TELEMETRY=1` is set and no claim token is
+configured, so the agent talks to nobody. Claiming it would put the box's metrics on someone
+else's dashboard; that is a decision to make deliberately, not to drift into.
 
 **Inspecting logs.** Everything lands in the host's systemd journal, which is persistent and
 survives the container swaps a deploy makes. Two surfaces: the deploy runner and the app
@@ -1202,6 +1182,10 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 - Retire the old push-deploy `deploy` user if the box still carries it: `sudo userdel -r
   deploy`, drop `deploy` from `AllowUsers`, `sudo rm -rf /opt/rovertools`.
 - Move off the temp FreeDNS name to a permanent domain when ready (Caddyfile + `PUBLIC_BASE_URL`).
+- **Configure a Netdata notifier** (`health_alarm_notify.conf`, an HTTPS method - section 12).
+  Until then every alarm is something you have to go and look at.
+- **Add a free external uptime check** on the public healthz with a `"status":"ok"` keyword
+  match. Nothing on the box can report the box being down.
 
 ---
 
@@ -1280,6 +1264,21 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   an exit trap on failure. Silence is now the alarm: no ping in five minutes means the script
   broke or the timer stopped. The heartbeat is what would have caught the `docker rollout`
   bug, which exited 125 and told nobody.
+- **2026-08-25 — Uptime Kuma out, Netdata in.** Kuma answered one question, "is the URL
+  responding", and answering it well still left the box itself invisible: no CPU, no memory,
+  no disk trend, no per-container usage. Machine health had to be bolted on as a shell script
+  pushing numbers into a fake monitor, which is a sign the tool was wrong rather than
+  incomplete. Netdata replaces it and the scaffolding around it: removed the `kuma` service and
+  `kuma_data` volume, `deploy/host-health.sh` and its timer, and the push-heartbeat plumbing in
+  `deploy.sh`. What each of those guaranteed still holds, by a different route - the healthz
+  **body** match moved into `netdata/go.d/httpcheck.conf` (a status-code check would still stay
+  green through a Postgres outage), and the deploy heartbeat became the systemd-units alarm on
+  a failed `rovertools-deploy.service`, which covers every unit rather than one. Two costs,
+  both accepted deliberately: Netdata needs the host read-only (`/proc`, `/sys`, `/`,
+  `/var/log`) plus `SYS_PTRACE`, which is *more* box access than Kuma ever had, and its
+  dashboard has no login, so Caddy basic auth is now load-bearing rather than a nicety. The
+  Docker socket is still not mounted into anything web-facing: container names come from
+  `dockerproxy`, allowlisted to `GET /containers`.
 
 ---
 

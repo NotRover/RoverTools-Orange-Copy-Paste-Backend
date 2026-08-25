@@ -21,6 +21,14 @@ services:
       - caddy_config:/config
     depends_on:
       - api
+    # Credentials for the metrics site's basic auth. The hash is generated with
+    # `docker run --rm -it caddy:2-alpine caddy hash-password` and lives in .env - see
+    # docs/DEPLOY.md section 12. Compose substitutes it verbatim, so a bcrypt
+    # hash's $ characters need no escaping here. The `:?` is deliberate: an unset
+    # hash must fail the deploy loudly, not start Caddy with the metrics site open.
+    environment:
+      - METRICS_AUTH_USER=${METRICS_AUTH_USER:-admin}
+      - METRICS_AUTH_HASH=${METRICS_AUTH_HASH:?set METRICS_AUTH_HASH in .env}
     # Ship logs to the host journal (persistent, survives the rollout that
     # replaces this container, size-capped by journald). Read with
     # `journalctl -t rovertools-caddy`. See docs/DEPLOY.md section 12.
@@ -42,19 +50,63 @@ services:
       options:
         tag: rovertools-api
 
-  # Uptime Kuma — self-hosted status dashboard (docs/DEPLOY.md section 12).
-  # No host port: Caddy publishes it on the status subdomain. The Docker socket is
-  # deliberately NOT mounted — container monitors would need root-equivalent access,
-  # the same objection that ruled out docker-rollout; HTTP checks cover the stack.
-  kuma:
-    image: louislam/uptime-kuma:1
+  # Netdata - metrics for the box and every container (docs/DEPLOY.md section 12).
+  # No host port: Caddy publishes it on the status subdomain behind basic auth,
+  # because the agent dashboard has no authentication of its own and exposes
+  # processes, listening ports and container internals.
+  #
+  # The host mounts are what make it a metrics agent rather than a health checker;
+  # there is no subset of them that still yields CPU, memory and disk. They are
+  # read-only, and the container gets no route to the Docker socket - container
+  # names come from dockerproxy below.
+  netdata:
+    image: netdata/netdata:stable
     restart: unless-stopped
+    hostname: your-vps-hostname          # the name shown in the dashboard
+    pid: host                       # so process charts see the host's processes
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - DOCKER_HOST=dockerproxy:2375
+      - DISABLE_TELEMETRY=1         # no anonymous stats; Netdata Cloud stays unclaimed
     volumes:
-      - kuma_data:/app/data
+      - netdataconfig:/etc/netdata
+      - netdatalib:/var/lib/netdata
+      - netdatacache:/var/cache/netdata
+      - ./netdata/go.d:/etc/netdata/go.d:ro   # our collector config; a DIRECTORY, see section 13
+      - /:/host/root:ro,rslave
+      - /etc/passwd:/host/etc/passwd:ro
+      - /etc/group:/host/etc/group:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - /var/log:/host/var/log:ro
     logging:
       driver: journald
       options:
-        tag: rovertools-kuma
+        tag: rovertools-netdata
+
+  # Read-only Docker socket proxy, so Netdata can label containers by name without
+  # holding the socket itself. CONTAINERS=1 allows GET /containers and nothing else;
+  # POST is refused outright. Not published, not reachable from outside the compose
+  # network - which is the difference between this and mounting the socket into a
+  # web-facing service (section 9).
+  dockerproxy:
+    image: tecnativa/docker-socket-proxy:0.3
+    restart: unless-stopped
+    environment:
+      - CONTAINERS=1
+      - POST=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: journald
+      options:
+        tag: rovertools-dockerproxy
 
   redis:
     image: redis:8-alpine
@@ -80,4 +132,6 @@ services:
 volumes:
   caddy_data:
   caddy_config:
-  kuma_data:      # monitor definitions + history (SQLite); back this up, not the image
+  netdataconfig:  # /etc/netdata - alarm + notification config you edit on the box
+  netdatalib:     # /var/lib/netdata - the metrics database; this is the history
+  netdatacache:   # /var/cache/netdata - rebuildable, safe to drop

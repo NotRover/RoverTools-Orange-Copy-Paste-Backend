@@ -30,29 +30,10 @@ flock -n 9 || { echo "deploy: another run in progress, skipping"; exit 0; }
 
 cd "$APP_DIR"
 
-# Deploy heartbeat -> an Uptime Kuma "Push" monitor. Optional: set KUMA_PUSH_URL in
-# .env to switch it on. This is the dead man's switch for the whole pipeline - a
-# successful run (including a quiet no-op poll) pings, and a failure or a timer that
-# stopped running pings nothing, so Kuma alerts. A deploy that breaks silently and is
-# only noticed by hand is the failure mode this exists to catch.
-# tr strips surrounding quotes and a stray CR, so a hand-edited .env still parses.
-# The %%?* strips any query string: Kuma shows its push URL with a sample
-# ?status=up&msg=OK&ping= attached, and curl -G would then append a SECOND status=,
-# which Kuma parses as an array - so a down ping would never read as down.
-KUMA_PUSH_URL="$(sed -n 's/^KUMA_PUSH_URL=//p' .env 2>/dev/null | tail -n1 | tr -d '\r\"')"
-KUMA_PUSH_URL="${KUMA_PUSH_URL%%\?*}"
-
-kuma_ping() {  # kuma_ping <up|down> [message]
-	[[ -n "${KUMA_PUSH_URL:-}" ]] || return 0
-	curl -fsS -m 10 -o /dev/null -G "$KUMA_PUSH_URL" \
-		--data-urlencode "status=$1" --data-urlencode "msg=${2:-OK}" \
-		|| echo "deploy: heartbeat ping failed (non-fatal)"
-}
-
-# Any non-zero exit from here on reports itself, rather than dying quietly in a log
-# nobody reads.
-trap 'rc=$?; (( rc != 0 )) && kuma_ping down "deploy failed, exit $rc"; exit $rc' EXIT
-
+# No heartbeat ping here any more: Uptime Kuma is gone (section 15). A failing run
+# exits non-zero, systemd marks rovertools-deploy.service failed, and Netdata's
+# systemd-units collector alarms on that - so the pipeline still announces itself
+# without this script knowing anything about the monitoring stack.
 git fetch --quiet origin main
 LOCAL="$(git rev-parse HEAD)"
 REMOTE="$(git rev-parse origin/main)"
@@ -60,7 +41,6 @@ RUNNING="$(docker compose -f "$COMPOSE" ps -q api || true)"
 
 # The common poll result: nothing new and the stack is up. Quiet no-op.
 if [[ "$LOCAL" == "$REMOTE" && -n "$RUNNING" && "$FORCE" != "--force" ]]; then
-	kuma_ping up "no change ${LOCAL:0:7}"
 	exit 0
 fi
 
@@ -103,5 +83,4 @@ docker images "${IMAGE_REPO}" --format '{{.ID}} {{.Tag}}' \
 	| awk '$2 != "latest"' | tail -n +$((KEEP_IMAGES + 1)) | awk '{print $1}' \
 	| xargs -r docker rmi -f >/dev/null 2>&1 || true
 
-kuma_ping up "deployed ${SHA}"
 echo "deploy: done ${IMAGE}"
