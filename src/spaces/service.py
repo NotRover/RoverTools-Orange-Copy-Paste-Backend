@@ -487,7 +487,7 @@ async def record_space_removals(
 async def remove_entry_from_space(
     db: AsyncSession, space_id: uuid.UUID, client_id: str, entry_type: str, user_id: str
 ) -> str:
-    """Take a shared entry down from a space. Returns the author's id.
+    """Take a shared entry down from a space. Returns the recorded author id.
 
     Two callers, one effect. The space owner may take down anything in the space
     (moderation); any member may take down what they themselves shared
@@ -501,6 +501,10 @@ async def remove_entry_from_space(
     Pull's space arm matches on `space_ids` overlap, so a row that just lost the
     space is invisible to members from here on. The `space:entry_removed` event
     is what tells the members already holding a copy to drop it.
+
+    The returned id is the one recorded as the author, which is a choice rather
+    than a lookup when the owner clears rows from several accounts at once - see
+    the comment at the selection below.
     """
     uid = uuid.UUID(user_id)
     s = await db.scalar(select(Space).where(Space.id == space_id))
@@ -529,7 +533,27 @@ async def remove_entry_from_space(
                 detail="Only the space owner or the member who shared it can remove this",
             )
 
-    author_id = str(matched[0].user_id)
+    # Whose entry this was. Rows are keyed `(user_id, client_id, entry_type)`, so
+    # several accounts can hold a row under one `client_id` - a client build that
+    # pushed an entry it had received produced exactly that, and those rows are
+    # still on the server. The owner path clears every one of them, while
+    # `space_entry_removals` has a unique index on (space_id, client_id,
+    # entry_type) and therefore room for a single author. So when the rows
+    # disagree, one of them has to be named.
+    #
+    # It used to be whichever the database returned first, which is unordered:
+    # an owner removing their own item could have the removal recorded against
+    # another member's row, and a client computing "did the author remove this"
+    # from `author_id == removed_by` then told the owner a space owner had
+    # moderated them. Prefer the remover's own row when there is one - the only
+    # reading that is true of the person the record is about - and otherwise the
+    # lowest id, so repeated calls at least agree with each other.
+    #
+    # Clients should not decide "was this the author" from this field: it
+    # describes one author and a member holds one copy, which may be another's.
+    # The copy they hold is what answers it, and they already know who wrote it.
+    authors = sorted({str(row.user_id) for row in matched})
+    author_id = user_id if user_id in authors else authors[0]
     server_ts = _now_ms()
     for row in matched:
         row.space_ids = [sid for sid in row.space_ids if sid != space_id]
