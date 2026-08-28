@@ -32,14 +32,25 @@ router = APIRouter(prefix="/spaces", tags=["spaces"])
 async def create_space(
     body: CreateSpaceRequest,
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
     """Create a new space owned by the current user and return its invite code.
 
     Requires: Bearer token + X-Device-Id header.
+
+    Emits `space:membership_changed` to the creator's own channel, which is
+    what puts their open socket on the new space channel - a socket resolves
+    its channel set at connect and re-resolves when a membership event for that
+    user goes past. Creation used to publish nothing, so the owner stayed deaf
+    to their own space until the next reconnect: no entries other members
+    shared, no comments, no presence, not even the "someone joined" event,
+    which is published to the very channel they were missing from. Restarting
+    the app was the only cure.
     """
     user_id, _ = current
     space, invite_code = await service.create_space(db, user_id, body)
+    await rt.publish_membership_changed_to_user(redis, user_id, str(space.id), "joined")
     return CreateSpaceResponse(space_id=space.id, invite_code=invite_code)
 
 
