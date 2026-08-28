@@ -88,6 +88,101 @@ async def _pull(client: AsyncClient, headers: dict, after_ts: int = 0) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_the_recorded_author_is_not_whichever_row_came_back_first(client: AsyncClient):
+    """Two accounts, one `client_id`, and the owner removing their own item.
+
+    Rows are keyed `(user_id, client_id, entry_type)`, so two accounts can each
+    hold a row under one `client_id` - a client build that pushed an entry it had
+    received produced exactly that, and those rows are still on the server. The
+    owner path clears every one of them, while `space_entry_removals` has a
+    unique index on (space_id, client_id, entry_type) and so has room for one
+    author.
+
+    It used to take `matched[0]`, and that list is unordered. When the member's
+    row came back first the removal was recorded as author=member,
+    removed_by=owner - two different ids for what was the owner taking down
+    their own item - and every client computing "did the author remove this"
+    from the pair reported the owner as having been moderated by a space owner.
+
+    The owner wrote one of these rows, so the owner is who the record has to
+    name.
+    """
+    owner = await make_user(client, "owner-author@example.com")
+    member = await make_user(client, "member-author@example.com")
+    space = await create_space(client, owner)
+    space_id = space["space_id"]
+    await join(client, member, space, owner)
+
+    ts = 2_000_000_000_000
+    # Both accounts push under the same client_id. Order matters: the member
+    # pushes first, so their row is the older one and the likelier to be
+    # returned first by a query with no ORDER BY.
+    for who, at in ((member, ts), (owner, ts + 1000)):
+        pushed = await client.post(
+            "/api/v1/sync/push",
+            json={"entries": [_shared_entry("cid-contested", space_id, at)]},
+            headers=clean(who),
+        )
+        assert pushed.status_code == 200, pushed.text
+
+    gone = await client.delete(
+        f"/api/v1/spaces/{space_id}/entries/cid-contested?entry_type=clipboard",
+        headers=clean(owner),
+    )
+    assert gone.status_code == 204, gone.text
+
+    removals = (await _pull(client, member))["removals"]
+    row = next(r for r in removals if r["client_id"] == "cid-contested")
+    assert row["removed_by"] == owner["_user_id"]
+    assert row["author_id"] == owner["_user_id"], (
+        "the remover wrote one of the cleared rows, so naming anyone else "
+        "reports their own removal as somebody moderating them"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_contested_client_id_names_an_author_stably(client: AsyncClient):
+    """Same collision, but the remover wrote none of the rows.
+
+    There is no right answer here - one row, two authors - so the requirement is
+    only that it is the same answer every time. An arbitrary pick means two
+    members pulling the same removal can be told two different things about who
+    wrote it.
+    """
+    owner = await make_user(client, "arbiter@example.com")
+    first = await make_user(client, "first@example.com")
+    second = await make_user(client, "second@example.com")
+    space = await create_space(client, owner)
+    space_id = space["space_id"]
+    await join(client, first, space, owner)
+    await join(client, second, space, owner)
+
+    ts = 2_000_000_000_000
+    for who, at in ((first, ts), (second, ts + 1000)):
+        pushed = await client.post(
+            "/api/v1/sync/push",
+            json={"entries": [_shared_entry("cid-neither", space_id, at)]},
+            headers=clean(who),
+        )
+        assert pushed.status_code == 200, pushed.text
+
+    gone = await client.delete(
+        f"/api/v1/spaces/{space_id}/entries/cid-neither?entry_type=clipboard",
+        headers=clean(owner),
+    )
+    assert gone.status_code == 204, gone.text
+
+    row = next(
+        r
+        for r in (await _pull(client, first))["removals"]
+        if r["client_id"] == "cid-neither"
+    )
+    assert row["removed_by"] == owner["_user_id"]
+    # Lowest of the two ids, so the choice does not depend on row order.
+    assert row["author_id"] == min(first["_user_id"], second["_user_id"])
+
+
+@pytest.mark.asyncio
 async def test_a_member_who_was_offline_learns_the_entry_was_withdrawn(client: AsyncClient):
     """The regression, end to end.
 

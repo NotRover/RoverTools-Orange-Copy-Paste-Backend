@@ -968,9 +968,15 @@ Routing rules worth knowing when implementing a client:
   would say nothing. `online: false` comes from the clean-close path and, for sockets
   that died without one, from the presence sweeper. Repeats are expected — a client
   drops an update that changes nothing.
-- `space:entry_removed` carries both `author_id` and `removed_by`. They are equal when
-  the author withdrew their own post and differ when the space owner took it down, and
-  that is the only way a member can tell the two apart.
+- `space:entry_removed` carries both `author_id` and `removed_by`. `removed_by` is the
+  authoritative half: it is the account that acted. `author_id` is advisory, because the
+  removal record has one row per (space, entry) and can name only one author, while rows
+  are keyed `(user_id, client_id, entry_type)` - so an owner clearing every row under one
+  `client_id` may be clearing several authors' rows and only one of them is recorded
+  (the remover's own if present, else the lowest id). **A client must not compute
+  "did the author remove this" from `author_id == removed_by`.** It holds one copy, it
+  already knows who wrote that copy, and comparing `removed_by` against that is the only
+  answer that is true of the copy in front of the reader.
 - `space:entry_removed` is the *fast* path, not the guarantee. The durable record is a
   `space_entry_removals` row written in the same transaction that strips the space id,
   returned by `GET /sync/pull` as `removals`. The event may be missed by anyone not
