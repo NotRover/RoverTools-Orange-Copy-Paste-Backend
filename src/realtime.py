@@ -42,6 +42,10 @@ SEND_TIMEOUT = 5
 # of one per connected user.
 BROADCAST_CHANNEL = "broadcast:all"
 PRESENCE_TTL = 300  # seconds; refreshed on every client message/pong
+# Longest a channel re-resolution may spend in the database before it is
+# abandoned. Same reasoning as SEND_TIMEOUT: the work is off the listener's
+# path, but an unbounded query still holds a connection indefinitely.
+RESYNC_TIMEOUT = 10
 
 # How long the pub/sub listener waits before re-subscribing, and the ceiling it
 # backs off to. A Redis that is restarting comes back in seconds; one that is
@@ -174,27 +178,136 @@ _ws_device: dict[WebSocket, str] = {}
 _lock = asyncio.Lock()
 
 
+def _bind_locked(ws: WebSocket, device_id: str, channels: list[str]) -> None:
+    """Put `ws` on exactly `channels`, dropping any it no longer belongs on.
+
+    One step, and the caller holds `_lock` for all of it. Changing a channel
+    set as unregister-then-register leaves a window in which the socket is on
+    no channel at all, and anything delivered in that window is not delayed,
+    it is gone - pub/sub does not replay.
+    """
+    wanted = set(channels)
+    for ch in _ws_channels.get(ws, set()) - wanted:
+        _channels[ch].discard((ws, device_id))
+        if not _channels[ch]:
+            del _channels[ch]
+    _ws_device[ws] = device_id
+    _ws_channels[ws] = wanted
+    for ch in wanted:
+        _channels[ch].add((ws, device_id))
+
+
 async def _register(ws: WebSocket, device_id: str, channels: list[str]) -> None:
     async with _lock:
-        _ws_device[ws] = device_id
-        _ws_channels[ws] = set(channels)
-        for ch in channels:
-            _channels[ch].add((ws, device_id))
+        _bind_locked(ws, device_id, channels)
 
 
-async def _unregister(ws: WebSocket) -> None:
+async def _rebind(ws: WebSocket, channels: list[str]) -> None:
+    """Move an already-registered socket onto `channels`.
+
+    A no-op for a socket that has gone. Resolving a channel set means a
+    database round trip, and the socket can close during it — re-adding it
+    would put a dead entry in `_channels` that nothing ever removes, since its
+    teardown has already run.
+    """
+    async with _lock:
+        device_id = _ws_device.get(ws)
+        if device_id is None:
+            return
+        _bind_locked(ws, device_id, channels)
+
+
+async def _unregister(ws: WebSocket) -> list[str]:
+    """Remove `ws` from the hub, and report what it was on.
+
+    The channel set is returned because it is no longer safe to keep a copy:
+    the server re-resolves a socket's channels when membership changes, so
+    whatever the endpoint resolved at connect may not be where this socket
+    ended up — and the departure has to be announced to the spaces it was
+    actually in.
+    """
     async with _lock:
         device_id = _ws_device.pop(ws, None)
-        for ch in _ws_channels.pop(ws, set()):
+        channels = _ws_channels.pop(ws, set())
+        for ch in channels:
             _channels[ch].discard((ws, device_id))  # type: ignore[arg-type]
             if not _channels[ch]:
                 del _channels[ch]
+        return sorted(channels)
 
 
 def _space_channels(channels: list[str]) -> list[str]:
     """Just the space channels — the user's own channel carries device-level
     presence already and must not get the per-user event too."""
     return [c for c in channels if c.startswith("space:")]
+
+
+async def _resolve_channels(user_id: str) -> list[str]:
+    """Where a socket for `user_id` belongs: their own channel, the broadcast
+    channel, and one per space they are a member of."""
+    channels = [f"user:{user_id}", BROADCAST_CHANNEL]
+    async with AsyncSessionLocal() as db:
+        memberships = await db.scalars(
+            select(SpaceMembership).where(SpaceMembership.user_id == uuid.UUID(user_id))
+        )
+        channels.extend(f"space:{m.space_id}" for m in memberships.all())
+    return channels
+
+
+async def _resync_user_channels(user_id: str) -> None:
+    """Put every local socket of `user_id` back on the channels their
+    memberships now imply.
+
+    The hole this closes: the channel set is resolved once, at connect. A space
+    joined — or created — after that is a channel the socket is not on, and
+    everything published to it goes to an audience the user is missing from:
+    the entries other members share, their comments, withdrawals, presence, and
+    the next membership change, which is the very event that was supposed to
+    fix this. Nothing recovers until the socket reconnects.
+
+    The client is expected to answer a membership event with `resubscribe`, and
+    still does. This does not replace that so much as stop depending on it —
+    correctness of the fan-out should not rest on which build happens to be at
+    the far end of the socket.
+
+    Only ever driven by an event on the user's *own* channel, which is exactly
+    the case "your membership changed". A membership event on a space channel
+    is news about somebody else, and re-resolving every member on it would
+    spend a query per member to learn nothing.
+    """
+    async with _lock:
+        sockets = list(_channels.get(f"user:{user_id}", set()))
+    if not sockets:
+        return
+    try:
+        channels = await asyncio.wait_for(_resolve_channels(user_id), timeout=RESYNC_TIMEOUT)
+    except Exception:
+        # Leaves the socket on its old channel set, which is where a client
+        # that sends `resubscribe` recovers, and where a reconnect does anyway.
+        logger.exception("could not re-resolve channels for user %s", user_id)
+        return
+    for ws, _ in sockets:
+        await _rebind(ws, channels)
+
+
+# Held so the event loop does not collect a resync mid-flight; each drops
+# itself on completion.
+_resync_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_resync(user_id: str) -> None:
+    """Run a resync off the listener's critical path.
+
+    Not awaited by the caller on purpose: the listener does not read the next
+    Redis message until dispatch returns, so a database query taken in line
+    would let a slow Postgres do to fan-out what a stalled socket used to —
+    see `_broadcast_local`.
+    """
+    if not user_id or f"user:{user_id}" not in _channels:
+        return  # not a user this replica holds a socket for
+    task = asyncio.create_task(_resync_user_channels(user_id))
+    _resync_tasks.add(task)
+    task.add_done_callback(_resync_tasks.discard)
 
 
 async def _send_to_one(ws: WebSocket, raw: str) -> bool:
@@ -290,6 +403,15 @@ async def start_listener(redis_url: str) -> None:
                     parsed = json.loads(data)
                     exclude_device: str | None = parsed.pop("_origin_device", None)
                     await _broadcast_local(channel, json.dumps(parsed), exclude_device)
+                    # A membership event on a user's own channel is that user's
+                    # space list changing under an open socket. Acting on it
+                    # here is what makes the channel set self-healing on every
+                    # replica, whatever the client does with the same event.
+                    if (
+                        parsed.get("event") == "space:membership_changed"
+                        and channel.startswith("user:")
+                    ):
+                        _schedule_resync(channel.removeprefix("user:"))
                 except Exception:
                     logger.exception("pubsub dispatch error on channel %s", channel)
         except asyncio.CancelledError:
@@ -514,18 +636,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
     redis: Redis = await get_redis_pool()  # type: ignore[assignment]
     await websocket.accept()
 
-    async def _resolve_channels() -> list[str]:
-        # Channel list: the user's own channel, the broadcast channel, and
-        # every space they belong to.
-        channels = [f"user:{user_id}", BROADCAST_CHANNEL]
-        async with AsyncSessionLocal() as db:
-            memberships = await db.scalars(
-                select(SpaceMembership).where(SpaceMembership.user_id == uuid.UUID(user_id))
-            )
-            channels.extend(f"space:{m.space_id}" for m in memberships.all())
-        return channels
-
-    channels = await _resolve_channels()
+    channels = await _resolve_channels(user_id)
     await _register(websocket, device_id, channels)
 
     # Presence: mark online + set the TTL key the sweeper watches.
@@ -556,18 +667,23 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
                         # next pong refreshes the key anyway.
                         logger.warning("presence refresh failed for %s: %s", device_id, exc)
                 elif msg.get("event") == "resubscribe":
-                    # Membership changed mid-connection (join/leave/invite accept):
-                    # re-resolve the channel set so space fan-out starts (or stops)
-                    # immediately instead of on the next reconnect.
-                    await _unregister(websocket)
-                    channels = await _resolve_channels()
-                    await _register(websocket, device_id, channels)
+                    # Membership changed mid-connection (join/leave/invite
+                    # accept). The server re-resolves on its own when the
+                    # membership event goes past, so this is no longer what
+                    # makes space fan-out work — it is the client saying it
+                    # believes it is stale, which stays supported because it
+                    # costs one query and is the client's only way to say so.
+                    await _rebind(websocket, await _resolve_channels(user_id))
             except asyncio.TimeoutError:
                 await websocket.send_json({"event": "ping", "payload": {"server_ts": _now_ms()}})
             except (WebSocketDisconnect, RuntimeError):
                 break
     finally:
-        await _unregister(websocket)
+        # The set as it actually ended up, not the one resolved at connect:
+        # membership can move a socket between channels mid-connection, and a
+        # stale local copy would announce the departure to the wrong spaces
+        # while saying nothing to the ones it had joined since.
+        channels = await _unregister(websocket)
         try:
             # Asked *before* the removal and excluding this device, so the answer
             # is in hand before anything is mutated. Asking afterwards — which is

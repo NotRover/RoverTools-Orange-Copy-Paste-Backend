@@ -1,5 +1,6 @@
 """Spaces, short invite codes, addressed invites, rekey-on-remove, shared blobs."""
 
+import json
 import uuid
 
 import pytest
@@ -83,6 +84,48 @@ async def distribute(client: AsyncClient, owner: dict, space_id: str, keyrings: 
 
 
 # ── Short invite codes ─────────────────────────────────────────────────
+
+
+async def _next_event(pubsub, timeout: float = 1.0) -> dict:
+    """The next published event on a subscription, decoded."""
+    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout)
+    assert msg is not None, "nothing was published"
+    return json.loads(msg["data"])
+
+
+@pytest.mark.asyncio
+async def test_creating_a_space_announces_it_to_the_creators_own_channel(client: AsyncClient, fake_redis):
+    """The owner has to be told about their own space, or they never hear it.
+
+    A socket resolves its channel set once, at connect, and re-resolves only
+    when the client is told membership changed. Every other membership event is
+    published to the space channel *and* to the affected user's own channel,
+    for exactly the reason that bites here: you cannot reach someone on a
+    channel they are not on yet. Creation was the one path that published
+    nothing at all, so an owner who created a space without restarting the app
+    sat off their own space channel indefinitely - the entries other members
+    shared, their comments, their presence and the "someone joined" event were
+    all published to a channel with the owner missing from it.
+
+    This asserts the announcement. That the client answers it with
+    `resubscribe`, and that the server then re-resolves, is socket behaviour and
+    is only exercised in the running app.
+    """
+    owner = await make_user(client)
+    pubsub = fake_redis.pubsub()
+    await pubsub.subscribe(f"user:{owner['_user_id']}")
+    try:
+        created = await create_space(client, owner)
+        event = await _next_event(pubsub)
+    finally:
+        await pubsub.aclose()
+
+    assert event["event"] == "space:membership_changed"
+    assert event["payload"] == {
+        "space_id": created["space_id"],
+        "action": "joined",
+        "user_id": owner["_user_id"],
+    }
 
 
 @pytest.mark.asyncio

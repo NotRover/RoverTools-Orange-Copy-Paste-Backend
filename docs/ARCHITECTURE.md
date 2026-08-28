@@ -927,8 +927,11 @@ Metrics: `orange_users_total`, `orange_devices_total`, `orange_devices_active_to
 **Connection:** `GET /ws?token=<supabase access token>&device_id=<device_id>`
 
 The connection is subscribed to `user:<user_id>` and every `space:<space_id>` the
-user belongs to. The channel set is resolved once at connect time and re-resolved on
-demand (see `resubscribe` below).
+user belongs to. The channel set is resolved at connect, and re-resolved by the server
+whenever a `space:membership_changed` for that user passes down their own channel - on
+every replica, for every socket that user has open. A client may also ask, with
+`resubscribe` (below), but nothing depends on it doing so: a socket that joined or
+created a space mid-connection is moved onto its channel either way.
 
 **Server → Client events:**
 
@@ -976,7 +979,12 @@ Routing rules worth knowing when implementing a client:
   Losing the event therefore costs latency, not correctness.
 - `space:membership_changed` is published to the space channel **and** to the affected
   user's own channel, because the joiner is not on the space channel yet and a removed
-  member may already be off it. `action: "deleted"` is published *before* the row is
+  member may already be off it. Creating a space is the same case with nobody else in
+  it: `POST /spaces` publishes `action: "joined"` to the creator's own channel alone,
+  which is what puts their open socket on the new space channel. Without it the channel
+  set resolved at connect never grows, and the owner receives nothing published to their
+  own space - entries, comments, removals, presence, or the next membership change -
+  until the socket reconnects. `action: "deleted"` is published *before* the row is
   deleted, while the channel still has subscribers.
 - `space:join_requested` goes to the space channel when `members_can_approve` is set
   and to the owner's own channel when it is not, so the fan-out matches who may act on
@@ -989,8 +997,10 @@ Routing rules worth knowing when implementing a client:
 
 **Client → Server:** `{ "event": "pong" }` / `{ "event": "ack" }` (either refreshes
 the presence TTL), and `{ "event": "resubscribe" }` — re-resolves the socket's
-channel set after a membership change, so space fan-out starts (or stops)
-without a reconnect.
+channel set. The server already does this itself on any membership change (see
+the connection note above), so `resubscribe` is a client saying it believes it is
+stale rather than the mechanism fan-out depends on. It costs one query and is
+safe to send at any time.
 
 ### 5.9 Web Page Routes (unversioned, no auth)
 

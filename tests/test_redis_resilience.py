@@ -286,6 +286,130 @@ def test_the_origin_device_is_still_skipped():
     assert other_got == ["payload"]
 
 
+# ── A socket's channel set follows membership on its own ─────────────
+
+
+def test_a_socket_moves_between_channels_in_one_step():
+    """Rebinding must not pass through "on no channel at all".
+
+    The set used to be changed as unregister-then-register. Between the two the
+    socket was on nothing, and an event delivered in that window is not late,
+    it is lost - pub/sub has no replay. Channels the socket keeps must also
+    survive the move untouched, or a rebind would silently drop the user
+    channel every membership change arrives on.
+    """
+
+    async def scenario():
+        ws = _Socket()
+        try:
+            await rt._register(ws, "d1", ["user:u", "space:old"])  # type: ignore[arg-type]
+            await rt._rebind(ws, ["user:u", "space:new"])  # type: ignore[arg-type]
+            return (
+                set(rt._ws_channels.get(ws, set())),  # type: ignore[arg-type]
+                {ch for ch, members in rt._channels.items() if (ws, "d1") in members},
+            )
+        finally:
+            await rt._unregister(ws)  # type: ignore[arg-type]
+
+    bound, indexed = asyncio.run(scenario())
+    assert bound == {"user:u", "space:new"}
+    assert indexed == bound, "the forward index and the per-socket set disagree"
+
+
+def test_a_socket_that_left_is_not_resurrected_by_a_rebind():
+    """Resolving a channel set is a database round trip, and the socket can
+    close during it. Re-adding one whose teardown has already run puts a dead
+    entry in the hub that nothing ever removes."""
+
+    async def scenario():
+        ws = _Socket()
+        await rt._register(ws, "d1", ["user:u"])  # type: ignore[arg-type]
+        await rt._unregister(ws)  # type: ignore[arg-type]
+        await rt._rebind(ws, ["user:u", "space:new"])  # type: ignore[arg-type]
+        return ws in rt._ws_channels, "space:new" in rt._channels  # type: ignore[operator]
+
+    still_bound, channel_recreated = asyncio.run(scenario())
+    assert not still_bound
+    assert not channel_recreated
+
+
+def test_membership_re_resolves_every_local_socket_of_that_user():
+    """The hardening. A space created or joined under an open socket is a
+    channel that socket is not on, and everything published to it - entries,
+    comments, withdrawals, presence, the next membership change - goes to an
+    audience the user is missing from. The client is asked to send
+    `resubscribe`, but the fan-out cannot depend on which build is at the far
+    end, so the server re-resolves when the event goes past. Both of the user's
+    devices move, not just the one that acted."""
+
+    async def scenario():
+        phone, laptop, stranger = _Socket(), _Socket(), _Socket()
+        resolved = rt._resolve_channels
+
+        async def fake_resolve(user_id: str) -> list[str]:
+            return [f"user:{user_id}", rt.BROADCAST_CHANNEL, "space:fresh"]
+
+        rt._resolve_channels = fake_resolve  # type: ignore[assignment]
+        try:
+            await rt._register(phone, "d1", ["user:u", rt.BROADCAST_CHANNEL])  # type: ignore[arg-type]
+            await rt._register(laptop, "d2", ["user:u", rt.BROADCAST_CHANNEL])  # type: ignore[arg-type]
+            await rt._register(stranger, "d3", ["user:other", rt.BROADCAST_CHANNEL])  # type: ignore[arg-type]
+            await rt._resync_user_channels("u")
+            return (
+                set(rt._ws_channels[phone]),  # type: ignore[index]
+                set(rt._ws_channels[laptop]),  # type: ignore[index]
+                set(rt._ws_channels[stranger]),  # type: ignore[index]
+            )
+        finally:
+            rt._resolve_channels = resolved  # type: ignore[assignment]
+            for sock in (phone, laptop, stranger):
+                await rt._unregister(sock)  # type: ignore[arg-type]
+
+    phone_on, laptop_on, stranger_on = asyncio.run(scenario())
+    assert "space:fresh" in phone_on
+    assert "space:fresh" in laptop_on, "a user's other devices are on the same spaces"
+    assert stranger_on == {"user:other", rt.BROADCAST_CHANNEL}, "somebody else must not move"
+
+
+def test_a_replica_holding_no_socket_for_that_user_does_no_work():
+    """Every replica sees every membership event, and only one of them holds
+    the socket. The others must not each spend a query finding that out."""
+
+    async def scenario() -> bool:
+        touched = False
+        resolved = rt._resolve_channels
+
+        async def fake_resolve(user_id: str) -> list[str]:
+            nonlocal touched
+            touched = True
+            return []
+
+        rt._resolve_channels = fake_resolve  # type: ignore[assignment]
+        try:
+            rt._schedule_resync("nobody-here")
+            await rt._resync_user_channels("nobody-here")
+            return touched
+        finally:
+            rt._resolve_channels = resolved  # type: ignore[assignment]
+
+    assert asyncio.run(scenario()) is False
+
+
+def test_a_departing_socket_reports_the_channels_it_ended_up_on():
+    """Teardown announces the user offline to their spaces. Since the server
+    can move a socket mid-connection, the set resolved at connect is not the
+    one to announce to - a space joined since would never hear it."""
+
+    async def scenario() -> list[str]:
+        ws = _Socket()
+        await rt._register(ws, "d1", ["user:u", "space:old"])  # type: ignore[arg-type]
+        await rt._rebind(ws, ["user:u", "space:old", "space:joined-since"])  # type: ignore[arg-type]
+        return await rt._unregister(ws)  # type: ignore[arg-type]
+
+    left = asyncio.run(scenario())
+    assert rt._space_channels(left) == ["space:joined-since", "space:old"]
+
+
 def test_the_request_pool_is_bounded():
     """An unbounded pool opened one connection per concurrent coroutine: a hard
     cap and an error on a managed instance, per-connection buffers on a
