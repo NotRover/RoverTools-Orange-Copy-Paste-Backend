@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     # redirect). Single source, so pointing a domain at the deployment is an env
     # change rather than a code change. No trailing slash.
     public_base_url: str = "https://rovertools-temp.ctx.cl"
+    # Where a password-reset mail lands. The page lives on the static site, not
+    # here: it needs nothing from a server, and hosting it away from the API means
+    # a reset survives the API changing hostname - which is not hypothetical, it is
+    # what broke it once, when the backend left Render and the old redirect was
+    # left behind in Supabase's allow-list. `/reset` on this service only forwards
+    # to it, for installs built before that page existed.
+    reset_page_url: str = "https://orange-copy-paste-app.pages.dev/reset"
     # The interactive API docs and the OpenAPI schema. Off by default, so a
     # deployment that configures nothing keeps them private: the schema is a full
     # map of the surface, including the `/internal` admin routes, and publishing

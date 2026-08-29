@@ -32,6 +32,7 @@ Supabase's built-in mailer is rate limited to a couple of messages an hour and i
 not meant for production. Configuring custom SMTP (Project settings -> Auth ->
 SMTP) lifts that, and is what makes signup and reset mail dependable.
 
-The reset link points at this service's `/reset` page rather than at a web form,
-because a new password re-wraps the account's encryption key and only the app
-holds that key.
+The reset link never points at a web form: a new password re-wraps the account's
+encryption key, and only the app holds that key. It points at a page on the static
+site, which hands the one-time code to the app. Older installs point it at this
+service's `/reset` instead, which forwards to that same page.
