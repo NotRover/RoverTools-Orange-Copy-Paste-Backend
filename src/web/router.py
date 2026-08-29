@@ -1,16 +1,15 @@
-"""Human-facing HTML pages.
+"""Human-facing routes.
 
-Everything else this service serves is JSON for the desktop app. These two pages
-exist because two links have to survive being pasted into an email or a chat
-window, where an `orange://` URL is stripped or ignored:
+Everything else this service serves is JSON for the desktop app. ``/join/{code}``
+is here because a space invite has to survive being pasted into an email or a chat
+window, where an ``orange://`` URL is stripped or ignored: it shows what the link
+is for, hands it to the app through the deep-link scheme, and offers a download
+when the app is not installed. It touches no database row, so it paints on the
+first response even when the service is cold-starting, and cannot be used to probe
+whether a code exists.
 
-- ``/join/{code}`` - a space invite.
-- ``/reset`` - the target of the password-reset mail Supabase sends.
-
-Both do the same small job: show what the link is for, hand it to the app through
-the deep-link scheme, and offer a download when the app is not installed. Neither
-touches the database, so they paint on the first response even when the service is
-cold-starting, and ``/join`` cannot be used to probe whether a code exists.
+``/reset`` used to be a second page of the same shape. It is now a forward to the
+one on the static site, for the reason given on the route.
 
 Deliberately **unversioned**. ``version.py`` versions the product API because the
 desktop app negotiates a contract with it; a URL a person clicks in an email
@@ -21,8 +20,8 @@ the same reason the infra probes are unversioned.
 import html
 from pathlib import Path
 
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from src.config import settings
 from src.spaces import service as spaces_service
@@ -44,7 +43,6 @@ def read_template(name: str) -> str:
 
 _SHELL = read_template("shell.html")
 _JOIN = read_template("join.html")
-_RESET = read_template("reset.html")
 
 # The page's own policy. The global one is `default-src 'none'`, which would block
 # the inline style and script these pages are built from; this stays as tight as a
@@ -76,18 +74,27 @@ async def join_page(code: str) -> HTMLResponse:
     return _render("Join a space in Orange Copy Paste", body)
 
 
-@router.get("/reset", response_class=HTMLResponse)
-async def reset_page(code: str = "") -> HTMLResponse:
-    """Password-reset landing page - the ``redirect_to`` of the recovery mail.
+@router.get("/reset")
+async def reset_page(request: Request) -> RedirectResponse:
+    """Forward a password-reset link to the page that answers it.
 
-    The reset itself happens in the app, because a new password has to re-wrap the
-    account's encryption key and the server never has that key. All this page does
-    is carry the one-time code across.
+    That page lives on the static site now, so a reset no longer depends on this
+    service keeping its hostname or being up. This route stays because the
+    ``redirect_to`` an app sends is compiled into it: no later release can change
+    what an already-installed copy asks for, and every install shipped before that
+    page existed still asks for this host. It can be dropped once those have aged
+    out.
+
+    The query is forwarded whole rather than picked apart - it carries the
+    one-time code, and re-parsing it here could only corrupt it. The fragment,
+    where GoTrue puts an error, never reaches a server at all; browsers carry it
+    across a redirect whose target has none of its own, so it survives this hop
+    regardless.
     """
-    state = "ok" if code else "fail"
-    deep_link = f"orange://reset?code={html.escape(code, quote=True)}" if code else ""
-    body = _RESET.replace("__STATE__", state).replace("__DEEP_LINK__", deep_link)
-    return _render("Set a new Orange Copy Paste password", body)
+    target = settings.reset_page_url
+    if request.url.query:
+        target = f"{target}{'&' if '?' in target else '?'}{request.url.query}"
+    return RedirectResponse(target, status_code=302)
 
 
 def join_url(invite_code: str) -> str:

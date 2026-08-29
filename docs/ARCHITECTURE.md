@@ -205,14 +205,18 @@ the public `/internal/healthz`.
 
 ### 2.8 Web pages (`src/web/`)
 
-The only HTML this service serves. Two links have to survive being pasted into an
-email or a chat window, where an `orange://` URL is stripped or silently ignored:
+The only HTML this service serves is `/join`: a space invite has to survive being
+pasted into an email or a chat window, where an `orange://` URL is stripped or
+silently ignored.
 
 - `GET /join/{code}` - a space invite. Shows the code, hands it to the app as
   `orange://join?code=<code>`, and links the latest release when the app is not
   installed.
-- `GET /reset` - where the Supabase recovery mail lands. Carries `?code=` across to
-  the app as `orange://reset?code=<code>`.
+- `GET /reset` - a 302 to `settings.reset_page_url`, query forwarded whole. The
+  page a recovery mail lands on lives on the static site, so a reset does not
+  depend on this service keeping its hostname or being up. This route exists only
+  for installs whose compiled-in `redirect_to` still names this host, and can be
+  dropped once those have aged out.
 
 Four decisions worth keeping:
 
@@ -226,7 +230,7 @@ Four decisions worth keeping:
   anyone whether a given code exists.
 - **CSP carve-out.** The global header is `default-src 'none'; connect-src 'self'`,
   which would blank a self-contained page, so `middleware.py` sets it with
-  `setdefault` and these routes set their own: inline style and script allowed,
+  `setdefault` and `/join` sets its own: inline style and script allowed,
   everything remote still denied. The header is now overridable, never absent.
 - **HTML lives in `templates/*.html`**, read once at import and rendered by
   replacing `__PLACEHOLDER__` tokens - no Jinja2 dependency, and the pages stay
@@ -1012,11 +1016,12 @@ safe to send at any time.
 
 ```
 GET /join/{code}          HTML - space invite landing page
-GET /reset?code=<code>    HTML - password-reset landing page
+GET /reset?code=<code>    302  - forwards to the reset page on the static site
 ```
 
-Both answer 200 for any well-formed input, set their own Content-Security-Policy,
-and are excluded from OpenAPI. See section 2.8.
+Both are excluded from OpenAPI. `/join` answers 200 for any well-formed code and
+sets its own Content-Security-Policy; `/reset` forwards whatever query it is given
+and reads nothing out of it. See section 2.8.
 
 ---
 

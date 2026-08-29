@@ -1,1 +1,1 @@
-"""Human-facing HTML pages (invite links, password reset)."""
+"""Human-facing routes: the invite page, and the password-reset forward."""
