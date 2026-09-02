@@ -89,8 +89,10 @@ async def _upsert_entry(
     entry: PushEntry,
     room: int,
 ) -> tuple[AcceptedEntry | ConflictEntry, list[uuid.UUID], bool]:
-    """Third return value: whether this created a row, so the caller can keep
-    ``room`` honest across a batch without counting the table again."""
+    """Third return value: whether this consumed a live slot, so the caller can
+    keep ``room`` honest across a batch without counting the table again. A
+    tombstone insert creates a row but consumes no slot - the quota counts live
+    entries only - so it returns ``False``."""
     # Checked before the lookup: an oversized row is refused whether it would be
     # an insert or an update, and refusing costs nothing.
     #
@@ -176,9 +178,14 @@ async def _upsert_entry(
         return ConflictEntry(client_id=entry.client_id, reason="not_your_entry"), [], False
 
     # A full account can still be edited and emptied - the update path above is
-    # already past this point, so tombstones and changes to rows that exist keep
-    # working. Only a new row is refused.
-    if room <= 0:
+    # already past this point, so changes to rows that exist keep working. A new
+    # tombstone is let through too: the quota counts live entries only (`held`
+    # above filters on `deleted_at IS NULL`), so a tombstone adds nothing to
+    # charge for, and it is the very thing that frees space. Refusing it also
+    # broke "remove from my devices" for a received entry at quota - that hide is
+    # a brand-new tombstone row, so it would have been the one delete a full
+    # account could not make. Only a new *live* row is refused.
+    if room <= 0 and entry.deleted_at is None:
         return ConflictEntry(client_id=entry.client_id, reason="account_full"), [], False
 
     new_entry = SyncEntry(
@@ -202,7 +209,14 @@ async def _upsert_entry(
     db.add(new_entry)
     await db.commit()
     await db.refresh(new_entry)
-    return AcceptedEntry(client_id=entry.client_id, server_id=new_entry.id, server_ts=server_ts), [], True
+    # A live insert consumes a slot; a new tombstone does not (it is excluded
+    # from the quota count), so it must not shrink `room` for the rest of the batch.
+    consumed_slot = entry.deleted_at is None
+    return (
+        AcceptedEntry(client_id=entry.client_id, server_id=new_entry.id, server_ts=server_ts),
+        [],
+        consumed_slot,
+    )
 
 
 async def _belongs_to_someone_else(db: AsyncSession, user_id: uuid.UUID, entry: PushEntry) -> bool:
