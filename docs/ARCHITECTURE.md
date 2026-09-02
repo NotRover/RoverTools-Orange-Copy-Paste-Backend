@@ -715,6 +715,17 @@ with two accounts and the same local history holds colliding `client_id`s by
 construction. Only when both rows land in the same space is one claiming to be the
 other.
 
+That same overlap gap is what lets a member delete a *received* entry off their own
+devices without touching the space ("remove from my devices"). The client pushes a
+tombstone for the received `client_id` with **empty `space_ids`** — a self-owned row
+under the deleter's account that overlaps no space, so `_belongs_to_someone_else`
+permits it and fan-out reaches only `user:{deleter}`. The author's row is untouched
+and every other member keeps their copy; the deleter's other devices apply it through
+a self-hide path in the client's merge (they recognise a self-authored, space-less
+tombstone for an entry they hold as received). Contrast the normal case in section
+14, rule 5: a tombstone for an entry you *own* keeps its `space_ids` so the delete
+reaches the members who received it.
+
 ### 5.3 Settings Routes
 
 ```
@@ -1092,9 +1103,14 @@ way, because a chunked request offers nothing. A body that goes over is answered
 the route never runs; `BodySizeLimitMiddleware` carries the reason that answer
 cannot simply be an exception.
 
-`account_full` counts live rows only (`deleted_at IS NULL`) and is checked *after* the
-update path, so a full account can still be emptied - a cap that blocks its own
-remedy is a cap the user cannot get out from under.
+`account_full` counts live rows only (`deleted_at IS NULL`) and refuses only a new
+**live** row. It is checked *after* the update path, so a full account can still be
+edited and emptied; and a new *tombstone* is let through as well - it adds nothing to
+a count that excludes tombstones, and it is the very thing that frees space. That last
+part is what keeps "remove from my devices" for a received entry working at quota: that
+hide is a brand-new tombstone row, so without the exemption it would be the one delete a
+full account could not make. A cap that blocks its own remedy is a cap the user cannot
+get out from under.
 
 Both per-account limits count rows by `user_id`, which means an entry somebody else
 shared into your space is **their** row on **their** account and does not count
@@ -1508,8 +1524,10 @@ is largely unchanged. What the client must adopt for this backend:
    `device_id`, and send it as the `X-Device-Id` header on device-scoped calls.
 4. **WebSocket** connects to `/ws?token=<supabase JWT>&device_id=<device_id>`.
 5. **Deletion is a tombstone** in `POST /sync/push` (`deleted_at` set) — there is no
-   dedicated delete route. Keep the entry's `space_ids` on the tombstone so the delete
-   reaches the members who received the entry.
+   dedicated delete route. For an entry you own, keep its `space_ids` on the tombstone so
+   the delete reaches the members who received it. A tombstone for an entry *another*
+   member wrote is the exception: it carries empty `space_ids` and hides the item on your
+   own devices only (section 5.2).
 6. **Every push carries a CEK envelope.** Mint a per-entry key, encrypt content and
    metadata under it with `aad=client_id`, and send `wrapped_keys` with a `"personal"` wrap
    plus one wrap per space id in `space_ids` (section 7.2). An entry with an empty envelope is
@@ -1578,7 +1596,7 @@ Three contract points still catch a fresh client and are worth restating:
 
 | Trap | Reality |
 | ---- | ------- |
-| Deleting an entry | A push with `deleted_at` set. There is no DELETE route, and the tombstone must keep the entry's `space_ids`. |
+| Deleting an entry | A push with `deleted_at` set. There is no DELETE route. A tombstone for an entry you own keeps its `space_ids`; one for a received entry carries empty `space_ids` and hides it on your own devices only (section 5.2). |
 | Device-scoped calls | Need `X-Device-Id` in addition to the bearer token. `/auth/bootstrap`, `/auth/devices` and `/invites/*` do not. |
 | WebSocket | `/ws?token=<supabase JWT>&device_id=<device_id>` — both query params are required, and `device_id` must be a registered device. |
 

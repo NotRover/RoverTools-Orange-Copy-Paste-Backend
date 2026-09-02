@@ -241,6 +241,41 @@ async def test_a_full_account_refuses_new_rows_but_still_accepts_deletes(
     assert len(again.json()["accepted"]) == 1
 
 
+async def test_a_full_account_still_accepts_a_brand_new_tombstone(
+    client: AsyncClient, auth_headers: dict, monkeypatch
+):
+    """A received-entry hide ("remove from my devices") is a brand-new tombstone
+    row, not an update to one that exists. It adds nothing to a count that excludes
+    tombstones, so a full account must still take it - otherwise that hide is the
+    one delete quota could block. And it consumes no live slot, so the account
+    stays full for a new *live* row."""
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "max_entries_per_user", 1)
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+
+    filled = await client.post(
+        "/api/v1/sync/push", json={"entries": [_entry("cid-live")]}, headers=headers
+    )
+    assert len(filled.json()["accepted"]) == 1
+
+    # A tombstone for a client_id this account never held live - a new row, at quota.
+    hide = await client.post(
+        "/api/v1/sync/push",
+        json={"entries": [_entry("cid-received", deleted=True)]},
+        headers=headers,
+    )
+    assert len(hide.json()["accepted"]) == 1
+    assert len(hide.json()["conflicts"]) == 0
+
+    # It freed nothing: the live row still fills the account, so a new live row
+    # is still refused.
+    blocked = await client.post(
+        "/api/v1/sync/push", json={"entries": [_entry("cid-another")]}, headers=headers
+    )
+    assert [c["reason"] for c in blocked.json()["conflicts"]] == ["account_full"]
+
+
 async def test_an_oversized_batch_is_rejected_outright(
     client: AsyncClient, auth_headers: dict
 ):
