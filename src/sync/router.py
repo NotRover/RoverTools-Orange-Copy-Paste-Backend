@@ -11,6 +11,7 @@ from src import realtime as rt
 from src.sync import service
 from src.sync.models import SyncEntry
 from src.sync.schemas import (
+    BreakdownOut,
     CursorUpdateRequest,
     PullResponse,
     PushRequest,
@@ -95,4 +96,19 @@ async def update_cursor(
     """
     user_id, device_id = current
     await service.update_cursor(db, device_id, user_id, body.last_server_ts)
+
+
+@router.get("/breakdown", response_model=BreakdownOut)
+async def breakdown(
+    db: AsyncSession = Depends(get_db),
+    current: tuple[str, str] = Depends(get_current_user_id),
+):
+    """Live-row counts for the account, split by kind, from one aggregate query.
+
+    Requires: Bearer token + X-Device-Id header.
+    Answers the account screen's cloud bar without paging every row down to the
+    client to count there. Own rows only; tombstones excluded.
+    """
+    user_id, _ = current
+    return await service.account_breakdown(db, user_id)
 
