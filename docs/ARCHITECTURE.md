@@ -692,6 +692,17 @@ GET  /api/v1/sync/pull?after_ts=<ts>&limit=200&entry_type=all|clipboard|note
      removals it never received.
 
 POST /api/v1/sync/cursor        Body: { last_server_ts }
+
+GET  /api/v1/sync/breakdown
+     Returns: { clipboard, notes, total, text, image, file, html }
+     Live-row counts for the caller's own account, from one GROUP BY over
+     (entry_type, kind) on the user_id index - no ciphertext leaves the server, so
+     it answers in milliseconds where paging every row to count client-side did
+     not. Own rows only, tombstones excluded (matches "synced items"). kind is the
+     plaintext label the server already routes on; text is every clipboard row that
+     is not image/file/html (a legacy null-kind row included), so
+     text + image + file + html == clipboard. Coarser than the client's on-device
+     bar, which splits URL / document / folder out of content the server cannot read.
 ```
 
 There is no `GET /sync/status` and no delete route: the cursor is client-held (and
