@@ -14,6 +14,7 @@ from src.spaces.models import SpaceEntryRemoval, SpaceMembership
 from src.sync.models import SyncCursor, SyncEntry
 from src.sync.schemas import (
     AcceptedEntry,
+    BreakdownOut,
     ConflictEntry,
     PushEntry,
 )
@@ -385,4 +386,46 @@ async def update_cursor(db: AsyncSession, device_id: str, user_id: str, last_ser
     )
     await db.execute(stmt)
     await db.commit()
+
+
+# ── Breakdown ─────────────────────────────────────────────────────────────────
+
+
+async def account_breakdown(db: AsyncSession, user_id: str) -> BreakdownOut:
+    """Live-row counts for the account, split by entry_type and kind.
+
+    One `GROUP BY` over the `(user_id)` index instead of paging every row down to
+    the client to tally there. Tombstones are excluded (`deleted_at IS NULL`), so
+    this matches the account screen's "synced items" count. `text` absorbs every
+    clipboard kind that is not image / file / html — including a legacy row with a
+    null kind — so `text + image + file + html == clipboard` always holds.
+    """
+    uid = uuid.UUID(user_id)
+    rows = await db.execute(
+        select(SyncEntry.entry_type, SyncEntry.kind, func.count())
+        .where(SyncEntry.user_id == uid, SyncEntry.deleted_at.is_(None))
+        .group_by(SyncEntry.entry_type, SyncEntry.kind)
+    )
+
+    notes = 0
+    named = {"image": 0, "file": 0, "html": 0}
+    clipboard = 0
+    for entry_type, kind, count in rows:
+        if entry_type == "note":
+            notes += count
+            continue
+        clipboard += count
+        if kind in named:
+            named[kind] += count
+
+    text = clipboard - named["image"] - named["file"] - named["html"]
+    return BreakdownOut(
+        clipboard=clipboard,
+        notes=notes,
+        total=clipboard + notes,
+        text=text,
+        image=named["image"],
+        file=named["file"],
+        html=named["html"],
+    )
 

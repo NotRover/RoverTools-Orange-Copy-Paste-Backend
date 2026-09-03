@@ -288,3 +288,55 @@ async def test_an_oversized_batch_is_rejected_outright(
 
     resp = await client.post("/api/v1/sync/push", json={"entries": entries}, headers=headers)
     assert resp.status_code == 422
+
+
+async def test_breakdown_counts_live_rows_by_kind(
+    client: AsyncClient, auth_headers: dict
+):
+    """The cloud bar's numbers come straight from one GROUP BY: notes split out,
+    clipboard split by kind, a tombstone counted in neither, and an unknown kind
+    folded into text so the parts sum to `clipboard`."""
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+
+    def _kind(cid: str, entry_type: str, kind: str | None) -> dict:
+        now = _now_ms()
+        return {
+            "client_id": cid,
+            "entry_type": entry_type,
+            "kind": kind,
+            "encrypted_content": "dGVzdA==",
+            "created_at": now - 1000,
+            "updated_at": now,
+            "deleted_at": None,
+        }
+
+    entries = [
+        _kind("bd-text-1", "clipboard", "text"),
+        _kind("bd-text-2", "clipboard", "text"),
+        _kind("bd-legacy", "clipboard", None),  # counts as text
+        _kind("bd-image", "clipboard", "image"),
+        _kind("bd-file", "clipboard", "file"),
+        _kind("bd-html", "clipboard", "html"),
+        _kind("bd-note", "note", "text"),
+    ]
+    await client.post("/api/v1/sync/push", json={"entries": entries}, headers=headers)
+
+    # A tombstone must not be counted.
+    await client.post(
+        "/api/v1/sync/push",
+        json={"entries": [_entry("bd-gone", deleted=True)]},
+        headers=headers,
+    )
+
+    resp = await client.get("/api/v1/sync/breakdown", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "clipboard": 6,
+        "notes": 1,
+        "total": 7,
+        "text": 3,
+        "image": 1,
+        "file": 1,
+        "html": 1,
+    }

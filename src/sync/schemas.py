@@ -109,3 +109,24 @@ class PullResponse(BaseModel):
 
 class CursorUpdateRequest(BaseModel):
     last_server_ts: int
+
+
+# ── Breakdown ─────────────────────────────────────────────────────────────────
+
+
+class BreakdownOut(BaseModel):
+    """How many live rows the account holds, split the way the account screen
+    draws its cloud bar. Counts only, from one aggregate query — no ciphertext
+    crosses the wire, so it answers in milliseconds where paging every row did
+    not. `kind` is the plaintext label the server already routes on; `text` is
+    every clipboard row that is not one of the three named kinds (an older row
+    with no kind lands here too), so the parts always sum to `clipboard`.
+    """
+
+    clipboard: int
+    notes: int
+    total: int
+    text: int
+    image: int
+    file: int
+    html: int
