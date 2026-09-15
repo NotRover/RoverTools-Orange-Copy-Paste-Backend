@@ -862,7 +862,7 @@ cat ~/.ssh/id_repo.pub
 
 # 2. Clone the repo into ~/app with that key:
 GIT_SSH_COMMAND='ssh -i ~/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' \
-  git clone git@github.com:Spectrewolf8/RoverTools-Smart-Clipboard-App-Backend.git ~/app
+  git clone git@github.com:NotRover/RoverTools-Smart-Clipboard-App-Backend.git ~/app
 
 # 3. Secrets — .env lives INSIDE the checkout (git-ignored, so `git reset --hard` keeps it):
 install -m 600 /dev/null ~/app/.env    # then fill it (see Secrets below)
