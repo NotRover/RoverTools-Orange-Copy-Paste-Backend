@@ -57,7 +57,7 @@ forever; if that ever happens, rotate it, do not edit it out.
 | Timezone | UTC |
 | Admin user | `ubuntu` (passwordless `sudo`) |
 | `root` | locked — no root login by any path, including the console |
-| Deploy runs as | `ubuntu` in `~/app`, pulling with a read-only deploy key (section 4) |
+| Deploy runs as | `ubuntu` in `~/app`, pulling read-only over HTTPS with a fine-grained token (section 5.6) |
 
 ---
 
@@ -243,9 +243,9 @@ a break.
   `docker-buildx` deliberately left out — the plain builder is enough for the on-box build.
 - **Runs as `ubuntu`** — the login user owns the checkout (`~/app`) and runs the deploy
   timer. Because deploys are **polled**, nothing logs in to deploy, so a dedicated service
-  account buys little; the box reaches **out** to GitHub with an **outbound, read-only** repo
-  deploy key (`~/.ssh/id_repo`), and nothing reaches in. `.env` lives inside the checkout,
-  git-ignored, mode 600 (a `git reset --hard` leaves ignored files alone).
+  account buys little; the box reaches **out** to GitHub with an **outbound, read-only**
+  fine-grained token over HTTPS (section 5.6), and nothing reaches in. `.env` lives inside
+  the checkout, git-ignored, mode 600 (a `git reset --hard` leaves ignored files alone).
   - **Historical:** earlier designs added a separate `deploy` user — first with an inbound,
     forced-command-locked CI key (`id_ci`) for a GitHub Actions push-deploy, then as a no-SSH
     service account. Both were dropped for the simpler "run as `ubuntu`, poll git" model. On a
@@ -276,7 +276,7 @@ list rather than a hunt. Nothing here is optional except where marked:
 | 4 | Patch, then firewall (deny by default) | 5.3 |
 | 5 | Brute-force protection + unattended upgrades | 5.4 |
 | 6 | Docker, and the user that runs the deploy | 5.5 |
-| 7 | Read-only deploy key for the repo | 5.6 |
+| 7 | Read-only pull token for the repo (HTTPS) | 5.6 |
 | 8 | DNS: both hostnames, before first deploy | 5.7 |
 | 9 | Persistent, capped journal for container logs | 5.8 |
 | 10 | Swap file (2 GB, `nofail`, swappiness 10) | 5.9 |
@@ -449,19 +449,28 @@ docker.sock` — the new group is not active in the shell that added it. `newgrp
 logging out and back in) fixes it. Note `docker` group membership is root-equivalent
 (section 4).
 
-### 5.6 Read-only deploy key
+### 5.6 Read-only pull token (HTTPS)
 
-The deploy runs as `ubuntu` (section 4), so the outbound key that `git fetch` uses lives in
-`ubuntu`'s home. It is **read-only** — the box only ever pulls — and never leaves the box.
+The deploy runs as `ubuntu` (section 4) and only ever pulls, so the box needs read-only
+outbound access to the private repo and nothing more.
 
-```bash
-ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_repo -C 'rovertools-box-readonly'
-cat ~/.ssh/id_repo.pub
-#   -> add that PUBLIC key as a READ-ONLY Deploy key on the GitHub repo.
-```
+**Why not a deploy key.** The original design used an SSH deploy key. The `NotRover` org
+disables deploy keys by policy ("Disabled by NotRover" on the repo's Deploy keys page, no
+per-repo override), so the box authenticates with a **fine-grained personal access token**
+over HTTPS instead. The security profile is the same as the old key: read-only, one repo,
+lives only on the box.
 
-The rest of the wiring — cloning the repo, `.env`, and the systemd timer — is in section 9,
-since it depends on the repo files.
+Create the token in GitHub (owner **NotRover** approves it, since it targets an org repo):
+
+- Settings -> Developer settings -> Fine-grained tokens -> Generate new token.
+- Resource owner **NotRover**; repository access limited to
+  `RoverTools-Smart-Clipboard-App-Backend`; Repository permission **Contents: Read-only**.
+- Fine-grained tokens must expire (max ~1 year). Set a reminder to rotate before then;
+  an expired token makes every deploy poll fail on `git fetch` until it is replaced.
+
+The token is embedded in the `origin` remote URL on the box (see section 9), so it lands in
+`~/app/.git/config` — `chmod 600` that file. The rest of the wiring — cloning the repo,
+`.env`, and the systemd timer — is in section 9, since it depends on the repo files.
 
 **Historical:** an earlier design added a separate `deploy` user with an inbound,
 forced-command-locked CI key (`id_ci`) for a GitHub Actions push-deploy. The poll model
@@ -733,7 +742,7 @@ The box **reaches out** to GitHub; nothing reaches in. A systemd timer runs `dep
 
 ```
 push to main ─▶ GitHub (repo only)
-                   ▲  git fetch (read-only deploy key, outbound)
+                   ▲  git fetch (read-only token over HTTPS, outbound)
                    │
    systemd timer ─▶ deploy.sh:  origin/main moved?
                                    ├─ no  → exit (quiet no-op, the common case)
@@ -851,18 +860,18 @@ eviction is safe *only because* the backend re-`SET`s presence keys on every hea
 
 Runs as the login user (`ubuntu`), which is already in the `docker` group, in `~/app`. No
 separate service account: polling means nothing logs in to deploy, so a dedicated user buys
-little here and adds friction. The box reaches **out** to GitHub with a read-only deploy key;
-nothing reaches in.
+little here and adds friction. The box reaches **out** to GitHub with a read-only token over
+HTTPS (section 5.6); nothing reaches in.
 
 ```bash
-# 1. A read-only deploy key so the box can pull the private repo (outbound):
-ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_repo -C 'rovertools-box-readonly'
-cat ~/.ssh/id_repo.pub
-#   -> add that PUBLIC key in GitHub: repo -> Settings -> Deploy keys -> Add (read-only, NO write).
+# 1. Create a read-only fine-grained token (section 5.6) and keep it handy as $TOKEN.
+#    Owner NotRover, repo RoverTools-Smart-Clipboard-App-Backend, Contents: Read-only.
 
-# 2. Clone the repo into ~/app with that key:
-GIT_SSH_COMMAND='ssh -i ~/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' \
-  git clone git@github.com:NotRover/RoverTools-Smart-Clipboard-App-Backend.git ~/app
+# 2. Clone the repo into ~/app over HTTPS with that token, then lock down .git/config:
+git clone "https://x-access-token:${TOKEN}@github.com/NotRover/RoverTools-Smart-Clipboard-App-Backend.git" ~/app
+chmod 600 ~/app/.git/config
+#   The token is now embedded in the origin remote URL; deploy.sh's git fetch uses it as-is.
+#   To rotate: git -C ~/app remote set-url origin "https://x-access-token:<new>@github.com/NotRover/RoverTools-Smart-Clipboard-App-Backend.git"
 
 # 3. Secrets — .env lives INSIDE the checkout (git-ignored, so `git reset --hard` keeps it):
 install -m 600 /dev/null ~/app/.env    # then fill it (see Secrets below)
@@ -1602,6 +1611,16 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   new costume - **so the installer now always prints `N checked, M updated`, and exits
   non-zero if it finds nothing to check.** Silence had been indistinguishable from a healthy
   no-change run three times; it no longer is.
+- **2026-09-16 - repos moved to the NotRover org; box auth switched off deploy keys.** All
+  Orange Copy Paste repos were transferred from the `Spectrewolf8` account to the `NotRover`
+  org (same repo names). The read-only deploy key transferred with the repo but the org
+  disables deploy keys by policy ("Disabled by NotRover", no per-repo override), so `git
+  fetch` failed with "Repository not found". Switched the box to a fine-grained
+  **Contents: Read-only** token over HTTPS, embedded in the `origin` remote URL (section
+  5.6, section 9); `deploy.sh` is unchanged because git ignores its `GIT_SSH_COMMAND` for an
+  HTTPS remote. Trade-off: the token expires (max ~1 year) and must be rotated, where the
+  deploy key did not. The old `~/.ssh/id_repo` key and the disabled GitHub deploy key are
+  now unused and can be removed.
 
 ---
 
