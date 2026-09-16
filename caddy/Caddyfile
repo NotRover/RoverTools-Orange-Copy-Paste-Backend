@@ -1,6 +1,10 @@
 # Reverse proxy + automatic TLS for the self-hosted backend.
 # Swap the hostname (and PUBLIC_BASE_URL in .env) to move domains.
-rovertools-temp.ctx.cl {
+# Both names resolve to this box and serve the same API. `api.rovertools.ctx.cl`
+# is the current name; `rovertools-temp.ctx.cl` is kept as an alias so app installs
+# shipped before the rename (which have the temp host baked in as their default
+# server URL) keep syncing. Drop the temp name once those installs have updated.
+api.rovertools.ctx.cl, rovertools-temp.ctx.cl {
 	encode zstd gzip
 
 	reverse_proxy {
@@ -29,7 +33,7 @@ rovertools-temp.ctx.cl {
 # published bare it is a free reconnaissance page for the box. Credentials come from
 # .env via the caddy service's environment (docs/DEPLOY.md section 12); Caddy refuses
 # to start if METRICS_AUTH_HASH is unset, which is the intended failure.
-rovertools-status.ctx.cl {
+status.rovertools.ctx.cl {
 	encode zstd gzip
 
 	basic_auth {
