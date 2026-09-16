@@ -1,10 +1,6 @@
 # Reverse proxy + automatic TLS for the self-hosted backend.
 # Swap the hostname (and PUBLIC_BASE_URL in .env) to move domains.
-# Both names resolve to this box and serve the same API. `api.rovertools.ctx.cl`
-# is the current name; `rovertools-temp.ctx.cl` is kept as an alias so app installs
-# shipped before the rename (which have the temp host baked in as their default
-# server URL) keep syncing. Drop the temp name once those installs have updated.
-api.rovertools.ctx.cl, rovertools-temp.ctx.cl {
+api.rovertools.ctx.cl {
 	encode zstd gzip
 
 	reverse_proxy {
