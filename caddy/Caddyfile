@@ -1,6 +1,6 @@
 # Reverse proxy + automatic TLS for the self-hosted backend.
 # Swap the hostname (and PUBLIC_BASE_URL in .env) to move domains.
-api.rovertools.ctx.cl {
+api.orangecp.rovertools.ctx.cl {
 	encode zstd gzip
 
 	reverse_proxy {

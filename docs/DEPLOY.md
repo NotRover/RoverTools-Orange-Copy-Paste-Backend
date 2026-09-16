@@ -51,7 +51,7 @@ forever; if that ever happens, rotate it, do not edit it out.
 | Hostname | `your-vps-hostname` |
 | IPv4 | `203.0.113.10` |
 | IPv6 | `2001:db8::1` |
-| Domain | `api.rovertools.ctx.cl` (FreeDNS) -> `203.0.113.10`; status at `status.rovertools.ctx.cl` |
+| Domain | `api.orangecp.rovertools.ctx.cl` (FreeDNS) -> `203.0.113.10`; status at `status.rovertools.ctx.cl` |
 | OS | Ubuntu 26.04 LTS (resolute) |
 | Size | 2 vCPU - 3.7 GiB RAM - 38 GB disk, plus a 2 GB swap file (section 5.9) |
 | Timezone | UTC |
@@ -480,10 +480,10 @@ dropped it. On a box provisioned under the old design, remove the whole account:
 ### 5.7 Domain (FreeDNS)
 
 The name Caddy gets its TLS cert for. At `freedns.afraid.org`, add an **A** record for a
-subdomain pointing at the box's IPv4. The API is `api.rovertools.ctx.cl` -> `203.0.113.10`,
+subdomain pointing at the box's IPv4. The API is `api.orangecp.rovertools.ctx.cl` -> `203.0.113.10`,
 and the status dashboard is `status.rovertools.ctx.cl` -> the same box.
 
-**Verify:** `nslookup api.rovertools.ctx.cl 8.8.8.8` returns `203.0.113.10`.
+**Verify:** `nslookup api.orangecp.rovertools.ctx.cl 8.8.8.8` returns `203.0.113.10`.
 
 **What bit us:** the first record pointed at the wrong IP; fix the A record's destination in
 the FreeDNS panel. DNS negatively caches, so a resolver queried too early (Cloudflare's
@@ -803,7 +803,7 @@ script), not proxy tuning.
                                  \
                                   \----------> netdata (metrics dashboard)  [in-compose]
 
-   api.rovertools.ctx.cl   -> api
+   api.orangecp.rovertools.ctx.cl   -> api
    status.rovertools.ctx.cl -> netdata (basic auth)
 ```
 
@@ -830,7 +830,7 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
   build context.
 - **`docker-compose.prod.yml`** — `caddy` (published 80/443), `api` (`build: .`, tagged
   `${IMAGE}`, no host port), `redis` (no host port). The dev `docker-compose.yml` is untouched.
-- **`caddy/Caddyfile`** — `api.rovertools.ctx.cl` and the status site, auto TLS. The `dynamic a` upstream (via Docker
+- **`caddy/Caddyfile`** — `api.orangecp.rovertools.ctx.cl` and the status site, auto TLS. The `dynamic a` upstream (via Docker
   DNS `127.0.0.11`) re-resolves `api` per request, so after a recreate Caddy finds the new
   container's IP instead of caching the dead one. No retry directives — see "What zero
   downtime means here" for why they do not help with a single container.
@@ -913,7 +913,7 @@ Never in the image, never in git. They live in `~/app/.env` (`/home/ubuntu/app/.
 - `APP_ENV=production`, `DOCS_ENABLED=false`.
 - `METRICS_AUTH_USER`, `METRICS_AUTH_HASH` — read by **Caddy**, never by the app. Basic auth
   for the Netdata dashboard (section 12). Caddy refuses to start without the hash, on purpose.
-- **`PUBLIC_BASE_URL=https://api.rovertools.ctx.cl`** — the base of every user-facing link
+- **`PUBLIC_BASE_URL=https://api.orangecp.rovertools.ctx.cl`** — the base of every user-facing link
   (invites, password-reset redirect). `APP_CORS_ORIGINS` already lists the Tauri client
   origins and does not change.
 
@@ -940,7 +940,7 @@ that is a separate, deliberate `migrate.yml` downgrade — the real protection i
 ## 10. Verify the deployment
 
 ```bash
-curl -i https://api.rovertools.ctx.cl/internal/healthz
+curl -i https://api.orangecp.rovertools.ctx.cl/internal/healthz
 ```
 
 Check, in order:
@@ -952,7 +952,7 @@ Check, in order:
 - **Auth works end to end** — sign in via Supabase, then call an authenticated route with
   `Authorization: Bearer <jwt>` and `X-Device-Id: <id>`. A 401 here almost always means a
   JWT config mismatch (section 13).
-- **WebSocket connects and stays open**: `wss://api.rovertools.ctx.cl/ws?token=<jwt>&device_id=<id>`.
+- **WebSocket connects and stays open**: `wss://api.orangecp.rovertools.ctx.cl/ws?token=<jwt>&device_id=<id>`.
 - If `ADMIN_API_KEY` is set, `/internal/metrics` with `X-Admin-Key` returns 200 (503 means
   the key is unset).
 
@@ -962,7 +962,7 @@ watch the swap; measure the gap rather than assume it:
 ```bash
 cd ~/app && ./deploy/deploy.sh --force >/tmp/deploy.log 2>&1 &
 while kill -0 $! 2>/dev/null; do
-  curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" https://api.rovertools.ctx.cl/internal/healthz
+  curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" https://api.orangecp.rovertools.ctx.cl/internal/healthz
   sleep 0.3
 done
 ```
@@ -981,7 +981,7 @@ authenticates against Supabase directly and forwards the access token as an opaq
 it never inspects the JWT, so the asymmetric-key change in section 7a needs no client change.
 
 **`DEFAULT_SERVER_URL` in `orange-copy-paste-clipboard-app-rust/src-tauri/src/sync/config.rs`
-now points at `https://api.rovertools.ctx.cl`** — repointed off Render in source, but baked in
+now points at `https://api.orangecp.rovertools.ctx.cl`** — repointed off Render in source, but baked in
 at build time, so it reaches users only in a **client release** (none shipped yet). An existing
 install can be repointed sooner by editing `sync_server_url` in `settings.json`. The old Render
 service is retired, so there is no endpoint running in parallel during the switch — anyone who
@@ -1055,7 +1055,7 @@ that comes up unprotected.
 | Check | Where | Why it is not the default |
 |---|---|---|
 | `api_direct` -> `http://api:8000/internal/healthz` | `netdata/conf/go.d/httpcheck.conf` | Matches the **body** for `"status":"ok"` |
-| `api_public` -> `https://api.rovertools.ctx.cl/internal/healthz` | same | Same match, through Caddy and TLS |
+| `api_public` -> `https://api.orangecp.rovertools.ctx.cl/internal/healthz` | same | Same match, through Caddy and TLS |
 
 Neither is bind-mounted. Netdata's entrypoint copies stock config into `/etc/netdata` on
 every start, so a read-only mount anywhere under that path makes the copy fail and the
@@ -1226,7 +1226,7 @@ free to fix.
 
 **What this still cannot tell you.** Netdata runs on the box it watches, so if the VPS is down
 or off the network, the dashboard is down with it and no alert is sent. A **free external
-check** (UptimeRobot, Better Stack) hitting `https://api.rovertools.ctx.cl/internal/healthz`
+check** (UptimeRobot, Better Stack) hitting `https://api.orangecp.rovertools.ctx.cl/internal/healthz`
 with a keyword match on `"status":"ok"` is the only thing that catches a whole-box outage. Run
 one alongside this; it is the one piece that cannot live on the box.
 
@@ -1391,7 +1391,7 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 
 - **Host** — self-hosted OVH VPS-1, replacing Render. Fixed monthly cost, full control, and
   Redis co-located so it can bind to an internal network with no tunnel or TLS.
-- **Ingress/domain** — a free FreeDNS name, `api.rovertools.ctx.cl` -> `203.0.113.10`,
+- **Ingress/domain** — a free FreeDNS name, `api.orangecp.rovertools.ctx.cl` -> `203.0.113.10`,
   Caddy owning TLS via Let's Encrypt. Chosen over: an owned domain (~$10/yr — swap later by
   changing one Caddyfile hostname + `PUBLIC_BASE_URL`), and a Cloudflare Tunnel (zero
   inbound ports but another hop in the WebSocket path and a daemon to keep up). Temp name
@@ -1422,7 +1422,7 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 **Open / to do:**
 
 - **Client cutover release (section 11)** — `DEFAULT_SERVER_URL` is repointed at
-  `https://api.rovertools.ctx.cl` in source, but it reaches users only in a client release,
+  `https://api.orangecp.rovertools.ctx.cl` in source, but it reaches users only in a client release,
   which has not shipped yet.
 - Retire the old push-deploy `deploy` user if the box still carries it: `sudo userdel -r
   deploy`, drop `deploy` from `AllowUsers`, `sudo rm -rf /opt/rovertools`.
@@ -1448,7 +1448,7 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   the *key passphrase*. Both are documented in section 2. KVM console login with the `ubuntu`
   password confirmed working.
 - **2026-08-24 — Docker + domain.** Installed Docker (Ubuntu packages) and pointed
-  `api.rovertools.ctx.cl` (FreeDNS) at the box. A `deploy` service account was created here
+  `api.orangecp.rovertools.ctx.cl` (FreeDNS) at the box. A `deploy` service account was created here
   under the push-deploy design, then dropped when the deploy moved to run as `ubuntu`; remove
   it if the box still has it. No application containers running yet.
 - **2026-08-24 — docs consolidated.** The Render/Supabase/R2 runbook and the two parent-repo
@@ -1466,7 +1466,7 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
   could not have on the Windows workstation: the `Caddyfile` needed the block form of
   `dynamic a` (the inline `resolvers` failed to parse and crash-looped caddy), and container
   logs moved to the persistent `journald` driver so they survive a rollout (section 5.8, 12).
-  `https://api.rovertools.ctx.cl/internal/healthz` returns 200 with `db` and `redis` ok, valid
+  `https://api.orangecp.rovertools.ctx.cl/internal/healthz` returns 200 with `db` and `redis` ok, valid
   TLS, `via: 1.1 Caddy`. Backend is live; client cutover still pending (section 11).
 - **2026-08-24 — deploy rollover: accept the blip.** Weighed docker-rollout (declined:
   third-party script with Docker/root access) and Swarm (declined: cluster-weight on one host,

@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     # this service puts in front of a person (space invites, the password-reset
     # redirect). Single source, so pointing a domain at the deployment is an env
     # change rather than a code change. No trailing slash.
-    public_base_url: str = "https://api.rovertools.ctx.cl"
+    public_base_url: str = "https://api.orangecp.rovertools.ctx.cl"
     # Where a password-reset mail lands. The page lives on the static site, not
     # here: it needs nothing from a server, and hosting it away from the API means
     # a reset survives the API changing hostname - which is not hypothetical, it is

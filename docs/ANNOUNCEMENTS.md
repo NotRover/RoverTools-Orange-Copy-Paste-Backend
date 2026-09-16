@@ -34,7 +34,7 @@ one.
 
 ```bash
 export ADMIN_KEY='<the value from the service environment>'
-export API='https://api.rovertools.ctx.cl'
+export API='https://api.orangecp.rovertools.ctx.cl'
 ```
 
 ## Send one to everybody
