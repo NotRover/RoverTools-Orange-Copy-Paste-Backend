@@ -62,6 +62,86 @@ flowchart TB
 The desktop app remains fully functional offline; sync is opportunistic and resumes
 on reconnect.
 
+### 1.1 Project structure
+
+Each package under `src/` owns a router + service (+ models/schemas); section 2 walks
+through what each one does.
+
+```filetree
+src/
+├── main.py                     # App composition, router mounting, OpenAPI tags
+├── version.py                  # Single source for API/service versions + route prefixes
+├── config.py                   # Env-driven settings
+├── database.py                 # SQLAlchemy async engine + session
+├── redis_client.py             # Redis connection (pub/sub + presence)
+├── dependencies.py             # Shared JWT verification + X-Device-Id extraction
+├── middleware.py               # Security headers + X-API-Version
+├── limiter.py                  # slowapi rate limiting
+├── background.py               # In-process jobs under a Postgres advisory lock
+├── email.py                    # Transactional email via FastAPI BackgroundTasks
+├── supabase_admin.py           # Supabase admin (service-role) calls
+├── realtime.py                 # WebSocket endpoint, in-process hub, Redis fan-out, presence
+├── auth/                       # Profiles, devices, public-key registration, bootstrap
+│   ├── router.py               # HTTP routes
+│   ├── service.py              # Domain logic
+│   ├── models.py               # ORM models
+│   ├── schemas.py              # Pydantic request/response shapes
+│   └── tokens.py               # Supabase token verification (verify only, never sign)
+├── sync/                       # Push/pull/cursor, last-write-wins
+│   ├── router.py
+│   ├── service.py
+│   ├── models.py               # sync_entries, sync_cursors
+│   └── schemas.py
+├── settings/                   # Encrypted settings blob
+│   ├── router.py
+│   ├── service.py
+│   ├── models.py
+│   └── schemas.py
+├── spaces/                     # Spaces, invites, and space-key distribution
+│   ├── router.py
+│   ├── service.py
+│   ├── invites.py              # Invite create/accept/revoke
+│   ├── join_requests.py        # Join request, owner approval, key wrap
+│   ├── models.py
+│   └── schemas.py
+├── blobs/                      # Presigned upload/download + quota
+│   ├── router.py
+│   ├── service.py
+│   ├── s3.py                   # S3/R2 presign
+│   ├── models.py
+│   └── schemas.py
+├── announcements/              # Server-authored messages to users
+│   ├── router.py
+│   ├── service.py
+│   ├── models.py
+│   └── schemas.py
+├── admin/                      # Internal stats/ops
+│   ├── router.py
+│   ├── service.py
+│   └── schemas.py
+└── web/                        # Human-facing HTML pages
+    ├── router.py
+    └── templates/              # shell.html, join.html, email_*.html
+migrations/                     # Alembic
+├── env.py
+├── script.py.mako
+└── versions/                   # Revisions through 0019
+tests/                          # pytest, one module per domain (test_auth, test_sync, etc.)
+caddy/                          # Caddyfile (reverse proxy + TLS)
+deploy/                         # On-box build-and-deploy, polled by a systemd timer
+├── deploy.sh
+├── rovertools-deploy.service
+└── rovertools-deploy.timer
+netdata/                        # Host metrics config
+scripts/                        # One-off scripts (render_supabase_emails.py)
+docs/                           # architecture.md (this file), DEPLOY.md, ANNOUNCEMENTS.md
+Dockerfile
+docker-compose.yml              # Dev stack
+docker-compose.prod.yml         # Production stack
+alembic.ini
+pyproject.toml                  # uv-managed dependencies
+```
+
 ---
 
 ## 2. Service Boundaries
