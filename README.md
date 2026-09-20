@@ -38,7 +38,7 @@ It is a **stateless relay and store**. All encryption happens on the client, so 
 
 - **Auth is delegated.** The client authenticates against Supabase directly and attaches the resulting access token to every call here. This service verifies it — asymmetric ES256/RS256 against the project's JWKS, or legacy HS256 for older projects — and reads `sub` as the user id. There is no login, refresh, or password route on this server.
 - **Sync is last-write-wins.** Entries are keyed by `(user_id, client_id, entry_type)` and resolved on `updated_at`. Deletes are tombstones — a push carrying `deleted_at` — so there is deliberately no delete route, and a tombstone always wins a conflict.
-- **Realtime is horizontal.** Each process holds its own WebSocket connections and subscribes to Redis (`user:*`, `group:*`). Any process can publish, so every replica delivers, and the API scales out behind a load balancer without sticky sessions.
+- **Realtime is horizontal.** Each process holds its own WebSocket connections and subscribes to Redis (`user:*`, `space:*`). Any process can publish, so every replica delivers, and the API scales out behind a load balancer without sticky sessions.
 - **Blobs bypass the API.** Large attachments are uploaded straight to object storage through presigned URLs; the service only issues them, tracks quota, and reaps unconfirmed uploads.
 - **Background work runs in-process.** One replica wins a Postgres advisory lock and becomes the leader, sweeping expired device presence every minute and orphaned blobs hourly. No Celery, no beat scheduler.
 
@@ -107,22 +107,22 @@ All settings come from environment variables (or `.env`) via `pydantic-settings`
 
 ## API surface
 
-Product endpoints are versioned; infrastructure probes deliberately are not, because load balancers and metrics scrapers hardcode their paths. Prefixes come from `src/version.py` — never hardcode `/api/v1`. Every response carries an `X-API-Version` header.
+Product endpoints are versioned under `/api/v1`; infrastructure probes deliberately are not, because load balancers and metrics scrapers hardcode their paths. Prefixes come from `src/version.py` — never hardcode `/api/v1`. Every response carries an `X-API-Version` header.
 
-| Area | Prefix | Endpoints |
-| --- | --- | --- |
-| **auth** | `/api/v1/auth` | `POST /bootstrap` · `PUT /umk` · `POST /devices` · `GET /devices` · `DELETE /devices/{id}` · `POST /keys/register` · `GET /umk/device` · `POST /devices/{id}/key-wrap` |
-| **sync** | `/api/v1/sync` | `POST /push` · `GET /pull` · `POST /cursor` · `GET /status` |
-| **settings** | `/api/v1/settings` | `GET` · `PUT` (encrypted blob, last-write-wins) |
-| **blobs** | `/api/v1/blobs` | `POST /request-upload` · `POST /confirm-upload` · `GET /{key}/download-url` · `GET /quota` |
-| **groups** | `/api/v1/groups` | create/list/get · `POST /{id}/invite` · `POST /join` · `POST /{id}/invites` · `POST /{id}/keys` · remove member · delete group |
-| **sharing** | `/api/v1/sharing` | `POST /invite` · `GET /sessions` · `PATCH /sessions/{id}/scope` · `DELETE /sessions/{id}` · `DELETE /sessions/{id}/leave` |
-| **invites** | `/api/v1/invites` | `GET` · `POST /{id}/accept` · `POST /{id}/decline` · `DELETE /{id}` |
-| **realtime** | `/ws` | WebSocket: `?token=<jwt>&device_id=<id>` |
-| **ops** | `/internal` | `GET /healthz` (public) · `GET /metrics` (Prometheus, admin key) |
-| **admin** | `/internal/v1` | `GET /stats` · user list/detail · quota patch · suspend · delete (all require `X-Admin-Key`) |
+The domains, at a glance:
 
-**WebSocket events** are published to `user:{id}` and `group:{id}` channels: `sync:entry`, `group:membership_changed`, `group:rekey`, `invite:received`, `invite:updated`, `sharing:ended`, `sharing:scope_changed`, plus presence. Events carry an origin device so a client never re-applies its own write.
+- **auth** — account bootstrap, master-key and recovery-key storage, device registration, public-key registration and per-device key wrapping.
+- **sync** — push, pull, cursor, and a per-type breakdown; last-write-wins.
+- **settings** — one encrypted per-user settings blob.
+- **blobs** — presigned upload/download, confirm/release, and quota.
+- **spaces** — shared spaces, membership, and space-key distribution.
+- **invites** — space invitations: list, accept, decline, revoke, and key delivery.
+- **realtime** — the `/ws` WebSocket, authenticated with `?token=<jwt>&device_id=<id>`; events are published to `user:{id}` and `space:{id}` channels (`sync:entry`, `space:membership_changed`, `space:rekey`, `invite:*`, and presence) and carry an origin device so a client never re-applies its own write.
+- **ops / admin** — unversioned `/internal` probes and metrics, and the versioned `/internal/v1` management API behind `X-Admin-Key`.
+
+The full, current endpoint list, payload shapes, and event protocol live in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the source of truth for the wire
+contract. This overview intentionally does not restate them, so it cannot drift.
 
 ---
 
@@ -134,7 +134,7 @@ These bind this service to the desktop app. Changing one side means changing the
 - **`entry_type` is singular** — `"clipboard"` or `"note"`.
 - **Deletes are tombstones.** Push with `deleted_at` set; tombstones beat any concurrent edit regardless of timestamp.
 - **The server cannot read content.** Entry bodies are AES-256-GCM ciphertext bound to their `client_id` as AAD. It stores the user's password-wrapped master key, per-device wrapped copies, and X25519-wrapped group keys — all opaque blobs it has no key for.
-- **Group keys are distributed, not derived.** A random per-group key is wrapped separately for each member's public key; membership changes trigger a `group:rekey` event rather than any server-side key handling.
+- **Space keys are distributed, not derived.** A random per-space key is wrapped separately for each member's public key; membership changes trigger a `space:rekey` event rather than any server-side key handling.
 
 The definitive reference for payload shapes, data models, and the event protocol is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -157,7 +157,7 @@ src/
 ├─ email.py             # Brevo / SMTP delivery for invites
 ├─ supabase_admin.py    # Supabase Admin API calls (ban, delete)
 ├─ auth/                # profiles, bootstrap, devices, public keys; tokens.py verifies JWTs
-├─ sync/                # push/pull/cursor/status + last-write-wins service
+├─ sync/                # push/pull/cursor/breakdown + last-write-wins service
 ├─ settings/            # encrypted per-user settings blob
 ├─ spaces/              # spaces, invites, join approval, space-key distribution
 ├─ blobs/               # presigned upload/download (s3.py), quota accounting
@@ -201,14 +201,13 @@ docker-compose exec db createdb -U postgres clipboard_test
 
 The backend is self-hosted on a small VPS in Docker: Caddy (TLS + reverse proxy) in front of the stateless FastAPI service, with Redis co-located for realtime fan-out and presence. Supabase (Postgres + Auth) and Cloudflare R2 (blobs) stay external. Deploys are pull-based with no CI service or registry: a systemd timer on the box polls `main`, and on a new commit it builds the image locally and recreates the container. There is one replica, so a deploy has a ~1-3s window where a request can get a 502 and realtime clients reconnect once — accepted deliberately rather than running an overlap tool ([`docs/DEPLOY.md`](docs/DEPLOY.md)).
 
-The `Dockerfile` builds from the lockfile and honours `$PORT`, so the image also runs unchanged under plain `docker run`. The full walkthrough — hardening the box, provisioning Supabase and R2, applying migrations, the compose/Caddy/deploy setup, verification, and pointing the desktop app at it — is in [`docs/DEPLOY.md`](docs/DEPLOY.md).
+The `Dockerfile` builds from the lockfile and honours `$PORT`, so the image also runs unchanged under plain `docker run`. The full walkthrough — provisioning Supabase and R2, applying migrations, the compose/Caddy/deploy setup, verification, and pointing the desktop app at it — is in [`docs/DEPLOY.md`](docs/DEPLOY.md), with a friendlier version on the [docs site](https://orange-copy-paste-app.pages.dev).
 
 ---
 
 ## Further reading
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview, service boundaries, data models, full API and WebSocket event reference. The source of truth for the wire contract.
-- [`docs/DEPLOY.md`](docs/DEPLOY.md) — production deployment and ongoing operations.
+- [`docs/DEPLOY.md`](docs/DEPLOY.md) — self-hosting: deployment and ongoing operations, with placeholders for your own host, domain, and secrets.
 - [`docs/ANNOUNCEMENTS.md`](docs/ANNOUNCEMENTS.md) — sending a message to users from the server: the calls, the fields, and how to word one.
-- [`TODO.md`](TODO.md) — planned work and known gaps.
 - Client repo `docs/ARCHITECTURE.md` — how the desktop app consumes this API.
