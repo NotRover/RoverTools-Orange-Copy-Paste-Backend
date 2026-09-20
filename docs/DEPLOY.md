@@ -5,8 +5,8 @@ recover it, harden it, and deploy the API onto it (Docker Compose + Caddy, deplo
 git poll on the box). Also
 the external services the backend depends on (Supabase, R2) and the migration discipline.
 **Not here:** the wire contract — routes, payloads, DDL, socket events, crypto envelope —
-which is [ARCHITECTURE.md](ARCHITECTURE.md); client internals (the app's own
-`docs/ARCHITECTURE.md`); who-may-do-what (`docs/PERMISSIONS.md` at the workspace root).
+which is [architecture.md](architecture.md); client internals (the app's own
+`docs/architecture.md`); who-may-do-what (`docs/permissions.md` at the workspace root).
 
 **Every host, domain, IP, and key value in this file is a placeholder** — `example.com`,
 `203.0.113.10` / `2001:db8::1`, `your-vps-hostname`, `SHA256:REDACTED-HOST-KEY`, and the
@@ -1296,9 +1296,15 @@ pub/sub traffic, so it stays small.
 a patch needs it (section 4); that briefly drops WebSockets and clients reconnect. Docker
 itself is patched the same way (Ubuntu packages).
 
-**Costs.** Fixed VPS cost, plus external tiers: R2's free tier (10 GB, zero egress) covers
-roughly 200 users at the 50 MB default quota; Supabase free works to start (expect ~$25/mo
-for Pro when you want no cold-database pauses). Redis is in-container and free.
+**Costs.** Fixed VPS cost, plus external tiers. **Supabase free** gives 500 MB Postgres +
+5 GB egress and **pauses after ~1 week idle**; text entries are tiny, so the DB is rarely
+the wall, and the meaningful first bill is **Supabase Pro (~$25/mo)** for always-on plus
+headroom. **R2 free** is 10 GB storage with **zero egress**, and ~$0.015/GB-mo beyond it —
+binary blobs are the real storage cost; at the 50 MB default quota the 10 GB free pool
+covers ~200 users before R2 costs anything. Redis is in-container and free. Per-user
+storage is capped by `profiles.blob_bytes_quota` (default 50 MB, set via
+`DEFAULT_BLOB_QUOTA_BYTES`, overridable per user via the admin quota endpoint) and a 5 MB
+per-entry hard cap.
 
 **Supabase and R2 stay external.** The migration onto the VPS did not touch them; the
 `DATABASE_URL` secret on the migrate workflow keeps working untouched.
@@ -1631,6 +1637,12 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 ## Local Development
 
 For a full local stack — Postgres, Redis, and MinIO standing in for R2 — see the
-`docker-compose.yml` at the repo root and the setup notes in the main `README`. You still
-need a real Supabase project locally, because the backend verifies Supabase-issued JWTs and
-never signs its own.
+`docker-compose.yml` at the repo root and the setup notes in the main `README`. The dev
+stack is three services (no worker service):
+
+- `api` — FastAPI `uvicorn --reload` on `:8000`.
+- `db` — `postgres:16-alpine`, the local stand-in for Supabase Postgres.
+- `redis` — `redis:7-alpine`.
+
+Blobs use MinIO or a real R2 bucket via env. You still need a real Supabase project
+locally, because the backend verifies Supabase-issued JWTs and never signs its own.

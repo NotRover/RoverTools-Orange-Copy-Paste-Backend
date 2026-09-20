@@ -27,7 +27,7 @@ approach.
 | `src/realtime.py` | WebSocket endpoint, in-process hub, Redis pub/sub fan-out |
 | `src/version.py` | Single source for API and service versions and route prefixes |
 | `migrations/` | Alembic migrations |
-| `docs/ARCHITECTURE.md` | The wire contract: routes, payloads, DDL, socket events, crypto envelope |
+| `docs/architecture.md` | The wire contract: routes, payloads, DDL, socket events, crypto envelope |
 | `tests/` | pytest suite, one module per domain |
 
 Routers stay thin: HTTP concerns in the route, logic in the domain service.
@@ -93,9 +93,9 @@ deliberate step, not automatically on deploy.
 
 ## The wire contract
 
-`docs/ARCHITECTURE.md` is the source of truth for everything that crosses the
+`docs/architecture.md` is the source of truth for everything that crosses the
 wire. A change to a payload, route, socket event, or the crypto envelope means a
-change to the client as well — coordinate both. Update `docs/ARCHITECTURE.md` in
+change to the client as well — coordinate both. Update `docs/architecture.md` in
 the same pull request as the code that changes the contract.
 
 ## License

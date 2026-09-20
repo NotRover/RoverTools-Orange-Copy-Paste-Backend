@@ -121,7 +121,7 @@ The domains, at a glance:
 - **ops / admin** — unversioned `/internal` probes and metrics, and the versioned `/internal/v1` management API behind `X-Admin-Key`.
 
 The full, current endpoint list, payload shapes, and event protocol live in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the source of truth for the wire
+[`docs/architecture.md`](docs/architecture.md) — the source of truth for the wire
 contract. This overview intentionally does not restate them, so it cannot drift.
 
 ---
@@ -136,7 +136,7 @@ These bind this service to the desktop app. Changing one side means changing the
 - **The server cannot read content.** Entry bodies are AES-256-GCM ciphertext bound to their `client_id` as AAD. It stores the user's password-wrapped master key, per-device wrapped copies, and X25519-wrapped group keys — all opaque blobs it has no key for.
 - **Space keys are distributed, not derived.** A random per-space key is wrapped separately for each member's public key; membership changes trigger a `space:rekey` event rather than any server-side key handling.
 
-The definitive reference for payload shapes, data models, and the event protocol is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+The definitive reference for payload shapes, data models, and the event protocol is [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -167,7 +167,7 @@ src/
 
 migrations/versions/    # Alembic 0001…0019
 tests/                  # pytest: auth, sync, blobs, space invites, announcements
-docs/                   # ARCHITECTURE.md, DEPLOY.md, ANNOUNCEMENTS.md
+docs/                   # architecture.md, DEPLOY.md, ANNOUNCEMENTS.md
 ```
 
 Routers stay thin — HTTP concerns in the route, logic in the domain service beside it.
@@ -207,7 +207,7 @@ The `Dockerfile` builds from the lockfile and honours `$PORT`, so the image also
 
 ## Further reading
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview, service boundaries, data models, full API and WebSocket event reference. The source of truth for the wire contract.
+- [`docs/architecture.md`](docs/architecture.md) — system overview, service boundaries, data models, full API and WebSocket event reference. The source of truth for the wire contract.
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — self-hosting: deployment and ongoing operations, with placeholders for your own host, domain, and secrets.
 - [`docs/ANNOUNCEMENTS.md`](docs/ANNOUNCEMENTS.md) — sending a message to users from the server: the calls, the fields, and how to word one.
-- Client repo `docs/ARCHITECTURE.md` — how the desktop app consumes this API.
+- Client repo `docs/architecture.md` — how the desktop app consumes this API.

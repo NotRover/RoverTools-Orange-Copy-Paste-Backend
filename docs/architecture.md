@@ -1,37 +1,14 @@
 # Orange Clipboard — Backend Architecture
 
 > **Project:** RoverTools Smart Clipboard Backend
-> **Status:** Implemented — reflects current source
-> **Last updated:** 2026-08-16
 > **Stack:** FastAPI + Supabase (Postgres + Auth) + Redis + S3-compatible blob storage
 
 **Owns:** the wire contract. Routes, payloads, DDL, socket events, the crypto envelope,
 and every rule the server itself enforces. If it crosses the network, its one true
 description is here, and a client doc that disagrees is wrong.
-**Not here:** client internals (`orange-copy-paste-clipboard-app-rust/docs/ARCHITECTURE.md`),
-who-may-do-what (root `docs/PERMISSIONS.md`), cross-component invariants (root
-`docs/ARCHITECTURE.md`). Link to those rather than restating them — one fact, one home.
-
----
-
-## Table of Contents
-
-1. [System Overview](#1-system-overview)
-2. [Service Boundaries](#2-service-boundaries)
-3. [Tech Stack](#3-tech-stack)
-4. [Data Models](#4-data-models)
-5. [API Design](#5-api-design)
-6. [Sync Strategy](#6-sync-strategy)
-7. [E2E Encryption Design](#7-e2e-encryption-design)
-8. [Realtime Architecture](#8-realtime-architecture)
-9. [Auth Flow](#9-auth-flow)
-10. [Background Maintenance](#10-background-maintenance)
-11. [Deployment Model & Cost](#11-deployment-model--cost)
-12. [Desktop App Integration](#12-desktop-app-integration)
-13. [Directory Layout](#13-directory-layout)
-14. [Client / Backend Contract Drift](#14-client--backend-contract-drift)
-15. [Spaces Design](#15-spaces-design)
-16. [Security Checklist](#16-security-checklist)
+**Not here:** client internals (`orange-copy-paste-clipboard-app-rust/docs/architecture.md`),
+who-may-do-what (root `docs/permissions.md`), cross-component invariants (root
+`docs/architecture.md`). Link to those rather than restating them — one fact, one home.
 
 ---
 
@@ -45,27 +22,32 @@ a load balancer, no sticky sessions.
 
 Two moving parts you operate (FastAPI + Redis); the rest is managed:
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                       Tauri Desktop App                            │
-│   ├─ Supabase Auth (GoTrue)  ── register / login / refresh / reset │
-│   ├─ HTTP  ── /api/v1/*   (Authorization: Bearer <supabase JWT>,    │
-│   │                        X-Device-Id: <device>)                  │
-│   └─ WS    ── /ws?token=<supabase JWT>&device_id=<device>          │
-└───────────────┬──────────────────────────────────┬────────────────┘
-                │                                   │
-        ┌───────▼────────────────┐         ┌────────▼───────────────────────┐
-        │  FastAPI (stateless ×N) │──SQL──► │  SUPABASE (managed)             │
-        │  auth · sync · settings │  verify │   • Postgres (app schema)       │
-        │  blobs · spaces+invites │  JWT──► │   • Auth (users, sessions,      │
-        │  /ws realtime · admin   │         │     email verify, pwd reset)    │
-        └───┬───────────────┬─────┘         └─────────────────────────────────┘
-            │               │
-     ┌──────▼─────┐  ┌──────▼────────────────┐
-     │  Redis     │  │  S3-compatible (R2)    │
-     │  pub/sub   │  │  image / file blobs    │
-     │  + presence│  │  (MinIO in dev)        │
-     └────────────┘  └────────────────────────┘
+```mermaid
+flowchart TB
+    app(["Tauri Desktop App<br/>Supabase Auth (GoTrue), HTTP /api/v1/*, WS /ws"]):::client
+
+    subgraph selfhost["You operate"]
+        direction LR
+        api["FastAPI, stateless (N replicas)<br/>auth, sync, settings, blobs,<br/>spaces + invites, realtime, admin"]:::svc
+        redis[("Redis<br/>pub/sub + presence")]:::store
+    end
+
+    subgraph managed["Managed services"]
+        direction LR
+        supa[("Supabase<br/>Postgres (app schema)<br/>Auth: users, sessions, verify, reset")]:::ext
+        r2[("S3-compatible R2<br/>image and file blobs<br/>MinIO in dev")]:::ext
+    end
+
+    app ==>|"HTTP + WebSocket"| api
+    app -.->|"GoTrue auth"| supa
+    api ==>|"SQL, verify JWT"| supa
+    api ==> redis
+    api ==> r2
+
+    classDef client fill:#20140f,stroke:#ff3e1c,stroke-width:2px,color:#fafafa
+    classDef svc fill:#1b1b1b,stroke:#9a9a9a,stroke-width:1.5px,color:#fafafa
+    classDef store fill:#161616,stroke:#6f6f6f,color:#e4e4e4
+    classDef ext fill:#141414,stroke:#4d4d4d,stroke-dasharray:5 3,color:#cfcfcf
 ```
 
 - **Supabase** owns the database and the identity layer. It is the only intentional
@@ -141,11 +123,9 @@ Brokers direct-to-object-store uploads.
 - `confirm-upload` → marks the blob confirmed. **This is where the meter starts:** a
   confirmed blob counts against the quota whether or not an entry references it yet.
 - `release` → un-confirms a blob whose entry never landed, giving the bytes straight
-  back. The client uploads and confirms *before* it pushes the entry, so a push that
-  the server refuses (or that fails locally after the upload) leaves an object nothing
-  points at. Without this the only collector is the 7-day unreferenced sweep, and a
-  retry loop mints a fresh object per attempt. Refuses with 409 while a live entry
-  still references the key, so it can never take an image away from an entry using it;
+  back (the client uploads and confirms *before* pushing the entry, so a refused or
+  locally-failed push leaves an orphan). Refuses with 409 while a live entry still
+  references the key, so it can never take an image away from an entry using it;
   404 if the key is not the caller's; a no-op (204) if it is already unconfirmed.
 - `{blob_key}/download-url` → presigned GET URL.
 - `quota` → usage (computed on demand: `SUM(size_bytes)` over confirmed blobs) and
@@ -155,18 +135,17 @@ Brokers direct-to-object-store uploads.
   globally and per-user via the admin API).
 
 **Every byte is charged to whoever uploaded it, and to nobody else.** `_used_bytes`
-sums `blobs` rows `WHERE user_id = <caller> AND confirmed`, and a `blobs` row is only
-ever created by `request-upload`, for the uploader. Receiving a shared image creates
-no row: `download-url` hands the reader a presigned GET on the *owner's* key
+sums `blobs` rows `WHERE user_id = <caller> AND confirmed`, and a row is only ever
+created by `request-upload`, for the uploader. Receiving a shared image creates no
+row: `download-url` hands the reader a presigned GET on the *owner's* key
 (`{owner_id}/{hex}`) after `_shares_space_with_blob` confirms a live entry carries it
 into a space they belong to, and answers 404 rather than 403 to everyone else so the
-key's existence is not confirmed. One bucket, namespaced by owner - not a bucket per
-user, and never a copy per reader.
+key's existence is not confirmed. One bucket, namespaced by owner.
 
-The consequence, which is deliberate: **the owner deleting the entry breaks it for
-every member.** `release_blob` marks the blob unconfirmed (so the quota stops
-counting it immediately), the hourly orphan sweep deletes the object, and any member
-who had not already fetched it gets a 404. The bytes were never theirs to keep.
+The deliberate consequence: **the owner deleting the entry breaks it for every
+member.** `release_blob` marks the blob unconfirmed (quota stops counting it
+immediately), the hourly orphan sweep deletes the object, and any member who had not
+already fetched it gets a 404.
 
 ### 2.5 Spaces (`src/spaces/`)
 
@@ -469,22 +448,11 @@ CREATE TABLE blobs (
 );
 ```
 
-> **Migration note:** `migrations/0006_supabase_migration.py` renames `users` →
-> `profiles`, drops the Supabase-owned columns (`email`, `password_hash`,
-> `email_verified`, `suspended_at`) plus the denormalized `blob_bytes_used`, drops
-> `devices.refresh_token_hash` and `blobs.entry_id`, makes `groups.max_members`
-> nullable (NULL = unlimited), and lowers the default quota to 50 MB. Migrations
-> 0001–0005 remain the historical chain.
+> **Migration note (0006):** the `users` → `profiles` rename and the column drops that
+> produced this shape are recorded in `migrations/versions/0006_supabase_migration.py`.
 
-> **Migration note (0011, spaces):** `migrations/versions/0011_spaces.py` drops
-> `groups` / `group_memberships` / `group_invites` and creates `spaces` /
-> `space_memberships` / `space_invites`, renames `sync_entries.group_ids` →
-> `space_ids` (rebuilding the GIN index), and adds `sync_entries.wrapped_keys`.
-> It is **destructive on purpose**: the old tables are dropped rather than renamed,
-> and `sync_entries` is `TRUNCATE`d because pre-CEK ciphertext was encrypted directly
-> under the UMK or a Group Key and cannot be read under the envelope. `downgrade()`
-> restores the old *shape*, not the data. This migration is **written but not
-> applied** — applying it needs explicit approval.
+> **Migration note (0011, spaces):** the destructive groups → spaces transition (and the
+> addition of `sync_entries.wrapped_keys`) is recorded in `migrations/versions/0011_spaces.py`.
 
 ---
 
@@ -709,11 +677,10 @@ There is no `GET /sync/status` and no delete route: the cursor is client-held (a
 advanced with `POST /sync/cursor`), and a delete is a push with `deleted_at` set.
 
 **`not_your_entry` — one entry, one author.** Rows are keyed
-`(user_id, client_id, entry_type)`, so pushing an entry somebody else wrote does not
-update their row: it inserts a *second* row carrying the same `client_id`, and both
-fan out to the space. Clients collapse the two onto one item, so the practical
-result is the author's text and name replaced by whoever pushed last — a real bug
-that cost attribution outright (client `docs/BUGFIX_HISTORY.md` #8).
+`(user_id, client_id, entry_type)`, so a push of an entry another account wrote would
+insert a *second* row under the same `client_id` rather than updating theirs, which
+clients collapse into one item with the wrong attribution (client
+`orange-copy-paste-clipboard-app-rust/docs/bugfix-history.md` #8).
 
 So push refuses to insert a row for a `client_id` another account already holds in a
 space this push targets (`_belongs_to_someone_else`). It is the rare rule the server
@@ -733,9 +700,9 @@ under the deleter's account that overlaps no space, so `_belongs_to_someone_else
 permits it and fan-out reaches only `user:{deleter}`. The author's row is untouched
 and every other member keeps their copy; the deleter's other devices apply it through
 a self-hide path in the client's merge (they recognise a self-authored, space-less
-tombstone for an entry they hold as received). Contrast the normal case in section
-14, rule 5: a tombstone for an entry you *own* keeps its `space_ids` so the delete
-reaches the members who received it.
+tombstone for an entry they hold as received). Contrast the normal case: a tombstone
+for an entry you *own* keeps its `space_ids` so the delete reaches the members who
+received it.
 
 ### 5.3 Settings Routes
 
@@ -1266,12 +1233,9 @@ says which of them to use (null = the owner). A distributor also wraps for itsel
 (`X25519(priv, own_pub)` is a valid secret); that is how a member recovers its ring after a
 restart.
 
-Handing the key over was owner-only until migration 0017, and the cost was a real
-blockage: a member who joined while the owner's app was closed could neither read the space
-nor write to it, for as long as that lasted. Widening it gives up nothing, because every
-member already holds the key in memory and could pass it on by other means — the
-restriction only ever stopped members who had no intention of leaking. Minting stays
-owner-only, so there is still exactly one account deciding what the current key is.
+Minting stays owner-only, so there is still exactly one account deciding what the current
+key is; distribution is open to any keyholder. Why distribution was widened from owner-only
+to any keyholder is recorded in the website design record.
 
 **Verifying a received ring.** The server stores whatever wrap it is handed and cannot
 check it. With more than one possible writer, a member could hand a newcomer a key that is
@@ -1310,11 +1274,9 @@ sees a key. The owner's next reconcile prepends a fresh key and redistributes, a
 pushed from then on wrap their CEK under the new key, which the departed member never
 receives. Distribution clears the flag once every remaining member holds a wrap.
 
-The owner's own wrap is deliberately left alone. Clearing it too — which is what happened
-before migration 0017 — meant that if the owner's app restarted before redistributing, the
-previous ring was gone, because it lived only in memory and in the wrap just deleted.
-Everything ever shared in that space became unreadable for everyone, permanently, and any
-member could trigger it by leaving.
+The owner's own wrap is deliberately left alone: it is the owner's only copy of the
+previous ring should their app restart before redistributing, and that ring lives nowhere
+but in memory and these wraps.
 
 Revocation is **best-effort by construction**, and the edges are real:
 
@@ -1479,137 +1441,7 @@ shell changes.
 
 ## 11. Deployment Model & Cost
 
-### 11.1 Development (`docker-compose.yml`)
-
-```
-api    — FastAPI uvicorn --reload (:8000)
-db     — postgres:16-alpine  (local stand-in for Supabase Postgres)
-redis  — redis:7-alpine
-```
-
-Blobs use MinIO or a real R2 bucket via env. No worker service.
-
-### 11.2 Production
-
-Self-hosted on a single VPS in Docker (Caddy + FastAPI + Redis); Supabase and R2 stay
-external. The operational steps — hardening, the compose/Caddy stack, and the on-box
-build-and-deploy — live in [`DEPLOY.md`](DEPLOY.md); this is the model.
-
-- **Supabase** (managed): Postgres + Auth. `DATABASE_URL` (asyncpg driver, via the
-  Supavisor pooler), `SUPABASE_URL` and optionally `SUPABASE_JWT_SECRET`.
-- **FastAPI**: stateless — run N replicas. Caddy terminates TLS, reverse-proxies, and
-  passes the `/ws` upgrade through with no extra config. The image is portable, so it can
-  also run on any platform that assigns `$PORT`.
-- **Redis**: co-located as a compose service on the internal network (no published port);
-  holds only pub/sub fan-out + presence, so persistence is off.
-- **R2**: bucket + credentials via the S3 env vars (`AWS_REGION=auto`).
-
-### 11.3 Free-tier ceilings & cost
-
-- **Supabase free**: 500 MB Postgres + 5 GB egress; free projects **pause after ~1
-  week idle**. Text entries are tiny, so the DB is rarely the wall. The meaningful
-  first bill is **Supabase Pro (~$25/mo)** for always-on + headroom.
-- **R2 free**: 10 GB storage, **zero egress**. Binary blobs are the real storage cost;
-  even beyond free it is ~$0.015/GB-mo. At the **50 MB** default per-user quota, the
-  10 GB free pool covers ~200 users before R2 costs anything.
-- **Redis**: presence + pub/sub only, and co-located in the compose stack — it costs
-  nothing beyond the VPS it already runs on.
-
-Per-user storage is capped by `profiles.blob_bytes_quota` (default 50 MB, set via
-`DEFAULT_BLOB_QUOTA_BYTES`, overridable per user via the admin quota endpoint) and a
-5 MB per-entry hard cap.
-
----
-
-## 12. Desktop App Integration
-
-The Rust `src-tauri/src/sync/` module (client, `ws_listener`, crypto, offline queue)
-is largely unchanged. What the client must adopt for this backend:
-
-1. **Auth via Supabase.** Obtain the access token from Supabase Auth (GoTrue), not
-   from a backend `/auth/login`. Send it as `Authorization: Bearer <token>`.
-2. **Bootstrap for the KDF salt + envelope.** Call `POST /auth/bootstrap` after login
-   to get `kdf_salt` and `wrapped_umk`; derive the KEK and unwrap the UMK (or generate
-   + `PUT /auth/umk` on first setup).
-3. **Register a device, send `X-Device-Id`.** Call `POST /auth/devices` once, persist
-   `device_id`, and send it as the `X-Device-Id` header on device-scoped calls.
-4. **WebSocket** connects to `/ws?token=<supabase JWT>&device_id=<device_id>`.
-5. **Deletion is a tombstone** in `POST /sync/push` (`deleted_at` set) — there is no
-   dedicated delete route. For an entry you own, keep its `space_ids` on the tombstone so
-   the delete reaches the members who received it. A tombstone for an entry *another*
-   member wrote is the exception: it carries empty `space_ids` and hides the item on your
-   own devices only (section 5.2).
-6. **Every push carries a CEK envelope.** Mint a per-entry key, encrypt content and
-   metadata under it with `aad=client_id`, and send `wrapped_keys` with a `"personal"` wrap
-   plus one wrap per space id in `space_ids` (section 7.2). An entry with an empty envelope is
-   accepted by the server and readable by nobody.
-7. **Reconcile space keys, don't trust the event.** `space:rekey` is fire-and-forget;
-   `GET /spaces` → `my_wrapped_space_keys` is the authoritative recovery path, and the
-   whole keyring must be kept so older entries stay readable (section 7.4).
-
-Image/file blobs still upload directly to R2 via presigned PUT (`request-upload` →
-PUT → `confirm-upload`), subject to the 5 MB per-entry cap; text/metadata ride inside
-the encrypted sync payload. Local store stays plaintext; encryption happens at the
-network boundary.
-
----
-
-## 13. Directory Layout
-
-```
-orange-copy-paste-clipboard-backend/
-├── src/
-│   ├── main.py               # app factory, router mounts, lifespan (listener + maintenance)
-│   ├── config.py             # pydantic-settings (Supabase, Redis, S3, email, admin)
-│   ├── database.py           # SQLAlchemy async engine + session factory
-│   ├── redis_client.py       # Redis connection pool
-│   ├── dependencies.py       # get_current_claims / get_current_user_only / get_current_user_id / get_redis
-│   ├── realtime.py           # WS endpoint + hub + Redis bridge + presence + publishers
-│   ├── background.py         # advisory-lock maintenance loop (presence sweep, blob cleanup)
-│   ├── email.py              # invite + test mail (Brevo | SMTP), via BackgroundTasks
-│   ├── web/                  # /join and /reset pages, and the mail templates
-│   ├── supabase_admin.py     # Supabase Auth Admin API client (get/ban/delete user)
-│   ├── middleware.py         # security headers
-│   ├── limiter.py            # slowapi limiter instance
-│   ├── auth/                 # tokens.py (JWT verify) + router/service/models/schemas
-│   ├── sync/                 # router/service/models/schemas
-│   ├── settings/             # router/service/models/schemas
-│   ├── blobs/                # router/service/models/schemas + s3.py
-│   ├── spaces/               # router/service/models/schemas + invites.py (addressed invites)
-│   ├── announcements/        # router/service/models/schemas (server-authored messages)
-│   └── admin/                # router/service/schemas
-├── migrations/               # Alembic (0001–0012)
-├── tests/                    # conftest + test_auth / test_sync / test_blobs / test_spaces_invites / test_announcements
-├── docker-compose.yml        # api + db + redis (dev)
-├── Dockerfile
-├── pyproject.toml
-└── .env.example
-```
-
-There is no `worker/`, `realtime/` package, `email/` package, `groups/` package,
-`groups/sharing.py`, `well_known.py`, or `auth/jwt.py` — those were removed or collapsed.
-
-`tests/test_spaces_invites.py` covers spaces and invites (replacing
-`test_groups_invites.py`). **It has not been executed** — `ruff` and `ty` pass, but
-`pytest` needs a local Postgres and has not been run against this change.
-
----
-
-## 14. Client / Backend Contract Drift
-
-No known drift. The Rust client (`src-tauri/src/sync/client.rs`) calls exactly the routes
-in sections 5.1–5.6 — auth, sync push/pull/cursor, settings, blobs, `/spaces*`, `/invites*` — and
-nothing else. The routes it used to reach for and that do not exist are gone from the
-client too: `/auth/login|refresh|logout` (Supabase Auth handles those), a delete route,
-`/sharing/*` in any form, and any rotate-invite or scope endpoint.
-
-Three contract points still catch a fresh client and are worth restating:
-
-| Trap | Reality |
-| ---- | ------- |
-| Deleting an entry | A push with `deleted_at` set. There is no DELETE route. A tombstone for an entry you own keeps its `space_ids`; one for a received entry carries empty `space_ids` and hides it on your own devices only (section 5.2). |
-| Device-scoped calls | Need `X-Device-Id` in addition to the bearer token. `/auth/bootstrap`, `/auth/devices` and `/invites/*` do not. |
-| WebSocket | `/ws?token=<supabase JWT>&device_id=<device_id>` — both query params are required, and `device_id` must be a registered device. |
+Deployment topology, environment variables, and cost live in [`DEPLOY.md`](DEPLOY.md).
 
 ---
 
