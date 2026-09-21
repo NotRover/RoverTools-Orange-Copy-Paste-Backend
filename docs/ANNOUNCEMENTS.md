@@ -4,7 +4,7 @@ How to send a message to users from the server. Nothing sends one automatically
 today - the machinery is in place and waiting for a reason to use it.
 
 Design notes (why it is one table, why reads are watermarked, why this is the
-one plaintext table) live in [`ARCHITECTURE.md` section 16](ARCHITECTURE.md). This
+one plaintext table) live in [`architecture.md` section 16](architecture.md). This
 file is the operator's half: what to type, and what the user ends up seeing.
 
 ## What a user sees
@@ -34,7 +34,7 @@ one.
 
 ```bash
 export ADMIN_KEY='<the value from the service environment>'
-export API='https://api.orangecp.rovertools.ctx.cl'
+export API='https://<your-api-host>'
 ```
 
 ## Send one to everybody
