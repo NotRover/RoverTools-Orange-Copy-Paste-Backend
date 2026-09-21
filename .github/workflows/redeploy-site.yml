@@ -1,0 +1,49 @@
+name: Redeploy docs site
+
+run-name: >-
+  redeploy site (${{ github.event_name == 'workflow_dispatch' && 'manual' || 'docs push' }})
+
+# The public site (Cloudflare Pages) mirrors this repo's docs/architecture.md as its
+# Developers > Reference "wire contract" page, regenerated at build time. But Pages
+# only rebuilds on a push to the WEBSITE repo, so a backend doc edit here would sit
+# unpublished until a site build happened for some other reason.
+#
+# This closes that gap: a push to main that touches the mirrored doc pings the site's
+# Cloudflare Pages Deploy Hook, which starts a fresh build. That build re-runs the
+# website's scripts/pull-dev-docs.mjs and pulls this doc's new content from GitHub
+# raw main.
+#
+# Mirrored source in THIS repo (see the website's scripts/pull-dev-docs.mjs):
+#   - docs/architecture.md   (the wire contract)
+#
+# Needs one repository secret, SITE_DEPLOY_HOOK, holding the Cloudflare Pages Deploy
+# Hook URL for the site (Pages project > Settings > Builds & deployments > Deploy
+# hooks). The job no-ops with a clear message if the secret is absent, so a fork or
+# an unconfigured repo does not turn red.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/architecture.md'
+  workflow_dispatch:
+
+# One site build at a time; a burst of doc commits collapses to the latest.
+concurrency:
+  group: redeploy-site
+  cancel-in-progress: true
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Cloudflare Pages build
+        env:
+          HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "SITE_DEPLOY_HOOK is not set; nothing to trigger. Skipping."
+            exit 0
+          fi
+          curl --fail --silent --show-error -X POST "$HOOK"
+          echo "Requested a Cloudflare Pages rebuild."
