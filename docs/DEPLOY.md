@@ -1,4 +1,4 @@
-# Orange Clipboard — Backend Deployment
+# RoverTools' Orange Copy Paste — Backend Deployment
 
 **Owns:** the self-hosted OVH VPS that runs the sync backend and Redis — how to reach it,
 recover it, harden it, and deploy the API onto it (Docker Compose + Caddy, deployed by a

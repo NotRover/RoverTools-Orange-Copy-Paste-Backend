@@ -1,6 +1,6 @@
-# Orange Clipboard — Backend Architecture
+# RoverTools' Orange Copy Paste — Backend Architecture
 
-> **Project:** RoverTools Smart Clipboard Backend
+> **Project:** Orange Copy Paste backend
 > **Stack:** FastAPI + Supabase (Postgres + Auth) + Redis + S3-compatible blob storage
 
 **Owns:** the wire contract. Routes, payloads, DDL, socket events, the crypto envelope,
@@ -1636,31 +1636,20 @@ this is the server forgetting rather than a recall.
 
 ## 17. Security Checklist
 
-- [x] All `/api/v1/*` routes (except `/auth/bootstrap`'s own JWT gate) require a valid
-      Supabase JWT; `/internal/*` (except `/healthz`) require `X-Admin-Key`.
-- [x] Backend verifies, never signs, tokens (PyJWT; ES256/RS256 via the project JWKS or
-      legacy HS256 via `SUPABASE_JWT_SECRET`, audience `authenticated`, `exp` required,
-      algorithm allowlisted from the header).
-- [x] Session/refresh/verification/reset owned by Supabase Auth; account
-      suspension/deletion delegated to the Supabase Admin API.
-- [x] Device and identity private keys never leave the client; the server stores only public
-      keys and the opaque `wrapped_umk` / `wrapped_space_keys` / `wrapped_keys` blobs.
-- [x] Server stores only ciphertext for `encrypted_content`, `encrypted_metadata`,
-      `encrypted_blob`; blobs are client-encrypted before upload.
-- [x] Content keys are per entry (CEK) with `aad=client_id`, and key wraps use a separate
-      `"key-wrap"` AAD, so a wrap cannot be replayed as content or vice versa.
-- [x] Blob download URLs are member-scoped: a non-owner gets a presigned GET only when a
-      live sync entry carries that blob into a space they belong to (404, not 403, so the
-      key's existence is not confirmed).
-- [ ] Space Key revocation is **best-effort**: removal clears the server-side keyrings and
-      the owner's client rekeys, but a departed member keeps whatever they already
-      decrypted, and no new key exists until the owner is next online (section 7.4).
-- [x] Presigned R2 PUT URLs expire in 5 min; GET in 1 h.
-- [x] Per-entry 5 MB cap + per-user quota (default 50 MB) enforced server-side.
+An at-a-glance audit of the backend's security controls. Each line asserts a control and
+points to its home; the mechanism and any values live there, not here.
+
+- [x] Route auth: user routes require a valid Supabase JWT, `/internal/*` an `X-Admin-Key` ([section 9](#9-auth-flow), `docs/permissions.md`).
+- [x] Backend verifies, never signs, tokens; algorithm allowlisted, `exp` required ([section 9](#9-auth-flow)).
+- [x] Sessions, refresh, verification, reset, suspension, and deletion are owned by Supabase, not this service ([section 9](#9-auth-flow)).
+- [x] Device and identity private keys never leave the client; the server holds only public keys and opaque wrapped-key blobs ([section 7.1](#71-user-master-key-umk--envelope-model), [7.3](#73-multi-device-umk-sharing-x25519), [7.5](#75-server-visibility)).
+- [x] Server stores only ciphertext for entry content, metadata, and blobs ([section 7.5](#75-server-visibility)).
+- [x] Per-entry content keys with an item-bound AAD, and a separate key-wrap AAD, so a wrap cannot be replayed as content or vice versa ([section 7.2](#72-content-encryption--the-per-entry-cek-envelope)).
+- [x] Blob downloads are member-scoped, and a miss returns 404 not 403 so a key's existence is not confirmed ([section 5.4](#54-blob-routes), `docs/permissions.md`).
+- [ ] Space Key revocation is best-effort: a departed member keeps what they already decrypted until the owner is next online to rekey ([section 7.4](#74-space-key-distribution-and-rekey)).
+- [x] Presigned upload/download URLs are short-lived ([section 5.4](#54-blob-routes)).
+- [x] Per-entry size cap and per-user storage quota enforced server-side ([section 6.3](#63-size-and-row-limits)).
 - [x] `SUPABASE_SERVICE_ROLE_KEY` is server-only and never returned to clients.
-- [x] Security headers (`X-Content-Type-Options`, `X-Frame-Options`, CSP,
-      `Referrer-Policy`, `Permissions-Policy`, conditional HSTS) via middleware.
-- [x] All SQL via SQLAlchemy parameterized queries.
-- [x] Asymmetric JWKS verification is in place, so Supabase-side key rotation needs no
-      redeploy; the shared HS256 secret remains accepted only for legacy projects.
-```
+- [x] Security response headers set via middleware (`src/middleware.py`).
+- [x] All SQL goes through SQLAlchemy parameterized queries.
+- [x] Asymmetric JWKS verification, so Supabase-side key rotation needs no redeploy; shared HS256 accepted only for legacy projects ([section 9](#9-auth-flow), [section 5.0](#50-versioning)).
