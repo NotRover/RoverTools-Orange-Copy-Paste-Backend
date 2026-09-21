@@ -1,7 +1,7 @@
-# Contributing to the RoverTools backend
+# Contributing to the RoverTools' Orange Copy Paste backend
 
-This repository is the **cloud-sync backend** for RoverTools, the cross-device
-Smart Clipboard app: a FastAPI service backed by Supabase (Postgres + auth),
+This repository is the **cloud-sync backend** for Orange Copy Paste, the cross-device
+clipboard app: a FastAPI service backed by Supabase (Postgres + auth),
 Redis, and S3/R2 object storage. It is a stateless relay and store — it verifies
 tokens, persists ciphertext, fans out changes over WebSocket, and brokers blob
 storage. It never sees plaintext or key material.

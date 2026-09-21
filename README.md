@@ -1,6 +1,6 @@
-# Orange Clipboard — Backend
+# RoverTools' Orange Copy Paste — Backend
 
-The cloud-sync API behind the [Smart Clipboard desktop app](../orange-copy-paste-clipboard-app-rust): a FastAPI service that stores encrypted clipboard entries and notes, fans changes out to a user's devices in real time, and brokers sharing between users.
+The cloud-sync API behind the [Orange Copy Paste desktop app](../orange-copy-paste-clipboard-app-rust): a FastAPI service that stores encrypted clipboard entries and notes, fans changes out to a user's devices in real time, and brokers sharing between users.
 
 It is a **stateless relay and store**. All encryption happens on the client, so the server holds ciphertext, public keys, and opaque wrapped keys — never plaintext, and never a key it could decrypt with. It also never issues identity tokens: Supabase Auth signs them, this service only verifies them.
 
