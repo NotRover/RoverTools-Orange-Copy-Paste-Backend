@@ -57,14 +57,14 @@ flowchart TB
 - **Redis** does exactly two things: realtime pub/sub fan-out and device presence.
 - **R2** (or any S3-compatible store) holds encrypted binary blobs. Vendor-neutral.
 - **No Celery / no worker service.** Background jobs run in-process under a Postgres
-  advisory lock (see section 10). Email is sent via FastAPI `BackgroundTasks`.
+  advisory lock (see [section 10](#10-background-maintenance)). Email is sent via FastAPI `BackgroundTasks`.
 
 The desktop app remains fully functional offline; sync is opportunistic and resumes
 on reconnect.
 
 ### 1.1 Project structure
 
-Each package under `src/` owns a router + service (+ models/schemas); section 2 walks
+Each package under `src/` owns a router + service (+ models/schemas); [section 2](#2-service-boundaries) walks
 through what each one does.
 
 ```filetree
@@ -188,7 +188,7 @@ Owns `sync_entries` (clipboard + notes) and per-device `sync_cursors`.
   and once to each `space:` channel named in the entry's `space_ids`. There is no
   `sync:delete`: a tombstone is a normal `sync:entry` with `deleted_at` set.
 - Carries two server-visible routing/key columns it never interprets:
-  `space_ids` (fan-out targets) and `wrapped_keys` (the per-entry CEK envelope, section 7.2).
+  `space_ids` (fan-out targets) and `wrapped_keys` (the per-entry CEK envelope, [section 7.2](#72-content-encryption--the-per-entry-cek-envelope)).
 
 ### 2.3 Settings (`src/settings/`)
 
@@ -210,7 +210,7 @@ Brokers direct-to-object-store uploads.
 - `{blob_key}/download-url` → presigned GET URL.
 - `quota` → usage (computed on demand: `SUM(size_bytes)` over confirmed blobs) and
   the per-user quota, plus the two sync ceilings the client cannot see on its own
-  (`entry_count` / `entry_limit`, and `max_entry_bytes`; section 6.3).
+  (`entry_count` / `entry_limit`, and `max_entry_bytes`; [section 6.3](#63-size-and-row-limits)).
 - **5 MB per-entry hard cap**; per-user quota default **50 MB** (configurable
   globally and per-user via the admin API).
 
@@ -231,7 +231,7 @@ already fetched it gets a 404.
 
 A **space** is the single sharing primitive: a named, persistent, realtime room whose
 entries are encrypted under a Space Key the server never sees. There is no space *type*,
-no member cap, and no server-side scope. See section 15.
+no member cap, and no server-side scope. See [section 15](#15-spaces-design).
 
 - **Spaces** (`router.py` / `service.py` / `models.py` / `schemas.py`) — create, list,
   get, join by invite code, remove member / leave, delete, and per-member Space Key
@@ -248,7 +248,7 @@ blob. The server only routes ciphertext.
 ### 2.6 Realtime (`src/realtime.py`)
 
 Single module: the WebSocket endpoint, an in-process connection hub, the Redis
-pub/sub bridge, the publish helpers, and device presence. See section 8.
+pub/sub bridge, the publish helpers, and device presence. See [section 8](#8-realtime-architecture).
 
 ### 2.7 Admin (`src/admin/`)
 
@@ -279,7 +279,7 @@ silently ignored.
 
 Four decisions worth keeping:
 
-- **Unversioned**, alongside the infra probes (see section 5.0). `version.py` versions
+- **Unversioned**, alongside the infra probes (see [section 5.0](#50-versioning)). `version.py` versions
   the product API because the desktop app negotiates a contract with it; a URL a
   person clicks in an email cannot be re-versioned without breaking every link
   already sent.
@@ -462,10 +462,10 @@ retyped; the API normalizes case and strips `-`/spaces on join, and displays it 
 `token_urlsafe` code and matched case-sensitively.
 
 Redeeming a code no longer joins the space. It raises a row in
-`space_join_requests` (section 4.10) that somebody already inside has to approve, so a
+`space_join_requests` ([section 4.10](#410-space_join_requests)) that somebody already inside has to approve, so a
 leaked or forwarded code buys a knock rather than a membership. `members_can_approve`
 is the only control over who may answer: owner alone by default, or the owner and any
-member. Addressed invites (section 4.9) are unaffected - naming someone by email *is*
+member. Addressed invites ([section 4.9](#49-space_invites)) are unaffected - naming someone by email *is*
 the approval.
 
 `share_history` is resolved into the joining member's `history_from_ts` **at join
@@ -474,14 +474,14 @@ pull.
 
 `key_fingerprint` is written by the owner alone, when it mints a key, and is what lets a
 recipient tell a genuine keyring from one a member made up. Any member may hand a key
-over (section 7.4), so the server -- which cannot open a wrap -- is no longer the only
+over ([section 7.4](#74-space-key-distribution-and-rekey)), so the server -- which cannot open a wrap -- is no longer the only
 thing standing between a newcomer and a wrong key. A hash of 32 random bytes reveals
 nothing about the key it names.
 
 `rekey_requested_at` is the rekey signal. It used to be implicit: a departure cleared
 every member's wrap, and a client seeing an empty wrap while holding keys knew to mint.
 That destroyed the owner's own recovery path, so the flag now carries the request and the
-owner's wrap survives (section 7.4).
+owner's wrap survives ([section 7.4](#74-space-key-distribution-and-rekey)).
 
 ### 4.7 `space_memberships`
 
@@ -507,7 +507,7 @@ newest key first, each element an X25519-wrapped copy for this member. It is an 
 because a rekey must not make older entries unreadable: previous Space Keys exist
 nowhere else, so a member who restarts after a rekey recovers the whole ring and can
 still decrypt entries written under earlier keys. `NULL` is meaningful — it is the
-signal that this member needs a (re)distribution (section 7.4).
+signal that this member needs a (re)distribution ([section 7.4](#74-space-key-distribution-and-rekey)).
 
 `wrapped_by` names the account whose public key the recipient must compute its shared
 secret against. It exists because distribution is no longer owner-only: with several
@@ -651,7 +651,7 @@ Source of truth: `src/version.py` (`API_VERSION`, `SERVICE_VERSION`).
   it private, and `.env.example` turns it on for local work. Every route declares a Pydantic `response_model` and a
   docstring (surfaced as OpenAPI summary/description); tags group the surface
   (auth, sync, settings, blobs, spaces, invites, realtime, ops, admin). The WebSocket `/ws`
-  contract is documented in section 5.8 (FastAPI does not emit WebSockets into OpenAPI).
+  contract is documented in [section 5.8](#58-websocket-event-protocol) (FastAPI does not emit WebSockets into OpenAPI).
 
 ### 5.1 Auth Routes
 
@@ -941,7 +941,7 @@ they do **not** require `X-Device-Id`. Revoke does, since it goes through the sh
 device-scoped dependency.
 
 Invitee resolution uses `profiles.email`, a lowercased mirror of the Supabase
-JWT email claim captured at bootstrap (section 4.9) — no Admin API round-trip.
+JWT email claim captured at bootstrap ([section 4.9](#49-space_invites)) — no Admin API round-trip.
 
 ```mermaid
 sequenceDiagram
@@ -966,7 +966,7 @@ sequenceDiagram
 
 ### 5.7 Internal Routes
 
-Split into **unversioned infra probes** and the **versioned admin API** (see section 5.0).
+Split into **unversioned infra probes** and the **versioned admin API** (see [section 5.0](#50-versioning)).
 
 ```
 -- Unversioned probes (paths are stable across API versions)
@@ -1090,7 +1090,7 @@ GET /reset?code=<code>    302  - forwards to the reset page on the static site
 
 Both are excluded from OpenAPI. `/join` answers 200 for any well-formed code and
 sets its own Content-Security-Policy; `/reset` forwards whatever query it is given
-and reads nothing out of it. See section 2.8.
+and reads nothing out of it. See [section 2.8](#28-web-pages-srcweb).
 
 ---
 
@@ -1172,7 +1172,7 @@ get out from under.
 
 Both per-account limits count rows by `user_id`, which means an entry somebody else
 shared into your space is **their** row on **their** account and does not count
-against you. Same rule as the storage quota (section 2.4): you are charged for what you
+against you. Same rule as the storage quota ([section 2.4](#24-blobs-srcblobs)): you are charged for what you
 uploaded, nothing else. The account screen shows both as bars beside each other for
 that reason.
 
@@ -1193,7 +1193,7 @@ The invariant: entry payloads reach the server (and Supabase) as **ciphertext on
 never plaintext content, note titles, or labels. All key material is generated, wrapped,
 and unwrapped on the client. Space *names* are the deliberate exception: `spaces.name` is
 plaintext, because an invitee is shown the space name before they join and therefore
-before they hold any key that could decrypt it. See section 7.5 for the full visibility list.
+before they hold any key that could decrypt it. See [section 7.5](#75-server-visibility) for the full visibility list.
 
 ### 7.1 User Master Key (UMK) — envelope model
 
@@ -1298,7 +1298,7 @@ at all.
 
 Every space has a **Space Key**: a random 32-byte key held in client memory, **minted** by
 the owner and handed over by **any member who holds it**. It never encrypts content
-directly — it only wraps per-entry CEKs (section 7.2). A member's copy is wrapped for their
+directly — it only wraps per-entry CEKs ([section 7.2](#72-content-encryption--the-per-entry-cek-envelope)). A member's copy is wrapped for their
 identity key:
 
 ```
@@ -1400,7 +1400,7 @@ Server sees: entry type/kind, timestamps, `pinned`, blob keys and sizes, which s
 entry was shared into (`space_ids`), space membership (user ↔ space), space names, invitee
 emails, and public keys.
 
-The one plaintext exception is `announcements` (section 16) — rows the *server itself*
+The one plaintext exception is `announcements` ([section 16](#16-announcements)) — rows the *server itself*
 wrote, so there was never a plaintext of the user's to protect.
 
 Server never sees: `encrypted_content`, `encrypted_metadata`,
@@ -1439,7 +1439,7 @@ the event.
 - **Heartbeat** — server pings every 25 s; any client message/`pong` refreshes the
   presence TTL.
 - **Crash backstop** — a socket that dies without a clean close leaves its presence
-  key to expire; the maintenance sweeper (section 10) then emits `device:offline`. So the
+  key to expire; the maintenance sweeper ([section 10](#10-background-maintenance)) then emits `device:offline`. So the
   instant path is primary and the sweep is a safety net, not a 60 s-latency primary.
 
 ---
@@ -1545,7 +1545,7 @@ They are separate concerns on the same pipe, distinguished by one field:
   personally, whether or not any space exists.
 - **A space** — an entry with one or more `space_ids`. Still reaches the author's own
   devices, *and* every member of each listed space. The same row serves both, because the
-  CEK envelope carries a `"personal"` wrap alongside the per-space wraps (section 7.2).
+  CEK envelope carries a `"personal"` wrap alongside the per-space wraps ([section 7.2](#72-content-encryption--the-per-entry-cek-envelope)).
 
 Nothing enters a space implicitly. The client decides per entry, from its own send filters,
 and the server has no view into that decision.
@@ -1572,13 +1572,13 @@ A client sends an entry into a space by listing the space in `space_ids` and add
 space's wrap to `wrapped_keys`, then pushing as normal. The server stores the row and
 publishes `sync:entry` to `user:{author}` and to each `space:{id}`; every member's socket
 receives it and unwraps the CEK locally. Members who were offline pick the same row up on
-their next `GET /sync/pull` through the space arm (section 6.2), subject to their history floor.
+their next `GET /sync/pull` through the space arm ([section 6.2](#62-push--pull)), subject to their history floor.
 
 ### 15.4 Leaving, Removal, and Deletion
 
 - `DELETE /spaces/{id}/members/{uid}` — the owner removing a member, or a member removing
   themselves. Both clear every remaining member's wrapped keyring, which is what drives the
-  rekey (section 7.4). The owner cannot leave their own space.
+  rekey ([section 7.4](#74-space-key-distribution-and-rekey)). The owner cannot leave their own space.
 - `DELETE /spaces/{id}` — owner only. `space:membership_changed` with `action: "deleted"`
   is published first, while the channel still has subscribers; then the row goes and
   memberships and invites cascade.
