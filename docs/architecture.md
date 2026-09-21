@@ -287,7 +287,7 @@ Four decisions worth keeping:
   (`spaces.service.normalize_invite_code`). The service cold-starts on the free tier
   and the page must paint on the first response; a lookup would also confirm to
   anyone whether a given code exists.
-- **CSP carve-out.** The global header is `default-src 'none'; connect-src 'self'`,
+- **CSP carve-out.** The global header is `default-src 'none'; connect-src 'self'; frame-ancestors 'none'`,
   which would blank a self-contained page, so `middleware.py` sets it with
   `setdefault` and `/join` sets its own: inline style and script allowed,
   everything remote still denied. The header is now overridable, never absent.
@@ -350,6 +350,8 @@ Email, password, and verification state live in Supabase — not here.
 CREATE TABLE profiles (
     id               UUID PRIMARY KEY,            -- = auth.users.id
     display_name     TEXT NOT NULL DEFAULT '',
+    email            TEXT,                        -- lowercased mirror of the Supabase email claim; indexed, for resolving invites
+    avatar_url       TEXT,                        -- mirror of the provider avatar URL (Google); no image data stored here
     kdf_salt         TEXT NOT NULL,               -- base64; Argon2id salt for the wrapping key
     identity_pubkey  TEXT,                        -- base64 X25519 public key (E2E)
     pw_wrapped_umk   TEXT,                        -- base64; random UMK wrapped under the KEK
@@ -372,6 +374,7 @@ CREATE TABLE devices (
     platform      TEXT NOT NULL,          -- 'windows' | 'linux' | 'macos'
     app_version   TEXT NOT NULL DEFAULT '',
     device_pubkey TEXT,                    -- base64 X25519 public key
+    fingerprint   VARCHAR(64),             -- client-side salted hash of a machine id; a grouping hint, never proof of identity
     wrapped_umk   TEXT,                    -- AES-GCM(shared_secret, UMK); set by a peer device
     revoked       BOOLEAN NOT NULL DEFAULT false,
     created_at    BIGINT NOT NULL,
@@ -617,6 +620,89 @@ new membership, exactly as an accepted invite does. The joiner goes from pending
 straight to readable. Joining by code used to be instant and then unreadable for as
 long as it took somebody's app to notice.
 
+### 4.11 `space_comments`
+
+One comment written by a member on one entry shared into a space. Scoped to the space,
+not the entry: the same clipboard item can sit in two spaces, and a remark meant for one
+team must not surface in the other. The entry is addressed the way every other space
+route addresses it, by `(client_id, entry_type)`, not by a foreign key - a `sync_entries`
+row is per-account, so there is no single row to point at.
+
+```sql
+CREATE TABLE space_comments (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    space_id       UUID NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+    client_id      TEXT NOT NULL,             -- the commented-on entry
+    entry_type     VARCHAR(16) NOT NULL,      -- 'clipboard' | 'note'
+    author_id      UUID NOT NULL,
+    encrypted_body TEXT NOT NULL,             -- ciphertext; mentions live inside it, invisible here
+    wrapped_key    TEXT NOT NULL,             -- per-comment content key, wrapped under the Space Key
+    created_at     BIGINT NOT NULL
+);
+CREATE INDEX ix_space_comments_space_id  ON space_comments(space_id);
+CREATE INDEX ix_space_comments_author_id ON space_comments(author_id);
+```
+
+Encrypted the way entries are: the body is sealed under a random per-comment key, and
+that key is wrapped under the Space Key current at write time. The server stores both and
+can read neither. A member who joined after a rekey still holds the older key in their
+keyring, so every comment stays readable across rotations.
+
+### 4.12 `space_entry_removals`
+
+One row per (space, entry) recording that shared content was withdrawn from a space, so a
+device that was offline during the removal learns about it on catch-up instead of keeping
+the copy forever. It is not a tombstone for the entry: the author keeps their own copy, and
+what was withdrawn is the *sharing* - the wrapped key for this space is dropped from the
+entry in the same transaction that writes this row. Re-sharing and re-removing the same
+entry updates the row in place and bumps `server_ts` rather than accumulating history.
+
+```sql
+CREATE TABLE space_entry_removals (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    space_id   UUID NOT NULL,
+    client_id  TEXT NOT NULL,             -- the withdrawn entry, keyed as sync_entries is
+    entry_type VARCHAR(16) NOT NULL,      -- 'clipboard' | 'note'
+    author_id  UUID NOT NULL,             -- who shared it
+    removed_by UUID NOT NULL,             -- who took it down (author or moderator)
+    server_ts  BIGINT NOT NULL            -- same clock and meaning as sync_entries.server_ts
+);
+CREATE UNIQUE INDEX ix_space_entry_removals_entry ON space_entry_removals(space_id, client_id, entry_type);
+CREATE INDEX        ix_space_entry_removals_pull  ON space_entry_removals(space_id, server_ts);
+```
+
+`author_id` and `removed_by` both travel to the client because the placeholder it shows
+depends on whether the author withdrew their own post or somebody moderated it - the same
+distinction the `space:entry_removed` event carries. A device pulls removals and entries
+against one cursor, and the entry row always carries a newer `server_ts` than any removal
+that preceded it, so applying removals before entries still lands on the right final state.
+
+### 4.13 `announcements`
+
+Server-authored messages to users; delivery and read semantics are section 16. The one
+table that holds plaintext, deliberately: nothing in it derives from an entry, a note, or a
+space name, so there is nothing the server would have had to decrypt to write it. A null
+`user_id` is a broadcast to every user; a uuid addresses one account.
+
+```sql
+CREATE TABLE announcements (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID,                                  -- null = every user; indexed
+    kind       TEXT NOT NULL DEFAULT 'announcement',  -- maps to a client NotificationKind
+    title      TEXT NOT NULL,
+    body       TEXT NOT NULL DEFAULT '',
+    data       JSONB NOT NULL DEFAULT '{}',           -- opaque to the server; handed to the client as-is
+    created_at BIGINT NOT NULL,                       -- indexed
+    expires_at BIGINT                                 -- null = never expires
+);
+CREATE INDEX ix_announcements_user_id    ON announcements(user_id);
+CREATE INDEX ix_announcements_created_at ON announcements(created_at);
+```
+
+`kind` is free-form so the server can use a new value before every client knows it; unknown
+values fall back to "announcement" on the client. `data` is opaque - a link, or an id to
+act on. After `expires_at` the row stops being served (null means it never expires).
+
 ---
 
 ## 5. API Design
@@ -658,7 +744,7 @@ Source of truth: `src/version.py` (`API_VERSION`, `SERVICE_VERSION`).
 ```
 POST   /api/v1/auth/bootstrap
        Body: { display_name? }
-       Returns: { user_id, kdf_salt, display_name, wrapped_umk?, recovery_wrapped_umk? }
+       Returns: { user_id, kdf_salt, display_name, avatar_url?, wrapped_umk?, recovery_wrapped_umk? }
        Idempotent: creates the profile on first call, generates the stable KDF salt,
        and returns it plus both envelopes (null on a brand-new account).
        Call right after Supabase login. A null recovery_wrapped_umk is what makes
@@ -844,6 +930,11 @@ DELETE /api/v1/spaces/{space_id}/members/{member_user_id}
        the owner (delete the space instead). Clears the remaining *non-owner* wraps
        and stamps spaces.rekey_requested_at to ask for a new key (section 7.4).
 DELETE /api/v1/spaces/{space_id}         -- owner only; cascades memberships + invites
+DELETE /api/v1/spaces/{space_id}/entries/{client_id}?entry_type=clipboard   -> 204
+       Take a shared entry down from a space: the owner (any entry) or the member who
+       shared it (their own). Moderation, not deletion - the space id and its wrapped
+       key copy are dropped from the entry, and the author keeps their personal copy.
+       Emits space:entry_removed to the space channel.
 POST   /api/v1/spaces/{space_id}/invites Body: { email }   -- owner only; see section 5.6
 POST   /api/v1/spaces/{space_id}/keys    -- any member holding the keyring
        Body: { wrapped_keyrings: [{ user_id, wrapped_space_keys }], key_fingerprint? }
@@ -851,6 +942,19 @@ POST   /api/v1/spaces/{space_id}/keys    -- any member holding the keyring
        alongside wrapped_by = the caller. key_fingerprint is honoured from the space
        owner only, and clears rekey_requested_at once every member holds a wrap.
        space:rekey is published only to members actually written.
+POST   /api/v1/spaces/{space_id}/comments   Returns: 201 CommentOut   -- any member
+       Body: { client_id, entry_type?: "clipboard", encrypted_body, wrapped_key }
+       Comment on an entry shared into the space. The body arrives encrypted and leaves
+       encrypted: stored as given, echoed to the space channel as given. Emits
+       space:comment (action "created").
+GET    /api/v1/spaces/{space_id}/comments?client_id=...&entry_type=clipboard
+       Returns: [CommentOut]   -- one entry's thread, oldest first.
+GET    /api/v1/spaces/{space_id}/comments/counts   Returns: [CommentCountOut]
+       Comment tallies for every commented-on entry in the space, so a feed draws all
+       its chips in one request. Each row: { client_id, entry_type, count, latest_at }.
+DELETE /api/v1/spaces/{space_id}/comments/{comment_id}   -> 204
+       The comment's author, or the space owner as moderator. Emits space:comment
+       (action "deleted").
 ```
 
 `SpaceOut`:
@@ -897,6 +1001,19 @@ A member's keyring is never exposed to anyone else.
 to the client, so the rule about who may approve has exactly one definition
 (`service.may_approve`) and a client cannot drift from it. The count comes back as zero
 to anybody who could not act on it anyway.
+
+`CommentOut`:
+
+```jsonc
+{
+  "id": "...", "space_id": "...",
+  "client_id": "...", "entry_type": "clipboard|note",  // the entry the comment hangs on
+  "author_id": "...",
+  "encrypted_body": "...",   // ciphertext; the server never sees the text or the mentions
+  "wrapped_key": "...",      // the per-comment key wrapped under the Space Key; opaque here
+  "created_at": 1234567
+}
+```
 
 There is no rotate-invite-code route: a space's code is minted once at creation.
 Rotating it on approval was considered and dropped - the code is printed on links and
@@ -993,7 +1110,7 @@ message and returns the real error. Neither returns a key or a password.
 Metrics: `orange_users_total`, `orange_devices_total`, `orange_devices_active_total`,
 `orange_devices_online`, `orange_sync_entries_total`, `orange_sync_entries_deleted_total`,
 `orange_blobs_total`, `orange_blobs_confirmed_total`, `orange_storage_bytes_used`,
-`orange_redis_memory_bytes`.
+`orange_redis_memory_bytes`, `orange_realtime_events_dropped_total`.
 
 ### 5.8 WebSocket Event Protocol
 
@@ -1016,8 +1133,11 @@ created a space mid-connection is moved onto its channel either way.
 { "event": "space:entry_removed", "payload": { "space_id": "...", "client_id": "...", "entry_type": "clipboard|note", "author_id": "...", "removed_by": "..." } }
 { "event": "space:membership_changed", "payload": { "space_id": "...", "action": "joined|left|deleted", "user_id": "..." } }
 { "event": "space:rekey",  "payload": { "space_id": "...", "wrapped_space_keys": "[...]" } }
-{ "event": "space:join_requested", "payload": { "space_id": "...", "request": { ...JoinRequestOut } } }
-{ "event": "space:join_decided",   "payload": { "space_id": "...", "decision": "approved|declined" } }
+{ "event": "space:join_requested", "payload": { "space_id": "...", "request_id": "...", "user_id": "..." } }
+{ "event": "space:join_decided",   "payload": { "space_id": "...", "status": "approved|declined" } }
+{ "event": "space:comment",        "payload": { "space_id": "...", "action": "created", "id": "...", "client_id": "...", "entry_type": "clipboard|note", "author_id": "...", "encrypted_body": "...", "wrapped_key": "...", "created_at": 1234567 } }   // action "deleted" carries { space_id, action, id, client_id, entry_type, author_id, deleted_by }
+{ "event": "space:history_opened", "payload": { "space_id": "..." } }   // space: channel; owner opened the back catalogue, go re-pull older rows
+{ "event": "announcement:new",     "payload": { "id": "...", "kind": "...", "title": "...", "body": "...", "data": {}, "created_at": 1234567, "expires_at": 1234567 } }   // one user's channel or broadcast
 { "event": "invite:received",      "payload": { ...InviteOut } }
 { "event": "invite:updated",       "payload": { "invite_id": "...", "status": "accepted|declined|revoked", "space_id": "..." } }
 { "event": "settings:updated",     "payload": { "updated_at": 1234567 } }
@@ -1469,7 +1589,9 @@ header and allowlisted to `ES256`/`RS256`/`HS256` before any key is selected, so
 and unknown algorithms are refused up front. Asymmetric tokens verify against the
 project's JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`, cached in-process for
 300 s, so Supabase-side rotation needs no redeploy); `HS256` verifies against
-`SUPABASE_JWT_SECRET` and is refused outright when that secret is unset. Algorithm
+`SUPABASE_JWT_SECRET`, and when that secret is unset the server answers `500`
+(a deployment/configuration error, not a verdict on the credential) rather than
+judging the token. Algorithm
 confusion has nothing to forge against, since the two branches draw on unrelated key
 material. Decode requires `exp` and `sub` and checks the audience, with 30 s of leeway
 for clock drift between Supabase and this host. No deny-list — Supabase owns session
@@ -1650,6 +1772,6 @@ points to its home; the mechanism and any values live there, not here.
 - [x] Presigned upload/download URLs are short-lived ([section 5.4](#54-blob-routes)).
 - [x] Per-entry size cap and per-user storage quota enforced server-side ([section 6.3](#63-size-and-row-limits)).
 - [x] `SUPABASE_SERVICE_ROLE_KEY` is server-only and never returned to clients.
-- [x] Security response headers set via middleware (`src/middleware.py`).
+- [x] Security response headers set on every response via middleware (`src/middleware.py`): `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: geolocation=(), camera=(), microphone=()`, and `Strict-Transport-Security: max-age=31536000; includeSubDomains` on HTTPS responses. A default `Content-Security-Policy` is set here too for JSON routes (value not repeated).
 - [x] All SQL goes through SQLAlchemy parameterized queries.
 - [x] Asymmetric JWKS verification, so Supabase-side key rotation needs no redeploy; shared HS256 accepted only for legacy projects ([section 9](#9-auth-flow), [section 5.0](#50-versioning)).

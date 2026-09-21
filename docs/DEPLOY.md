@@ -40,7 +40,6 @@ secret ever lands here, rotate it, do not just edit it out.
 12. [Ongoing operations](#12-ongoing-operations)
 13. [Troubleshooting](#13-troubleshooting)
 14. [Decisions — settled and open](#14-decisions--settled-and-open)
-15. [History](#15-history)
 
 ---
 
@@ -467,7 +466,7 @@ Create the token in GitHub (owner **NotRover** approves it, since it targets an 
 
 - Settings -> Developer settings -> Fine-grained tokens -> Generate new token.
 - Resource owner **NotRover**; repository access limited to
-  `RoverTools-Smart-Clipboard-App-Backend`; Repository permission **Contents: Read-only**.
+  `RoverTools-Orange-Copy-Paste-Backend`; Repository permission **Contents: Read-only**.
 - Fine-grained tokens must expire (max ~1 year). Set a reminder to rotate before then;
   an expired token makes every deploy poll fail on `git fetch` until it is replaced.
 
@@ -735,8 +734,7 @@ moment builds accumulate. Render hid that by building on its own machines; the s
 equivalent that spends nothing on GitHub is to build on the VPS you already pay for. GitHub's
 only job is hosting the repo; the box pulls it read-only.
 
-**Status: live on the box since 2026-08-24** (merged to `main`, deployed and verified —
-section 15). The wiring below is what was done once; the repo files are the source of truth,
+**Status: live on the box since 2026-08-24** (merged to `main`, deployed and verified). The wiring below is what was done once; the repo files are the source of truth,
 and this section explains them and the parts that live nowhere else.
 
 ### How a deploy flows
@@ -840,7 +838,7 @@ All under `orange-copy-paste-clipboard-backend/`. Read them for detail; the non-
 - **`deploy/deploy.sh`** — the poll+build+deploy script (run from the checkout by the timer).
   It **re-execs itself** when the pull changed it: bash reads a script from the handle it
   opened at startup, so without that, a change to this file lands only on the next poll -
-  and a step added here does nothing on the deploy that introduced it (section 15).
+  and a step added here does nothing on the deploy that introduced it.
   After `up -d` it also **validates and reloads Caddy**, because `up -d` does not recreate a
   container whose only change is its mounted config. It runs `caddy validate` then `reload`
   after `up -d`, because a Caddyfile change ships as a config edit that recreates nothing.
@@ -869,13 +867,13 @@ HTTPS (section 5.6); nothing reaches in.
 
 ```bash
 # 1. Create a read-only fine-grained token (section 5.6) and keep it handy as $TOKEN.
-#    Owner NotRover, repo RoverTools-Smart-Clipboard-App-Backend, Contents: Read-only.
+#    Owner NotRover, repo RoverTools-Orange-Copy-Paste-Backend, Contents: Read-only.
 
 # 2. Clone the repo into ~/app over HTTPS with that token, then lock down .git/config:
-git clone "https://x-access-token:${TOKEN}@github.com/NotRover/RoverTools-Smart-Clipboard-App-Backend.git" ~/app
+git clone "https://x-access-token:${TOKEN}@github.com/NotRover/RoverTools-Orange-Copy-Paste-Backend.git" ~/app
 chmod 600 ~/app/.git/config
 #   The token is now embedded in the origin remote URL; deploy.sh's git fetch uses it as-is.
-#   To rotate: git -C ~/app remote set-url origin "https://x-access-token:<new>@github.com/NotRover/RoverTools-Smart-Clipboard-App-Backend.git"
+#   To rotate: git -C ~/app remote set-url origin "https://x-access-token:<new>@github.com/NotRover/RoverTools-Orange-Copy-Paste-Backend.git"
 
 # 3. Secrets — .env lives INSIDE the checkout (git-ignored, so `git reset --hard` keeps it):
 install -m 600 /dev/null ~/app/.env    # then fill it (see Secrets below)
@@ -997,8 +995,7 @@ has not updated is offline until they do. Make sure `APP_CORS_ORIGINS` includes 
 
 **Monitoring (Netdata).** Runs as the `netdata` service in the prod stack, published by Caddy
 at `https://status.example.com` behind basic auth, with its metrics database in the
-`netdatalib` volume. It replaced Uptime Kuma, which answered "is it up" and nothing else
-(section 15). Out of the box it charts CPU, memory, disk space and IO, network, pressure
+`netdatalib` volume. It replaced Uptime Kuma, which answered "is it up" and nothing else. Out of the box it charts CPU, memory, disk space and IO, network, pressure
 stall, systemd unit states, and per-container CPU/memory/IO for every service in the stack -
 at one-second resolution, with alarms already defined for the things that matter.
 
@@ -1126,8 +1123,7 @@ docker compose -f docker-compose.prod.yml exec -T netdata   curl -s 'localhost:1
 
 **The deploy reports on itself.** A pipeline that stops working is silent by nature: the
 timer fires, the script fails early, the old containers keep serving, and nothing looks
-wrong until someone notices a merged commit never shipped. That happened twice here
-(section 15). So `deploy.sh` posts to the same Discord channel as the alarms, and only when
+wrong until someone notices a merged commit never shipped. That happened twice here. So `deploy.sh` posts to the same Discord channel as the alarms, and only when
 there is something to say - the ~90s no-op polls are silent:
 
 | When | Message |
@@ -1438,199 +1434,6 @@ from `pyproject.toml`, so `uv.lock` does not pin the deployed image.
 - Move off the temp FreeDNS name to a permanent domain when ready (Caddyfile + `PUBLIC_BASE_URL`).
 - **Add a free external uptime check** on the public healthz with a `"status":"ok"` keyword
   match. Nothing on the box can report the box being down.
-
----
-
-## 15. History
-
-- **2026-08-24 — box provisioned and hardened.** SSH locked to key-only, root off,
-  `AllowUsers ubuntu`; ufw up (deny-in, 22/80/443); fail2ban + unattended-upgrades with
-  nightly auto-reboot.
-- **2026-08-24 — SSH lockout, recovered.** Disabling password auth locked out new sessions
-  because `ubuntu`'s `authorized_keys` was **empty** — every login until then had been by
-  password, and the intended key had never been installed. Recovered by appending the public
-  key from the still-open session. **Lesson, now the rule in sections 3 and 5:** install and
-  test the key *before* disabling password auth, and never close the working session until a
-  new one proves the change.
-- **2026-08-24 — passphrase vs account password, cleared up.** Changing the `ubuntu` account
-  password with `passwd` looked like it broke SSH; it had not. The workstation prompt wants
-  the *key passphrase*. Both are documented in section 2. KVM console login with the `ubuntu`
-  password confirmed working.
-- **2026-08-24 — Docker + domain.** Installed Docker (Ubuntu packages) and pointed
-  `api.example.com` (FreeDNS) at the box. A `deploy` service account was created here
-  under the push-deploy design, then dropped when the deploy moved to run as `ubuntu`; remove
-  it if the box still has it. No application containers running yet.
-- **2026-08-24 — docs consolidated.** The Render/Supabase/R2 runbook and the two parent-repo
-  VPS docs (`VPS-RUNBOOK.md`, `DEPLOY-VPS.md`) folded into this single file; the Render path
-  was retired.
-- **2026-08-24 — deploy design settled on build-on-box + git poll.** First drafted as GitHub
-  Actions + GHCR push with a forced-command CI key; changed to building on the VPS and polling
-  `origin/main` from a systemd timer, to spend nothing on Actions minutes or Packages storage
-  (section 14). Wrote the stack on `deploy/vps-docker` — `Dockerfile` (frozen/non-root/
-  healthcheck), `docker-compose.prod.yml` (local build), `Caddyfile`, `.dockerignore`,
-  `deploy/deploy.sh`, `deploy/rovertools-deploy.{service,timer}`; removed `render.yaml`;
-  repointed `public_base_url` and the README/ARCHITECTURE notes off Render. Not yet deployed.
-- **2026-08-24 — first live deploy.** Ran as `ubuntu` in `~/app`: read-only deploy key, clone,
-  `.env`, systemd poll timer, first `docker compose up`. Two fixes surfaced on the real box and
-  could not have on the Windows workstation: the `Caddyfile` needed the block form of
-  `dynamic a` (the inline `resolvers` failed to parse and crash-looped caddy), and container
-  logs moved to the persistent `journald` driver so they survive a rollout (section 5.8, 12).
-  `https://api.example.com/internal/healthz` returns 200 with `db` and `redis` ok, valid
-  TLS, `via: 1.1 Caddy`. Backend is live; client cutover still pending (section 11).
-- **2026-08-24 — deploy rollover: accept the blip.** Weighed docker-rollout (declined:
-  third-party script with Docker/root access) and Swarm (declined: cluster-weight on one host,
-  and `stack deploy` cannot build). Tried a Caddy `lb_try_duration` retry as the free middle
-  option; **measured on the box, it does not work** — config confirmed live via `caddy adapt`
-  (`try_duration: 10000000000`) and the swap still produced the same two 502s, because retry
-  needs another healthy host and one container means an empty pool. Removed the retry rather
-  than leave misleading config, and settled on plain `docker compose up -d` with a known
-  ~1-3s 502 window per deploy. Also fixed `deploy.sh`: its `docker rollout` guard exited 0
-  with no plugin installed, so the branch ran and broke the deploy. Reproduce the measurement
-  with a watch-curl during `deploy.sh --force`.
-- **2026-08-24 — monitoring: Uptime Kuma on the box.** Added as the `kuma` compose service
-  behind Caddy on `status.example.com`, with no Docker socket mounted (container monitors
-  would mean root-equivalent access for a web-facing service, the docker-rollout objection
-  again). Health monitors must be **keyword** checks on `"status":"ok"`, because
-  `/internal/healthz` answers 200 while degraded and a status-code check would stay green
-  through a Postgres outage. Email notifiers are unusable (OVH filters SMTP) — use an HTTPS
-  notifier. Kuma cannot report a whole-box outage since it shares the box; pair it with a free
-  external check (section 12).
-- **2026-08-24 — the Caddyfile was never actually shipping.** Adding Kuma surfaced it: the new
-  site block was on disk and on the right commit, yet `caddy validate` passed and `caddy
-  reload` logged `"config is unchanged"`. `docker-compose.prod.yml` bind-mounted the *single
-  file* `./Caddyfile`, which binds an inode; `git pull` replaces the file, so the running
-  container kept reading the copy it started with, and every Caddyfile change since the last
-  container recreate had been silently inert (applying only at the next reboot). Fixed by
-  moving the config to `caddy/Caddyfile` and mounting the **directory**, and by adding a
-  `caddy reload` step to `deploy.sh` so config changes ship with the code as section 9 always
-  claimed they did.
-- **2026-08-24 — closing the class, not the instance.** Three failures this month shared one
-  shape: something was broken and nothing said so. The `docker rollout` guard exited 0 without
-  the plugin; the Caddyfile went inert behind a single-file bind mount; and during the retry
-  experiment the config being measured was a stale one, which is why the measurement was
-  confusing before it was conclusive. Two structural changes rather than three patches. **(a)
-  No single-file bind mounts** — the only host path left in `docker-compose.prod.yml` is the
-  `./caddy` *directory*; every other mount is a named volume, so no container can pin an inode
-  that git will replace. **(b) The deploy reports on itself** — `deploy.sh` validates the Caddy
-  config before reloading it, and pings a Kuma Push monitor on success and `status=down` from
-  an exit trap on failure. Silence is now the alarm: no ping in five minutes means the script
-  broke or the timer stopped. The heartbeat is what would have caught the `docker rollout`
-  bug, which exited 125 and told nobody.
-- **2026-08-25 — Uptime Kuma out, Netdata in.** Kuma answered one question, "is the URL
-  responding", and answering it well still left the box itself invisible: no CPU, no memory,
-  no disk trend, no per-container usage. Machine health had to be bolted on as a shell script
-  pushing numbers into a fake monitor, which is a sign the tool was wrong rather than
-  incomplete. Netdata replaces it and the scaffolding around it: removed the `kuma` service and
-  `kuma_data` volume, `deploy/host-health.sh` and its timer, and the push-heartbeat plumbing in
-  `deploy.sh`. What each of those guaranteed still holds, by a different route - the healthz
-  **body** match moved into `netdata/go.d/httpcheck.conf` (a status-code check would still stay
-  green through a Postgres outage), and the deploy heartbeat was replaced - first by a
-  systemd-units alarm, then, when that proved to rest on a unit that is idle by design, by
-  the deploy reporting to Discord directly (see the last entry). Two costs,
-  both accepted deliberately: Netdata needs the host read-only (`/proc`, `/sys`, `/`,
-  `/var/log`) plus `SYS_PTRACE`, which is *more* box access than Kuma ever had, and its
-  dashboard has no login, so Caddy basic auth is now load-bearing rather than a nicety. The
-  Docker socket is still not mounted into anything web-facing: container names come from
-  `dockerproxy`, allowlisted to `GET /containers`.
-- **2026-08-25 — the metrics password arrived blank.** First deploy of the Netdata site
-  answered 401 to everyone, which reads as working basic auth and is not: Compose interpolates
-  the values it reads out of `.env`, so `METRICS_AUTH_HASH=$2a$14$K3q...` expanded `$2a`,
-  `$14` and `$K3q...` as three unset variables and handed Caddy an empty hash. It failed
-  closed, so nothing was exposed - but the only way to tell that state from a working one
-  from outside is to try logging in. Every `$` must be doubled in `.env`. Verify with
-  `docker compose exec caddy printenv METRICS_AUTH_HASH` rather than inferring it from a 401.
-- **2026-08-25 — Netdata crash-looped on its own config mount.** The collector config was
-  bind-mounted read-only at `/etc/netdata/go.d`, and Netdata's entrypoint copies stock config
-  into `/etc/netdata` on every start: `cp: preserving times for '/etc/netdata/go.d':
-  Read-only file system`, then exit, then restart, forever. Mounting it read-write is worse -
-  Netdata would write dozens of stock files into the git checkout. Netdata's config genuinely
-  lives in a volume, so `deploy.sh` now installs `netdata/go.d/*.conf` into it and restarts
-  the container only when the content changed. The file still ships from git and still
-  arrives by the deploy, which was the point of not bind-mounting a single file in the first
-  place - the constraint moved, the guarantee did not.
-- **2026-08-25 - measured a memory scare, found no memory problem and no swap.** htop's bar
-  looked full and the box was reported to be "reaching memory caps". It was not: 939 MB used
-  of 3.7 GB with **2.8 GB available**, all five containers together under 300 MB (api 118,
-  netdata 135, caddy 13, redis 6, dockerproxy 4). The full-looking bar was page cache, which
-  Linux hands back on demand, and the repeated 106 MB `dockerd` / 141 MB `python` rows were
-  threads of one process each, not copies - htop was in thread view. Nothing was tuned:
-  trimming Netdata's retention would have blinded the monitoring just installed, in exchange
-  for nothing. The real finding was `Swap: 0B` - no runway between healthy and the OOM killer
-  picking the API container. Added a 2 GB swap file with `vm.swappiness=10` (section 5.9).
-  Read the numbers, not the bar.
-- **2026-08-25 - notifications made readable, and reproducible.** The stock Discord sender
-  worked but wrote a paragraph of italic prose per alarm. Replaced with a custom sender
-  (`SEND_DISCORD="NO"`, `SEND_CUSTOM="YES"`) posting a colour-coded embed: value, chart and
-  previous state as fields, severity carried by the embed colour so the text stays plain
-  ASCII. The bigger problem was that `health_alarm_notify.conf` lived only in the
-  `netdataconfig` volume - typed in by hand, and gone the moment the box is rebuilt. Netdata
-  config now lives in `netdata/conf/` in the repo, mirroring `/etc/netdata/`, and `deploy.sh`
-  installs the whole tree rather than just `go.d`. The webhook stays out of git, arriving as
-  `ALERT_DISCORD_WEBHOOK` from `.env` - named that way because the stock config assigns
-  `DISCORD_WEBHOOK_URL=""` before ours is sourced and would otherwise shadow it. A rebuilt box
-  now arrives already watching itself, needing only two values in `.env`.
-- **2026-08-25 - the deploy script was always one run behind itself.** Bash reads a script
-  from the file handle it opened at startup, and `git reset --hard` replaces `deploy.sh` with
-  a new inode, so the running copy is always the pre-pull one. Any change to the deploy
-  itself took effect on the *next* poll. That is mildly confusing on its own and actively
-  dangerous combined with a step that no-ops silently: when the collector-config loop moved
-  from `netdata/go.d/*.conf` to `netdata/conf/`, the old loop globbed a path that no longer
-  existed, compared empty against empty, found nothing to do and printed nothing - so the
-  deploy that shipped the notification config installed none of it, twice, and looked
-  successful both times. `deploy.sh` now hashes itself before the pull and re-execs the new
-  copy with `--force` when it changed, guarded by `DEPLOY_REEXEC` against looping. The lock
-  is kept across the exec by testing `/proc/self/fd/9` rather than assuming.
-- **2026-08-25 - deploy alerting rested on an idle unit; the dashboard buried its own
-  signal.** Two loose ends from the Kuma removal, closed together. **(a)** The claim that a
-  broken pipeline would alarm through Netdata's systemd-units collector was inferred, not
-  tested, and it was the wrong shape regardless: `rovertools-deploy.service` is a oneshot
-  that is *supposed* to be inactive between polls, so reading health from its state means
-  reading a signal that looks identical whether the timer is working or stopped. Replaced
-  with the direct thing - `deploy.sh` posts a green embed naming the image on a real deploy
-  and a red one from an `EXIT` trap on any non-zero exit, covering every way the script can
-  die rather than the errors someone anticipated. A failed post is non-fatal; a broken
-  notifier must not break a deploy. **(b)** The dashboard shipped with Netdata's defaults and
-  was unreadable for it - about 1900 charts, on top of pressure stall, IPv6/NFS/SCTP stacks,
-  ZFS, Btrfs, RAID, batteries, ECC and NUMA on a virtual machine that has none of them. `netdata/conf/netdata.conf` now
-  turns those off and ships from git like the rest. Note that unrecognised keys are ignored
-  silently, so this is a change that must be verified by counting charts, not by reading the
-  file - the same rule that produced the two entries above it.
-- **2026-08-25 - the 1900 charts were apps.plugin, guessed at twice as something else.**
-  A `grep -c systemd` over the charts JSON returned 1903, and that number was read as
-  "1900 systemd charts" - first blamed on the cgroups plugin, then on the go.d systemdunits
-  collector. It was neither: grep counts string occurrences across every field of every
-  chart, not charts. Counting properly (`cut -d. -f1 | uniq -c`) put it beyond argument -
-  **apps.plugin**, at 644 per-application, 168 per-user, 154 per-usergroup and 46 file-
-  descriptor charts, about 90% of the total. Per-systemd-service cgroup charts were real but
-  small (22 units, 7 each) and needed a different key again, `cgroups to match as systemd
-  services`, because v2 dropped `enable systemd services`. Two things this bought that the
-  guessing did not: the chart list also shows every configured **alarm**, which finally
-  answered "what am I notified about" from evidence, and it showed the API's chart families
-  briefly missing right after a restart - the cgroups plugin rediscovers containers on a 10s
-  cycle, so a count taken seconds after a deploy under-reports. Measure the thing, and know
-  what your measurement counts.
-- **2026-08-25 - the config installer ate its own worklist.** The netdata trim above shipped,
-  deployed cleanly, printed nothing, exited 0 - and installed neither file. The loop was
-  `while read CFG; do ... done < <(find ...)`, so the worklist arrived on **stdin**, and
-  `docker compose exec` reads stdin even with `-T`. The first iteration's `cat` drained the
-  remaining filenames; the loop ended after one file. Sorted first was `go.d/httpcheck.conf`,
-  already installed and byte-identical, so the one iteration that ran printed nothing either.
-  `set -e` does not catch it: the loop succeeded, and the dirty-flag line after it is exempt
-  as the non-final command of an `&&` list. Fixed by feeding the loop on **fd 3** and giving
-  every inner command `</dev/null`. The lesson is the one this section keeps repeating in a
-  new costume - **so the installer now always prints `N checked, M updated`, and exits
-  non-zero if it finds nothing to check.** Silence had been indistinguishable from a healthy
-  no-change run three times; it no longer is.
-- **2026-09-16 - repos moved to the NotRover org; box auth switched off deploy keys.** All
-  Orange Copy Paste repos were transferred from the `Spectrewolf8` account to the `NotRover`
-  org (same repo names). The read-only deploy key transferred with the repo but the org
-  disables deploy keys by policy ("Disabled by NotRover", no per-repo override), so `git
-  fetch` failed with "Repository not found". Switched the box to a fine-grained
-  **Contents: Read-only** token over HTTPS, embedded in the `origin` remote URL (section
-  5.6, section 9); `deploy.sh` is unchanged because git ignores its `GIT_SSH_COMMAND` for an
-  HTTPS remote. Trade-off: the token expires (max ~1 year) and must be rotated, where the
-  deploy key did not. The old `~/.ssh/id_repo` key and the disabled GitHub deploy key are
-  now unused and can be removed.
 
 ---
 
