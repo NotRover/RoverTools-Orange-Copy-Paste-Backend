@@ -742,14 +742,23 @@ and this section explains them and the parts that live nowhere else.
 The box **reaches out** to GitHub; nothing reaches in. A systemd timer runs `deploy.sh` on a
 ~90s poll:
 
-```
-push to main ─▶ GitHub (repo only)
-                   ▲  git fetch (read-only token over HTTPS, outbound)
-                   │
-   systemd timer ─▶ deploy.sh:  origin/main moved?
-                                   ├─ no  → exit (quiet no-op, the common case)
-                                   └─ yes → git reset --hard → docker compose build api
-                                            → docker compose up -d  (recreate api)
+```mermaid
+flowchart LR
+    PUSH["push to main"] --> GH["GitHub<br/>(repo only)"]
+    TIMER["systemd timer<br/>(~90s poll)"] --> DEPLOY["deploy.sh"]
+    DEPLOY -- "git fetch<br/>(read-only token over HTTPS, outbound)" --> GH
+    DEPLOY --> MOVED{"origin/main<br/>moved?"}
+    MOVED -- "no" --> NOOP["exit<br/>(quiet no-op, the common case)"]
+    MOVED -- "yes" --> BUILD["git reset --hard<br/>docker compose build api<br/>docker compose up -d (recreate api)"]
+
+    classDef event fill:#20140f,stroke:#ff3e1c,stroke-width:2px,color:#fafafa
+    classDef step fill:#1b1b1b,stroke:#9a9a9a,stroke-width:1.5px,color:#fafafa
+    classDef store fill:#161616,stroke:#6f6f6f,color:#e4e4e4
+    classDef decide fill:#20140f,stroke:#ff3e1c,stroke-width:2px,color:#fafafa
+    class PUSH,TIMER event
+    class DEPLOY,NOOP,BUILD step
+    class GH store
+    class MOVED decide
 ```
 
 - The image is **built on the box** from the checkout and tagged `rovertools-api:<short-sha>`

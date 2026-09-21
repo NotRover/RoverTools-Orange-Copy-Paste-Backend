@@ -31,12 +31,25 @@ It is a **stateless relay and store**. All encryption happens on the client, so 
 
 ## Architecture at a glance
 
-```
- Desktop client ──HTTPS──►  FastAPI  ──►  Postgres     (ciphertext, keys, membership)
-       │                       │
-       │                       ├────►     Redis        (pub/sub fan-out, device presence)
-       └────WSS /ws────────────┤
-                               └────►     S3 / R2      (presigned blob upload & download)
+```mermaid
+flowchart LR
+    C["Desktop client"]
+    F["FastAPI"]
+    PG["Postgres<br/>ciphertext, keys, membership"]
+    R["Redis<br/>pub/sub fan-out, device presence"]
+    S["S3 / R2<br/>presigned blob upload & download"]
+    C -- "HTTPS" --> F
+    C -- "WSS /ws" --> F
+    F --> PG
+    F --> R
+    F --> S
+
+    classDef client fill:#20140f,stroke:#ff3e1c,stroke-width:2px,color:#fafafa
+    classDef api fill:#20140f,stroke:#ff3e1c,stroke-width:2px,color:#fafafa
+    classDef store fill:#161616,stroke:#6f6f6f,color:#e4e4e4
+    class C client
+    class F api
+    class PG,R,S store
 ```
 
 - **Auth is delegated.** The client authenticates against Supabase directly and attaches the resulting access token to every call here. This service verifies it — asymmetric ES256/RS256 against the project's JWKS, or legacy HS256 for older projects — and reads `sub` as the user id. There is no login, refresh, or password route on this server.
