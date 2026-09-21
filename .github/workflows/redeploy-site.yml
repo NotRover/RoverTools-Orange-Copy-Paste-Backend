@@ -16,7 +16,7 @@ run-name: >-
 # Mirrored source in THIS repo (see the website's scripts/pull-dev-docs.mjs):
 #   - docs/architecture.md   (the wire contract)
 #
-# Needs one repository secret, SITE_DEPLOY_HOOK, holding the Cloudflare Pages Deploy
+# Needs one repository secret, ASTRO_SITE_DEPLOY_HOOK, holding the Cloudflare Pages Deploy
 # Hook URL for the site (Pages project > Settings > Builds & deployments > Deploy
 # hooks). The job no-ops with a clear message if the secret is absent, so a fork or
 # an unconfigured repo does not turn red.
@@ -39,10 +39,10 @@ jobs:
     steps:
       - name: Trigger Cloudflare Pages build
         env:
-          HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
+          HOOK: ${{ secrets.ASTRO_SITE_DEPLOY_HOOK }}
         run: |
           if [ -z "$HOOK" ]; then
-            echo "SITE_DEPLOY_HOOK is not set; nothing to trigger. Skipping."
+            echo "ASTRO_SITE_DEPLOY_HOOK is not set; nothing to trigger. Skipping."
             exit 0
           fi
           curl --fail --silent --show-error -X POST "$HOOK"
