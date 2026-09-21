@@ -210,14 +210,13 @@ The `Dockerfile` builds from the lockfile and honours `$PORT`, so the image also
 
 ## Related repositories
 
-The backend is one of three code repositories, plus a public feed for downloads. It is a submodule of the workspace (App) repo.
+The backend is one of three code repositories. It is a submodule of the workspace (App) repo, whose GitHub Releases carry the desktop app's downloads and update feed.
 
 | Repository | What it is |
 | --- | --- |
 | [Orange-Copy-Paste-App](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-App) | The desktop app and workspace — the client of this API |
 | **[Orange-Copy-Paste-Backend](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-Backend)** | This service |
 | [Orange-Copy-Paste-Website](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-Website) | The docs and marketing site |
-| [Orange-Copy-Paste-Releases](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-Releases) | The public release feed for the desktop app |
 
 ---
 
