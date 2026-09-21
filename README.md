@@ -10,6 +10,8 @@ It is a **stateless relay and store**. All encryption happens on the client, so 
 - **Blobs:** S3-compatible object storage (Cloudflare R2 in production, MinIO in dev)
 - **Auth:** Supabase Auth (GoTrue) JWTs, verified with PyJWT
 
+**Documentation:** the wire contract lives in [`docs/architecture.md`](docs/architecture.md); a friendlier self-hosting guide and the rest of the docs are at **[orange-copy-paste-app.pages.dev](https://orange-copy-paste-app.pages.dev)**. This service is one of three repos — see [Related repositories](#related-repositories).
+
 ---
 
 ## Table of contents
@@ -22,6 +24,7 @@ It is a **stateless relay and store**. All encryption happens on the client, so 
 - [Project structure](#project-structure)
 - [Development](#development)
 - [Deployment](#deployment)
+- [Related repositories](#related-repositories)
 - [Further reading](#further-reading)
 
 ---
@@ -205,8 +208,22 @@ The `Dockerfile` builds from the lockfile and honours `$PORT`, so the image also
 
 ---
 
+## Related repositories
+
+The backend is one of three code repositories, plus a public feed for downloads. It is a submodule of the workspace (App) repo.
+
+| Repository | What it is |
+| --- | --- |
+| [Orange-Copy-Paste-App](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-App) | The desktop app and workspace — the client of this API |
+| **[Orange-Copy-Paste-Backend](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-Backend)** | This service |
+| [Orange-Copy-Paste-Website](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-Website) | The docs and marketing site |
+| [Orange-Copy-Paste-Releases](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-Releases) | The public release feed for the desktop app |
+
+---
+
 ## Further reading
 
+- **[orange-copy-paste-app.pages.dev](https://orange-copy-paste-app.pages.dev)** — the public site: end-user guides and the Developers section (including a sanitized self-hosting guide).
 - [`docs/architecture.md`](docs/architecture.md) — system overview, service boundaries, data models, full API and WebSocket event reference. The source of truth for the wire contract.
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — self-hosting: deployment and ongoing operations, with placeholders for your own host, domain, and secrets.
 - [`docs/ANNOUNCEMENTS.md`](docs/ANNOUNCEMENTS.md) — sending a message to users from the server: the calls, the fields, and how to word one.
