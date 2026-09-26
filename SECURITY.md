@@ -1,7 +1,7 @@
 # Security Policy
 
-RoverTools is an end-to-end encrypted clipboard product. We take security
-reports seriously and appreciate responsible disclosure.
+Orange Copy Paste is an end-to-end encrypted clipboard app. This page says how
+to report a vulnerability and what happens next.
 
 ## Reporting a vulnerability
 
@@ -26,8 +26,10 @@ Please include:
 
 ## Scope
 
-The client holds all key material and performs all encryption and decryption;
-the backend stores only ciphertext and never sees plaintext or keys. Reports
+The app holds all key material and does all encryption and decryption; the
+server stores encrypted items and holds no key that can open them. What the
+server can see is listed in the
+[security model](https://orange-copy-paste-app.pages.dev/docs/security/#what-the-server-can-see). Reports
 that are especially valuable include anything that would let the server or a
 third party read plaintext, recover keys, or act as another user or device.
 
