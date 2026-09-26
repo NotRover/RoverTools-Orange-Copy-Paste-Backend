@@ -78,7 +78,8 @@ Always go through `uv run`, because `ruff` and `ty` are not on the venv PATH.
 
 ## Git
 
-Work on a dedicated branch in this repo, and open PRs against `main` as drafts. Keep
+Whether a change goes straight to `main` or gets a PR follows the workspace root
+`CLAUDE.md` (the Git & Repos section); a PR is a draft against `main`. Keep
 commits scoped to this repo. Never bundle a backend change with a parent-repo commit, except
 for a deliberate submodule-pointer bump. Never push or apply migrations without explicit
 approval.
