@@ -1,12 +1,13 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database import get_db
 from src.dependencies import get_current_user_id, get_redis
+from src.limiter import limiter
 from src import realtime as rt
 from src.sync import service
 from src.sync.models import SyncEntry
@@ -23,8 +24,15 @@ from src.sync.schemas import (
 router = APIRouter(prefix="/sync", tags=["sync"])
 
 
+# The client pushes one entry per request, so an offline backlog is a long run
+# of requests. 300/minute is five a second: a backlog flushes at that pace, and
+# the client honours `Retry-After` on a 429 and requeues what did not go, so a
+# limit costs time and never data. The row caps and the per-user push lock
+# bound what a burst can do inside the limit.
 @router.post("/push", response_model=PushResponse)
+@limiter.limit("300/minute")
 async def push(
+    request: Request,
     body: PushRequest,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
@@ -54,7 +62,15 @@ async def push(
                 origin_device=device_id,
             )
 
-    # Fan-out accepted entries to connected devices via WebSocket
+    # Fan-out accepted entries to connected devices via WebSocket.
+    #
+    # The space channels get the author's whole view, not the trimmed one pull
+    # gives other readers (`service.entry_view`): the author's own devices are
+    # subscribed to those channels too, and the client records the spaces a row
+    # carries as the entry's share list, so a trimmed copy reaching them would
+    # quietly un-share it from every other space on their next edit. Trimming
+    # here needs per-recipient filtering in the hub, which knows the socket's
+    # user; a channel-level publish does not.
     for acc in accepted:
         entry = await db.scalar(select(SyncEntry).where(SyncEntry.id == acc.server_id))
         if entry:
@@ -66,8 +82,10 @@ async def push(
 
 
 @router.get("/pull", response_model=PullResponse)
+@limiter.limit("120/minute")
 async def pull(
-    after_ts: Annotated[int, Query()] = 0,
+    request: Request,
+    after_ts: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
     entry_type: Annotated[str, Query()] = "all",
     db: AsyncSession = Depends(get_db),
@@ -78,14 +96,15 @@ async def pull(
     Requires: Bearer token + X-Device-Id header.
     """
     user_id, _ = current
-    rows, removed, next_cursor = await service.pull_entries(db, user_id, after_ts, limit, entry_type)
-    entries = [SyncEntryOut.model_validate(r) for r in rows]
+    entries, removed, next_cursor = await service.pull_entries(db, user_id, after_ts, limit, entry_type)
     removals = [RemovalOut.model_validate(r) for r in removed]
     return PullResponse(entries=entries, removals=removals, next_cursor=next_cursor)
 
 
 @router.post("/cursor", status_code=204)
+@limiter.limit("120/minute")
 async def update_cursor(
+    request: Request,
     body: CursorUpdateRequest,
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),

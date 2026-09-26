@@ -19,11 +19,13 @@ the same reason the infra probes are unversioned.
 
 import html
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from src.config import settings
+from src.limiter import limiter
 from src.spaces import service as spaces_service
 
 router = APIRouter(tags=["web"], include_in_schema=False)
@@ -59,7 +61,8 @@ def _render(title: str, body: str) -> HTMLResponse:
 
 
 @router.get("/join/{code}", response_class=HTMLResponse)
-async def join_page(code: str) -> HTMLResponse:
+@limiter.limit("60/minute")
+async def join_page(request: Request, code: str) -> HTMLResponse:
     """Space invite landing page.
 
     Answers 200 for any well-formed code, whether or not a space holds it: the
@@ -67,7 +70,8 @@ async def join_page(code: str) -> HTMLResponse:
     far more usefully than this page could.
     """
     normalized = spaces_service.normalize_invite_code(code)
-    deep_link = f"orange://join?code={html.escape(normalized, quote=True)}"
+    # Percent-encoded for the URL, then escaped for the attribute it sits in.
+    deep_link = html.escape(f"orange://join?code={quote(normalized, safe='')}", quote=True)
     body = _JOIN.replace("__CODE__", html.escape(spaces_service.format_invite_code(normalized))).replace(
         "__DEEP_LINK__", deep_link
     )

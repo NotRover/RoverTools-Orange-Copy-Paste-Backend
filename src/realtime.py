@@ -15,19 +15,21 @@ disconnect → `device:offline` immediately. A per-device Redis key with a TTL
 import asyncio
 import json
 import logging
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Awaitable, cast
+from typing import Any, Awaitable, cast
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from redis.asyncio import Redis, from_url
 from redis.exceptions import RedisError
 from sqlalchemy import select
 
-from src.auth.tokens import decode_supabase_token
+from src.auth.tokens import verify_supabase_token
 from src.database import AsyncSessionLocal
+from src.dependencies import check_device
 from src.spaces.models import SpaceMembership
 from src.redis_client import client_kwargs, get_redis_pool
 
@@ -46,6 +48,21 @@ PRESENCE_TTL = 300  # seconds; refreshed on every client message/pong
 # abandoned. Same reasoning as SEND_TIMEOUT: the work is off the listener's
 # path, but an unbounded query still holds a connection indefinitely.
 RESYNC_TIMEOUT = 10
+
+# The socket handshake: the client has this long after the upgrade to send its
+# `{"type": "auth", ...}` message, and every failure closes with AUTH_FAILED and
+# says nothing else, so a probe learns nothing about why.
+AUTH_TIMEOUT = 10
+AUTH_FAILED = 4401
+# Sockets one user may hold on one replica. Generous for real use (one per
+# running app); what it stops is one token opening sockets until the replica
+# runs out of file descriptors.
+MAX_SOCKETS_PER_USER = 8
+TOO_MANY_SOCKETS = 4429
+# Shortest gap between two honoured `resubscribe` messages on one socket. Each
+# costs a database query, so an unthrottled client could make the socket a
+# query pump.
+RESUBSCRIBE_MIN_INTERVAL = 5
 
 # How long the pub/sub listener waits before re-subscribing, and the ceiling it
 # backs off to. A Redis that is restarting comes back in seconds; one that is
@@ -175,7 +192,32 @@ async def presence_for_users(redis: Redis, user_ids: Sequence[str]) -> set[str]:
 _channels: dict[str, set[tuple[WebSocket, str]]] = defaultdict(set)
 _ws_channels: dict[WebSocket, set[str]] = {}
 _ws_device: dict[WebSocket, str] = {}
+# user_id -> that user's sockets on this replica, counted against
+# MAX_SOCKETS_PER_USER. Kept apart from `_channels` so a slot is held from the
+# moment the handshake passes, before the channel set is bound.
+_user_sockets: dict[str, set[WebSocket]] = defaultdict(set)
 _lock = asyncio.Lock()
+
+
+async def _reserve_slot(user_id: str, ws: WebSocket) -> bool:
+    async with _lock:
+        held = _user_sockets[user_id]
+        if len(held) >= MAX_SOCKETS_PER_USER:
+            if not held:
+                del _user_sockets[user_id]
+            return False
+        held.add(ws)
+        return True
+
+
+async def _release_slot(user_id: str, ws: WebSocket) -> None:
+    async with _lock:
+        held = _user_sockets.get(user_id)
+        if held is None:
+            return
+        held.discard(ws)
+        if not held:
+            del _user_sockets[user_id]
 
 
 def _bind_locked(ws: WebSocket, device_id: str, channels: list[str]) -> None:
@@ -310,6 +352,26 @@ def _schedule_resync(user_id: str) -> None:
     task.add_done_callback(_resync_tasks.discard)
 
 
+async def _close_device_sockets(user_id: str, device_id: str) -> None:
+    """Close every local socket `device_id` holds. Its endpoint loop then runs the
+    usual teardown (presence, `device:offline`)."""
+    async with _lock:
+        targets = [ws for ws, dev in _channels.get(f"user:{user_id}", set()) if dev == device_id]
+    for ws in targets:
+        try:
+            await ws.close(code=AUTH_FAILED)
+        except Exception:
+            pass  # already gone
+
+
+def _schedule_close_device(user_id: str, device_id: str) -> None:
+    if f"user:{user_id}" not in _channels:
+        return  # not a user this replica holds a socket for
+    task = asyncio.create_task(_close_device_sockets(user_id, device_id))
+    _resync_tasks.add(task)
+    task.add_done_callback(_resync_tasks.discard)
+
+
 async def _send_to_one(ws: WebSocket, raw: str) -> bool:
     """Deliver to a single socket. False means give up on it.
 
@@ -324,8 +386,44 @@ async def _send_to_one(ws: WebSocket, raw: str) -> bool:
         return False
 
 
-async def _broadcast_local(channel: str, raw: str, exclude_device: str | None = None) -> None:
+def _trim_entry_for(ws: WebSocket, data: dict) -> str:
+    """A `sync:entry` event as one socket may see it - the socket-side twin of
+    `sync.service.entry_view`.
+
+    The author's sockets hold `user:{author}` and get the row whole. Anyone
+    else reached it through a space, and their socket's channel set is exactly
+    the spaces they are in: `space_ids` shrinks to those, `wrapped_keys` to
+    those spaces' wraps, and the personal wrap goes. Trimmed per socket rather
+    than per channel because a member of two of the entry's spaces is on both
+    channels and must see the same view from each.
+    """
+    payload = data.get("payload")
+    if not isinstance(payload, dict):
+        return json.dumps(data)
+    mine = _ws_channels.get(ws, set())
+    author = payload.get("user_id")
+    if author and f"user:{author}" in mine:
+        return json.dumps(data)
+    shown = [s for s in (payload.get("space_ids") or []) if f"space:{s}" in mine]
+    try:
+        keys: Any = json.loads(payload.get("wrapped_keys") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        keys = {}
+    kept = {str(s): keys[str(s)] for s in shown if str(s) in keys} if isinstance(keys, dict) else {}
+    trimmed = {**payload, "space_ids": shown, "wrapped_keys": json.dumps(kept)}
+    return json.dumps({**data, "payload": trimmed})
+
+
+async def _broadcast_local(
+    channel: str,
+    raw: str,
+    exclude_device: str | None = None,
+    trim: dict | None = None,
+) -> None:
     """Deliver one event to this replica's sockets on `channel`.
+
+    `trim` is the decoded event when it is a `sync:entry`: each socket then gets
+    its own view of it (see `_trim_entry_for`) instead of `raw`.
 
     Concurrently, and with a per-socket timeout, because this is awaited by the
     pub/sub listener and used to be neither. Sending in sequence meant one
@@ -359,7 +457,9 @@ async def _broadcast_local(channel: str, raw: str, exclude_device: str | None = 
     if not targets:
         return
 
-    delivered = await asyncio.gather(*(_send_to_one(ws, raw) for ws, _ in targets))
+    delivered = await asyncio.gather(
+        *(_send_to_one(ws, _trim_entry_for(ws, trim) if trim else raw) for ws, _ in targets)
+    )
     for (ws, _), ok in zip(targets, delivered, strict=True):
         if ok:
             continue
@@ -402,7 +502,8 @@ async def start_listener(redis_url: str) -> None:
                 try:
                     parsed = json.loads(data)
                     exclude_device: str | None = parsed.pop("_origin_device", None)
-                    await _broadcast_local(channel, json.dumps(parsed), exclude_device)
+                    trim = parsed if parsed.get("event") == "sync:entry" else None
+                    await _broadcast_local(channel, json.dumps(parsed), exclude_device, trim)
                     # A membership event on a user's own channel is that user's
                     # space list changing under an open socket. Acting on it
                     # here is what makes the channel set self-healing on every
@@ -412,6 +513,12 @@ async def start_listener(redis_url: str) -> None:
                         and channel.startswith("user:")
                     ):
                         _schedule_resync(channel.removeprefix("user:"))
+                    # Sent to the device first (above), so it learns why, then
+                    # its sockets on this replica are closed.
+                    if parsed.get("event") == "device:revoked" and channel.startswith("user:"):
+                        revoked = (parsed.get("payload") or {}).get("device_id")
+                        if isinstance(revoked, str):
+                            _schedule_close_device(channel.removeprefix("user:"), revoked)
                 except Exception:
                     logger.exception("pubsub dispatch error on channel %s", channel)
         except asyncio.CancelledError:
@@ -611,32 +718,104 @@ async def publish_settings_updated(redis: Redis, user_id: str, updated_at: int) 
     await publish(redis, f"user:{user_id}", "settings:updated", {"updated_at": updated_at})
 
 
+async def publish_device_revoked(redis: Redis, user_id: str, device_id: str) -> None:
+    """Tell the user's devices that `device_id` was revoked. The revoked device
+    signs itself out on it, and every replica closes that device's sockets."""
+    await publish(redis, f"user:{user_id}", "device:revoked", {"device_id": device_id})
+
+
 # ── WebSocket endpoint ───────────────────────────────────────────────────────────
 
 
-@router.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: str = ""):
-    """Realtime WebSocket: subscribes the device to its user and space channels.
+async def _authenticate(websocket: WebSocket, redis: Redis) -> tuple[str, str, int] | None:
+    """Read and check the handshake message. (user_id, device_id, exp), or None.
 
-    Authenticates via `?token=` (Supabase JWT) and `?device_id=` query params.
-    Emits `device:online` on connect and `device:offline` on disconnect, and
-    relays fan-out events (sync, space, invite, settings) to the socket.
+    Never logs the message: it carries the access token.
     """
     try:
-        payload = decode_supabase_token(token)
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=AUTH_TIMEOUT)
+        msg = json.loads(raw)
     except Exception:
-        await websocket.close(code=4001)
-        return
+        return None
+    if not isinstance(msg, dict) or msg.get("type") != "auth":
+        return None
+    token = msg.get("token")
+    raw_device = msg.get("device_id")
+    if not isinstance(token, str) or not isinstance(raw_device, str):
+        return None
+    try:
+        payload = await verify_supabase_token(token)
+        user_id = payload.get("sub")
+        if not isinstance(user_id, str) or not user_id:
+            return None
+        device_id = uuid.UUID(raw_device)
+        async with AsyncSessionLocal() as db:
+            await check_device(db, redis, user_id, device_id)
+        return user_id, str(device_id), int(payload["exp"])
+    except Exception:
+        return None
 
-    user_id: str = payload.get("sub", "")
-    if not user_id or not device_id:
-        await websocket.close(code=4001)
-        return
 
-    redis: Redis = await get_redis_pool()  # type: ignore[assignment]
+async def _close_at_expiry(websocket: WebSocket, exp: int) -> None:
+    """Close the socket when the token it authenticated with expires. The client
+    reconnects with a fresh token; a socket must not outlive its credential."""
+    await asyncio.sleep(max(0.0, exp - time.time()))
+    try:
+        await websocket.close(code=AUTH_FAILED)
+    except Exception:
+        pass
+
+
+@router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """Realtime WebSocket: subscribes the device to its user and space channels.
+
+    Handshake: the server accepts the upgrade, then waits up to `AUTH_TIMEOUT`
+    seconds for `{"type": "auth", "token": "<jwt>", "device_id": "<uuid>"}`. The
+    token must verify and the device must be the user's own, unrevoked device;
+    the server then answers `{"type": "auth_ok"}`. Any failure closes with 4401
+    and nothing else. The token is never accepted in the URL, where proxies and
+    access logs would keep it.
+
+    Emits `device:online` on connect and `device:offline` on disconnect, and
+    relays fan-out events (sync, space, invite, settings) to the socket. Closed
+    with 4401 when the token expires or the device is revoked, and with 4429 when
+    the user already holds `MAX_SOCKETS_PER_USER` sockets on this replica.
+    """
     await websocket.accept()
+    redis: Redis = await get_redis_pool()  # type: ignore[assignment]
 
-    channels = await _resolve_channels(user_id)
+    auth = await _authenticate(websocket, redis)
+    if auth is None:
+        try:
+            await websocket.close(code=AUTH_FAILED)
+        except Exception:
+            pass
+        return
+    user_id, device_id, exp = auth
+
+    if not await _reserve_slot(user_id, websocket):
+        try:
+            await websocket.close(code=TOO_MANY_SOCKETS)
+        except Exception:
+            pass
+        return
+
+    expiry = asyncio.create_task(_close_at_expiry(websocket, exp))
+    try:
+        await _serve(websocket, redis, user_id, device_id)
+    finally:
+        expiry.cancel()
+        await _release_slot(user_id, websocket)
+
+
+async def _serve(websocket: WebSocket, redis: Redis, user_id: str, device_id: str) -> None:
+    """The authenticated life of one socket."""
+    try:
+        await websocket.send_json({"type": "auth_ok"})
+        channels = await _resolve_channels(user_id)
+    except Exception:
+        return
     await _register(websocket, device_id, channels)
 
     # Presence: mark online + set the TTL key the sweeper watches.
@@ -651,11 +830,19 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
     await publish(redis, f"user:{user_id}", "device:online", {"device_id": device_id})
     await publish_user_presence(redis, _space_channels(channels), user_id, True)
 
+    last_resubscribe = 0.0
     try:
         while True:
             try:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=PING_INTERVAL)
-                msg = json.loads(raw)
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                # Anything but an object is ignored: `.get` on a list or a number
+                # used to raise out of the loop and drop the socket.
+                if not isinstance(msg, dict):
+                    continue
                 if msg.get("event") in ("pong", "ack"):
                     try:
                         await _assert_presence(redis, user_id, device_id)
@@ -673,9 +860,18 @@ async def websocket_endpoint(websocket: WebSocket, token: str = "", device_id: s
                     # makes space fan-out work — it is the client saying it
                     # believes it is stale, which stays supported because it
                     # costs one query and is the client's only way to say so.
+                    # Throttled per socket, since that query is the cost.
+                    now = time.monotonic()
+                    if now - last_resubscribe < RESUBSCRIBE_MIN_INTERVAL:
+                        continue
+                    last_resubscribe = now
                     await _rebind(websocket, await _resolve_channels(user_id))
             except asyncio.TimeoutError:
                 await websocket.send_json({"event": "ping", "payload": {"server_ts": _now_ms()}})
+            except KeyError:
+                # A binary frame, which `receive_text` cannot read. Ignored like
+                # any other message this protocol does not define.
+                continue
             except (WebSocketDisconnect, RuntimeError):
                 break
     finally:

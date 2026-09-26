@@ -40,6 +40,13 @@ class Profile(Base):
     # here: the server holds a blob it cannot open, and no server-decryptable
     # recovery path exists - that would end the end-to-end guarantee.
     recovery_wrapped_umk: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # hex sha256 of the client's UMK proof (`X-Umk-Proof`), set on first use. Once
+    # set, routes that change key material require a matching proof. The proof is
+    # derived from the UMK client-side and opens nothing here.
+    umk_proof_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The password envelope an account reset replaced (reset needs a Supabase
+    # recovery-link session). Kept so a reset is not the silent loss of the old key.
+    pw_wrapped_umk_prev: Mapped[str | None] = mapped_column(Text, nullable=True)
     blob_bytes_quota: Mapped[int] = mapped_column(BigInteger, nullable=False, default=52_428_800)  # 50 MB
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

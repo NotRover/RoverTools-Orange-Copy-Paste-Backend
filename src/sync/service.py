@@ -1,13 +1,17 @@
+import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from fastapi import HTTPException, status
+from sqlalchemy import Select, and_, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.blobs import service as blobs_service
+from src.blobs.models import Blob
 from src.spaces.service import record_space_removals
 from src.config import settings
 from src.spaces.models import SpaceEntryRemoval, SpaceMembership
@@ -17,7 +21,14 @@ from src.sync.schemas import (
     BreakdownOut,
     ConflictEntry,
     PushEntry,
+    SyncEntryOut,
 )
+
+# Namespace for the two-key `pg_advisory_xact_lock(ns, hashtext(user_id))` a push
+# takes. Arbitrary and stable; it only has to differ from other two-key users.
+_PUSH_LOCK_NAMESPACE = 0x5EC5
+# Tombstone rows an account may hold, as a multiple of the live-row cap.
+_TOMBSTONE_CAP_FACTOR = 3
 
 
 def _now_ms() -> int:
@@ -31,6 +42,14 @@ class Withdrawal:
     client_id: str
     entry_type: str
     space_ids: list[str]
+
+
+@dataclass
+class _Room:
+    """What is left of the account's two row budgets within one push."""
+
+    live: int
+    tombstones: int
 
 
 # ── Push ──────────────────────────────────────────────────────────────────────
@@ -47,6 +66,11 @@ async def push_entries(
     Fan-out only reaches the spaces an entry still carries, and pull matches on
     the same array — so without this, un-sharing is silent and every member
     keeps their copy forever.
+
+    One transaction for the whole batch, committed once at the end. That is
+    what makes the per-user advisory lock below mean anything (a transaction
+    lock is released at the first commit), and it means a batch refused with a
+    422 part of the way through leaves nothing behind.
     """
     accepted: list[AcceptedEntry] = []
     conflicts: list[ConflictEntry] = []
@@ -54,19 +78,39 @@ async def push_entries(
     uid = uuid.UUID(user_id)
     did = uuid.UUID(device_id)
 
-    # Counted once per push, not once per entry: the number only moves by what
-    # this loop inserts, which it tracks itself.
+    # Serialises concurrent pushes from one account, so two of them cannot both
+    # read the same count and each take the last free slot. Two-key form, so it
+    # sits in its own namespace apart from the maintenance loop's one-key lock.
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(:ns, hashtext(:uid))"),
+        {"ns": _PUSH_LOCK_NAMESPACE, "uid": user_id},
+    )
+
+    # Counted once per push, not once per entry: the numbers only move by what
+    # this loop writes, which it tracks itself.
     held = await db.scalar(
         select(func.count())
         .select_from(SyncEntry)
         .where(SyncEntry.user_id == uid, SyncEntry.deleted_at.is_(None))
     )
-    room = settings.max_entries_per_user - (held or 0)
+    buried = await db.scalar(
+        select(func.count())
+        .select_from(SyncEntry)
+        .where(SyncEntry.user_id == uid, SyncEntry.deleted_at.is_not(None))
+    )
+    room = _Room(
+        live=settings.max_entries_per_user - (held or 0),
+        tombstones=settings.max_entries_per_user * _TOMBSTONE_CAP_FACTOR - (buried or 0),
+    )
 
     for entry in entries:
-        result, dropped, inserted = await _upsert_entry(db, uid, did, entry, room)
-        if inserted:
-            room -= 1
+        try:
+            result, dropped = await _upsert_entry(db, uid, did, entry, room)
+        except HTTPException:
+            # Nothing from this batch survives a refusal, including the rows
+            # already flushed ahead of the one that failed.
+            await db.rollback()
+            raise
         if isinstance(result, AcceptedEntry):
             accepted.append(result)
             if dropped:
@@ -80,6 +124,7 @@ async def push_entries(
         else:
             conflicts.append(result)
 
+    await db.commit()
     return accepted, conflicts, withdrawals
 
 
@@ -88,12 +133,18 @@ async def _upsert_entry(
     user_id: uuid.UUID,
     device_id: uuid.UUID,
     entry: PushEntry,
-    room: int,
-) -> tuple[AcceptedEntry | ConflictEntry, list[uuid.UUID], bool]:
-    """Third return value: whether this consumed a live slot, so the caller can
-    keep ``room`` honest across a batch without counting the table again. A
-    tombstone insert creates a row but consumes no slot - the quota counts live
-    entries only - so it returns ``False``."""
+    room: _Room,
+) -> tuple[AcceptedEntry | ConflictEntry, list[uuid.UUID]]:
+    """Write one entry into the push's transaction. Does not commit.
+
+    Updates ``room`` in place when the write takes a live or a tombstone slot,
+    so the caller's budgets stay honest across a batch without counting the
+    table again.
+
+    Raises 422 (`not_a_member`, `invalid_blob`) rather than returning a
+    conflict: those are bodies no retry can fix, and the client pushes one entry
+    per request.
+    """
     # Checked before the lookup: an oversized row is refused whether it would be
     # an insert or an update, and refusing costs nothing.
     #
@@ -105,7 +156,7 @@ async def _upsert_entry(
         len(entry.encrypted_content) > settings.max_entry_bytes
         or len(entry.encrypted_metadata or "") > settings.max_entry_bytes
     ):
-        return ConflictEntry(client_id=entry.client_id, reason="entry_too_large"), [], False
+        return ConflictEntry(client_id=entry.client_id, reason="entry_too_large"), []
 
     existing = await db.scalar(
         select(SyncEntry).where(
@@ -115,13 +166,48 @@ async def _upsert_entry(
         )
     )
 
+    # Nobody decrypts a tombstone, so it keeps no ciphertext, no key envelope
+    # and no blob. Storing what the client sent would make deleted rows - which
+    # the live-row cap does not count - a free place to park `max_entry_bytes`
+    # per row.
+    tombstone = entry.deleted_at is not None
+    content = "" if tombstone else entry.encrypted_content
+    metadata = None if tombstone else entry.encrypted_metadata
+    wrapped_keys = "{}" if tombstone else entry.wrapped_keys
+    blob_key = None if tombstone else entry.blob_key
+    blob_size = None if tombstone else entry.blob_size
+
+    # Spaces this push puts the entry *into*: all of them on an insert, and on
+    # an update only the ones the row does not already carry. A tombstone keeps
+    # the row's spaces so the delete reaches the same members, and the author
+    # may have left one of them since - that must not stop the delete.
+    already = set(existing.space_ids or []) if existing else set()
+    added = [s for s in entry.space_ids if s not in already]
+    if added:
+        await _require_memberships(db, user_id, added)
+
+    if blob_key is not None and (existing is None or existing.blob_key != blob_key):
+        await _require_own_blob(db, user_id, blob_key)
+
     server_ts = _now_ms()
 
     if existing:
         # Tombstone always wins
-        incoming_tombstone = entry.deleted_at is not None and existing.deleted_at is None
+        incoming_tombstone = tombstone and existing.deleted_at is None
         if not incoming_tombstone and entry.updated_at <= existing.updated_at:
-            return ConflictEntry(client_id=entry.client_id, reason="stale_update"), [], False
+            return ConflictEntry(client_id=entry.client_id, reason="stale_update"), []
+
+        # The insert rule, applied to the spaces this update adds: sharing a row
+        # this account holds into a space where another account already holds
+        # the same entry is the same impersonation as inserting it there.
+        if added and await _belongs_to_someone_else(db, user_id, entry, added):
+            return ConflictEntry(client_id=entry.client_id, reason="not_your_entry"), []
+
+        # Bringing a deleted row back takes a live slot, as an insert does.
+        # Without this the live cap was the tombstone cap plus one update each.
+        revived = existing.deleted_at is not None and not tombstone
+        if revived and room.live <= 0:
+            return ConflictEntry(client_id=entry.client_id, reason="account_full"), []
 
         # Spaces this push takes the entry out of. A tombstone keeps its spaces
         # so it can fan out as a delete, so this only ever fires on un-share.
@@ -132,7 +218,7 @@ async def _upsert_entry(
         # object) or because it is a tombstone. Nothing else references it, so
         # release it - otherwise it occupies the user's quota forever with no
         # way to reclaim it.
-        superseded_blob = existing.blob_key if existing.blob_key != entry.blob_key else None
+        superseded_blob = existing.blob_key if existing.blob_key != blob_key else None
 
         # The device that wrote it *last*, not the one that created it. Clients
         # suppress their own echo by comparing this to their device id, and a
@@ -141,16 +227,19 @@ async def _upsert_entry(
         # signed in since was not recognised as its own, and the client applied
         # its own deletion to its own local copy.
         existing.device_id = device_id
-        existing.encrypted_content = entry.encrypted_content
-        existing.encrypted_metadata = entry.encrypted_metadata
+        existing.encrypted_content = content
+        existing.encrypted_metadata = metadata
         existing.updated_at = entry.updated_at
         existing.server_ts = server_ts
         existing.deleted_at = entry.deleted_at
         existing.pinned = entry.pinned
-        existing.blob_key = entry.blob_key
-        existing.blob_size = entry.blob_size
+        existing.blob_key = blob_key
+        existing.blob_size = blob_size
         existing.space_ids = entry.space_ids
-        existing.wrapped_keys = entry.wrapped_keys
+        existing.wrapped_keys = wrapped_keys
+        if revived:
+            room.live -= 1
+            room.tombstones += 1
         if superseded_blob:
             await blobs_service.release_blob(db, user_id, superseded_blob)
         # Same transaction as the strip. The event this push triggers reaches
@@ -172,22 +261,24 @@ async def _upsert_entry(
                 removed_by=user_id,
                 server_ts=server_ts,
             )
-        await db.commit()
-        return AcceptedEntry(client_id=entry.client_id, server_id=existing.id, server_ts=server_ts), dropped, False
+        await db.flush()
+        return AcceptedEntry(client_id=entry.client_id, server_id=existing.id, server_ts=server_ts), dropped
 
-    if await _belongs_to_someone_else(db, user_id, entry):
-        return ConflictEntry(client_id=entry.client_id, reason="not_your_entry"), [], False
+    if await _belongs_to_someone_else(db, user_id, entry, entry.space_ids):
+        return ConflictEntry(client_id=entry.client_id, reason="not_your_entry"), []
 
     # A full account can still be edited and emptied - the update path above is
     # already past this point, so changes to rows that exist keep working. A new
-    # tombstone is let through too: the quota counts live entries only (`held`
-    # above filters on `deleted_at IS NULL`), so a tombstone adds nothing to
-    # charge for, and it is the very thing that frees space. Refusing it also
-    # broke "remove from my devices" for a received entry at quota - that hide is
-    # a brand-new tombstone row, so it would have been the one delete a full
-    # account could not make. Only a new *live* row is refused.
-    if room <= 0 and entry.deleted_at is None:
-        return ConflictEntry(client_id=entry.client_id, reason="account_full"), [], False
+    # tombstone is let through a full account too: it is the very thing that
+    # frees space, and refusing it broke "remove from my devices" for a received
+    # entry at quota - that hide is a brand-new tombstone row. Tombstones have a
+    # budget of their own instead (`_TOMBSTONE_CAP_FACTOR` times the live cap),
+    # so they are not an unmetered way to create rows.
+    if tombstone:
+        if room.tombstones <= 0:
+            return ConflictEntry(client_id=entry.client_id, reason="account_full"), []
+    elif room.live <= 0:
+        return ConflictEntry(client_id=entry.client_id, reason="account_full"), []
 
     new_entry = SyncEntry(
         client_id=entry.client_id,
@@ -195,32 +286,65 @@ async def _upsert_entry(
         device_id=device_id,
         entry_type=entry.entry_type,
         kind=entry.kind,
-        encrypted_content=entry.encrypted_content,
-        encrypted_metadata=entry.encrypted_metadata,
+        encrypted_content=content,
+        encrypted_metadata=metadata,
         created_at=entry.created_at,
         updated_at=entry.updated_at,
         server_ts=server_ts,
         deleted_at=entry.deleted_at,
         pinned=entry.pinned,
-        blob_key=entry.blob_key,
-        blob_size=entry.blob_size,
+        blob_key=blob_key,
+        blob_size=blob_size,
         space_ids=entry.space_ids,
-        wrapped_keys=entry.wrapped_keys,
+        wrapped_keys=wrapped_keys,
     )
     db.add(new_entry)
-    await db.commit()
-    await db.refresh(new_entry)
-    # A live insert consumes a slot; a new tombstone does not (it is excluded
-    # from the quota count), so it must not shrink `room` for the rest of the batch.
-    consumed_slot = entry.deleted_at is None
-    return (
-        AcceptedEntry(client_id=entry.client_id, server_id=new_entry.id, server_ts=server_ts),
-        [],
-        consumed_slot,
+    await db.flush()
+    if tombstone:
+        room.tombstones -= 1
+    else:
+        room.live -= 1
+    return AcceptedEntry(client_id=entry.client_id, server_id=new_entry.id, server_ts=server_ts), []
+
+
+async def _require_memberships(db: AsyncSession, user_id: uuid.UUID, space_ids: list[uuid.UUID]) -> None:
+    """Refuse a push that puts an entry into a space the caller is not in.
+
+    `space_ids` is the fan-out target list and what pull's space arm matches
+    on, so without this any account could publish into any space whose id it
+    had seen. The detail names nothing about which space failed or why: a space
+    the caller was removed from and one that never existed read the same.
+    """
+    held = set(
+        (
+            await db.scalars(
+                select(SpaceMembership.space_id).where(
+                    SpaceMembership.user_id == user_id,
+                    SpaceMembership.space_id.in_(space_ids),
+                )
+            )
+        ).all()
     )
+    if any(s not in held for s in space_ids):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="not_a_member")
 
 
-async def _belongs_to_someone_else(db: AsyncSession, user_id: uuid.UUID, entry: PushEntry) -> bool:
+async def _require_own_blob(db: AsyncSession, user_id: uuid.UUID, blob_key: str) -> None:
+    """A row may only point at a blob this account uploaded and confirmed.
+
+    Download access follows the entry (`_shares_space_with_blob`), so a row
+    naming another account's key would otherwise be a way to read it.
+    """
+    owned = await db.scalar(
+        select(Blob.key).where(Blob.key == blob_key, Blob.user_id == user_id, Blob.confirmed.is_(True))
+    )
+    if owned is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="invalid_blob")
+
+
+async def _belongs_to_someone_else(
+    db: AsyncSession, user_id: uuid.UUID, entry: PushEntry, space_ids: list[uuid.UUID]
+) -> bool:
     """Whether this push would plant a rival copy of somebody else's entry.
 
     Rows are keyed `(user_id, client_id, entry_type)`, so a push of an entry the
@@ -230,8 +354,8 @@ async def _belongs_to_someone_else(db: AsyncSession, user_id: uuid.UUID, entry: 
     one item, so the practical result is that the author's text and name are
     replaced by whoever pushed last (client bug #8).
 
-    Only checked when inserting: an existing row under this account means the
-    caller already owns the entry.
+    `space_ids` is what this push adds: every space on an insert, and on an
+    update only the spaces the row did not carry before.
 
     The space overlap is what keeps this from rejecting honest pushes. Client ids
     are UUIDv4, so two accounts holding one is not chance - but one *person* with
@@ -239,15 +363,17 @@ async def _belongs_to_someone_else(db: AsyncSession, user_id: uuid.UUID, entry: 
     construction. Nobody is impersonated unless the two rows meet in a space, so
     that is exactly where this refuses.
     """
-    if not entry.space_ids:
+    if not space_ids:
         return False
     rival = await db.scalar(
-        select(SyncEntry.id).where(
+        select(SyncEntry.id)
+        .where(
             SyncEntry.client_id == entry.client_id,
             SyncEntry.entry_type == entry.entry_type,
             SyncEntry.user_id != user_id,
-            SyncEntry.space_ids.overlap(entry.space_ids),
+            SyncEntry.space_ids.overlap(space_ids),
         )
+        .limit(1)
     )
     return rival is not None
 
@@ -261,7 +387,7 @@ async def pull_entries(
     after_ts: int,
     limit: int,
     entry_type: str,
-) -> tuple[list[SyncEntry], list[SpaceEntryRemoval], int | None]:
+) -> tuple[list[SyncEntryOut], list[SpaceEntryRemoval], int | None]:
     uid = uuid.UUID(user_id)
 
     # A device pulls its own user's entries plus anything shared into a space it
@@ -289,14 +415,33 @@ async def pull_entries(
     if entry_type in ("clipboard", "note"):
         q = q.where(SyncEntry.entry_type == entry_type)
 
-    q = q.order_by(SyncEntry.server_ts.asc()).limit(limit + 1)
-    result = await db.scalars(q)
-    rows = list(result.all())
-    rows, entries_next = _paginate(rows, limit)
+    rows, entries_next = await _page(db, q, SyncEntry, limit)
+    member_spaces = {m.space_id for m in memberships}
+    out = [entry_view(r, uid, member_spaces) for r in rows]
 
     removals, removals_next = await _pull_removals(db, memberships, after_ts, limit, entry_type)
 
-    return rows, removals, merge_cursors(entries_next, removals_next)
+    return out, removals, merge_cursors(entries_next, removals_next)
+
+
+def entry_view(row: SyncEntry, reader: uuid.UUID, reader_spaces: set[uuid.UUID]) -> SyncEntryOut:
+    """A row as one reader may see it.
+
+    The author sees their row whole. Anyone else reached it through a space, and
+    sees only the spaces they are in and the wraps for those spaces: the other
+    spaces an entry went to, and the personal wrap under the author's UMK, are
+    the author's business.
+    """
+    out = SyncEntryOut.model_validate(row)
+    if row.user_id == reader:
+        return out
+    shown = [s for s in (row.space_ids or []) if s in reader_spaces]
+    try:
+        keys: Any = json.loads(row.wrapped_keys or "{}")
+    except json.JSONDecodeError:
+        keys = {}
+    kept = {str(s): keys[str(s)] for s in shown if str(s) in keys} if isinstance(keys, dict) else {}
+    return out.model_copy(update={"space_ids": shown, "wrapped_keys": json.dumps(kept)})
 
 
 def merge_cursors(entries_next: int | None, removals_next: int | None) -> int | None:
@@ -319,12 +464,31 @@ def merge_cursors(entries_next: int | None, removals_next: int | None) -> int | 
     return min(truncations) if truncations else None
 
 
-def _paginate(rows: list, limit: int) -> tuple[list, int | None]:
-    """Trim an over-fetched page and report where it stopped."""
-    if len(rows) > limit:
-        rows = rows[:limit]
-        return rows, rows[-1].server_ts
-    return rows, None
+async def _page[T: (SyncEntry, SpaceEntryRemoval)](
+    db: AsyncSession, q: Select[tuple[T]], model: type[T], limit: int
+) -> tuple[list[T], int | None]:
+    """One page of `q`, and the cursor to resume from - never splitting a timestamp.
+
+    The cursor is a bare `server_ts` and the next pull asks for `> cursor`, so a
+    page that stopped in the middle of a run of rows sharing one `server_ts` would
+    skip the rest of that run for good. Rows do share one: a removal stamps every
+    row it strips with the same time, and a batch push lands many rows in one
+    millisecond. So a page ends on the last complete timestamp, and when a single
+    timestamp holds more than a whole page, that timestamp is returned whole.
+    """
+    ordered = q.order_by(model.server_ts.asc(), model.id.asc())
+    rows = list((await db.scalars(ordered.limit(limit + 1))).all())
+    if len(rows) <= limit:
+        return rows, None
+    boundary = rows[limit].server_ts
+    page = rows[:limit]
+    if page[-1].server_ts != boundary:
+        return page, page[-1].server_ts
+    page = [r for r in page if r.server_ts < boundary]
+    if page:
+        return page, page[-1].server_ts
+    whole = list((await db.scalars(q.where(model.server_ts == boundary).order_by(model.id.asc()))).all())
+    return whole, boundary
 
 
 async def _pull_removals(
@@ -362,16 +526,19 @@ async def _pull_removals(
     q = select(SpaceEntryRemoval).where(or_(*arms))
     if entry_type in ("clipboard", "note"):
         q = q.where(SpaceEntryRemoval.entry_type == entry_type)
-    q = q.order_by(SpaceEntryRemoval.server_ts.asc()).limit(limit + 1)
-
-    rows = list((await db.scalars(q)).all())
-    return _paginate(rows, limit)
+    return await _page(db, q, SpaceEntryRemoval, limit)
 
 
 # ── Cursor ────────────────────────────────────────────────────────────────────
 
 
 async def update_cursor(db: AsyncSession, device_id: str, user_id: str, last_server_ts: int) -> None:
+    """Advance this device's cursor. Forward only, and only on the caller's row.
+
+    The table's key is `device_id` alone, so the conflict target stays that; the
+    `user_id` condition is what stops a write naming another account's device id
+    from moving that account's cursor.
+    """
     did = uuid.UUID(device_id)
     uid = uuid.UUID(user_id)
 
@@ -381,7 +548,7 @@ async def update_cursor(db: AsyncSession, device_id: str, user_id: str, last_ser
         .on_conflict_do_update(
             index_elements=["device_id"],
             set_={"last_server_ts": last_server_ts},
-            where=SyncCursor.last_server_ts < last_server_ts,
+            where=and_(SyncCursor.user_id == uid, SyncCursor.last_server_ts < last_server_ts),
         )
     )
     await db.execute(stmt)
@@ -418,14 +585,13 @@ async def account_breakdown(db: AsyncSession, user_id: str) -> BreakdownOut:
         if kind in named:
             named[kind] += count
 
-    text = clipboard - named["image"] - named["file"] - named["html"]
+    text_rows = clipboard - named["image"] - named["file"] - named["html"]
     return BreakdownOut(
         clipboard=clipboard,
         notes=notes,
         total=clipboard + notes,
-        text=text,
+        text=text_rows,
         image=named["image"],
         file=named["file"],
         html=named["html"],
     )
-

@@ -8,6 +8,10 @@
 #     compose network. One replica: a deploy recreates it, with a ~1-3s 502
 #     window accepted rather than run an overlap tool (docs/DEPLOY.md section 9).
 #   - redis publishes NO host port; it holds only pub/sub + presence, persistence off.
+#   - Every service sits on the `edge` network, which has a fixed subnet so Caddy
+#     can have a fixed address. The api trusts X-Forwarded-For from that address
+#     only (FORWARDED_ALLOW_IPS below, read by the Dockerfile CMD), which is what
+#     makes per-IP rate limits key on the real client. Keep the two in step.
 services:
   caddy:
     image: caddy:2-alpine
@@ -15,6 +19,9 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    networks:
+      edge:
+        ipv4_address: 172.30.57.10
     volumes:
       - ./caddy:/etc/caddy:ro
       - caddy_data:/data
@@ -31,6 +38,10 @@ services:
     environment:
       - METRICS_AUTH_USER=${METRICS_AUTH_USER:-admin}
       - METRICS_AUTH_HASH=${METRICS_AUTH_HASH:?set METRICS_AUTH_HASH in .env}
+      # Source ranges allowed to reach the status site, space-separated CIDRs.
+      # Defaults to everyone (basic auth still applies); narrow it to your own
+      # address in .env - see docs/DEPLOY.md section 12.
+      - METRICS_ALLOW_CIDR=${METRICS_ALLOW_CIDR:-0.0.0.0/0 ::/0}
     # Ship logs to the host journal (persistent, survives the rollout that
     # replaces this container, size-capped by journald). Read with
     # `journalctl -t rovertools-caddy`. See docs/DEPLOY.md section 12.
@@ -44,6 +55,13 @@ services:
     image: ${IMAGE:-rovertools-api:latest}   # built & tagged locally by deploy.sh
     restart: unless-stopped
     env_file: .env          # every secret lives here, on the box, mode 600
+    environment:
+      # Caddy's fixed address on `edge`: the only peer whose forwarded headers
+      # uvicorn believes. Set here rather than in .env so it cannot drift from
+      # the ipv4_address above.
+      - FORWARDED_ALLOW_IPS=172.30.57.10
+    networks:
+      - edge
     depends_on:
       - redis
     # no published ports (only Caddy reaches it; two can run during a rollout)
@@ -62,20 +80,25 @@ services:
   # cp fail and the container crash-loop. deploy.sh installs netdata/go.d/*.conf into
   # the netdataconfig volume instead, so the file still ships from git.
   #
-  # The host mounts are what make it a metrics agent rather than a health checker;
-  # there is no subset of them that still yields CPU, memory and disk. They are
-  # read-only, and the container gets no route to the Docker socket - container
-  # names come from dockerproxy below.
+  # The host mounts are the specific ones Netdata documents for its collectors
+  # (/proc, /sys, os-release, passwd/group), all read-only; the whole host root
+  # filesystem is deliberately NOT mounted, so a compromised agent cannot read
+  # the box's files (.env included). The container gets no route to the Docker
+  # socket - container names come from dockerproxy below.
+  #
+  # SYS_ADMIN and apparmor:unconfined are gone. Netdata runs without them; what
+  # they bought was mapping container network interfaces to container names
+  # (cgroup-network) and host mount-point disk-space charts. SYS_PTRACE stays for
+  # per-process charts. See docs/DEPLOY.md section 12 for what to check.
   netdata:
     image: netdata/netdata:stable
     restart: unless-stopped
     hostname: your-vps-hostname          # the name shown in the dashboard
     pid: host                       # so process charts see the host's processes
+    networks:
+      - edge
     cap_add:
       - SYS_PTRACE
-      - SYS_ADMIN
-    security_opt:
-      - apparmor:unconfined
     environment:
       - DOCKER_HOST=dockerproxy:2375
       - DISABLE_TELEMETRY=1         # no anonymous stats; Netdata Cloud stays unclaimed
@@ -87,7 +110,6 @@ services:
       - netdataconfig:/etc/netdata
       - netdatalib:/var/lib/netdata
       - netdatacache:/var/cache/netdata
-      - /:/host/root:ro,rslave
       - /etc/passwd:/host/etc/passwd:ro
       - /etc/group:/host/etc/group:ro
       - /etc/localtime:/etc/localtime:ro
@@ -108,6 +130,8 @@ services:
   dockerproxy:
     image: tecnativa/docker-socket-proxy:0.3
     restart: unless-stopped
+    networks:
+      - edge
     environment:
       - CONTAINERS=1
       - POST=0
@@ -121,6 +145,8 @@ services:
   redis:
     image: redis:8-alpine
     restart: unless-stopped
+    networks:
+      - edge
     logging:
       driver: journald
       options:
@@ -138,6 +164,14 @@ services:
       - --maxmemory-policy
       - volatile-ttl
     # no published ports
+
+networks:
+  edge:
+    ipam:
+      config:
+        # Fixed so Caddy can have a fixed address (above). Change both, and
+        # FORWARDED_ALLOW_IPS, together if this ever collides with a host network.
+        - subnet: 172.30.57.0/24
 
 volumes:
   caddy_data:

@@ -1,0 +1,9 @@
+# Keys whose signature deploy/deploy.sh accepts on the commit it is about to deploy.
+# One line per key, in git's SSH allowed-signers format:
+#
+#   <email>  namespaces="git"  <key-type> <base64-public-key>
+#
+# e.g.  you@example.com namespaces="git" ssh-ed25519 AAAAC3Nza...
+#
+# While this file lists no keys, deploys still run but signatures are NOT checked.
+# Setup and the GitHub merge-button caveat: docs/DEPLOY.md section 9.

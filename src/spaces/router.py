@@ -1,6 +1,7 @@
 import uuid
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Path, Query, Request, status
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src import realtime as rt
 from src.database import get_db
 from src.dependencies import get_current_user_id, get_redis
+from src.limiter import limiter
 from src.spaces import invites as invites_module
 from src.spaces import join_requests as join_requests_module
 from src.spaces import service
@@ -24,12 +26,17 @@ from src.spaces.schemas import (
     SpaceOut,
     UpdateSpaceRequest,
 )
+from src.sync.schemas import CLIENT_ID_PATTERN
+
+EntryType = Literal["clipboard", "note"]
 
 router = APIRouter(prefix="/spaces", tags=["spaces"])
 
 
 @router.post("", response_model=CreateSpaceResponse, status_code=201)
+@limiter.limit("30/hour")
 async def create_space(
+    request: Request,
     body: CreateSpaceRequest,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
@@ -132,7 +139,9 @@ async def update_space(
 
 
 @router.post("/join", response_model=JoinResponse)
+@limiter.limit("20/minute")
 async def join_space(
+    request: Request,
     body: JoinRequest,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
@@ -265,7 +274,11 @@ async def remove_member(
     Emits `space:membership_changed` to the space channel and to the removed member.
     """
     user_id, _ = current
-    await service.remove_member(db, space_id, member_user_id, user_id)
+    removed = await service.remove_member(db, space_id, member_user_id, user_id)
+    if not removed:
+        # Nobody left, so there is nothing to announce - and announcing it would
+        # let a non-member put a "left" event on a space channel.
+        return
     await rt.publish_space_membership_changed(redis, str(space_id), "left", str(member_user_id))
     # Removed members are (or may be) no longer on the space channel — notify
     # them directly so their client drops the space and resubscribes.
@@ -275,16 +288,16 @@ async def remove_member(
 @router.delete("/{space_id}/entries/{client_id}", status_code=204)
 async def remove_space_entry(
     space_id: uuid.UUID,
-    client_id: str,
-    entry_type: str = "clipboard",
+    client_id: Annotated[str, Path(pattern=CLIENT_ID_PATTERN)],
+    entry_type: EntryType = "clipboard",
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
     """Take a shared entry down from a space.
 
-    Allowed for the space owner (any entry) and for the member who shared it
-    (their own). Moderation, not deletion: the space id and its wrapped key copy
+    Allowed for the space owner (any entry) and for a current member who shared
+    it (their own). Anyone else gets 404, whether or not the entry exists. Moderation, not deletion: the space id and its wrapped key copy
     are dropped from the entry. The author keeps their personal copy.
 
     Requires: Bearer token + X-Device-Id header.
@@ -315,16 +328,20 @@ async def delete_space(
 
     Requires: Bearer token + X-Device-Id header.
     Emits `space:membership_changed` (action `deleted`) before the row goes away,
-    while the space channel still has subscribers.
+    while the space channel still has subscribers - and only once the caller is
+    known to be the owner.
     """
     user_id, _ = current
-    # Publish first: after the delete commits, nobody is left on the channel.
+    await service.require_owned_space(db, space_id, user_id)
+    # Publish before deleting: after the delete commits, nobody is left on the channel.
     await rt.publish_space_membership_changed(redis, str(space_id), "deleted", user_id)
     await service.delete_space(db, space_id, user_id)
 
 
 @router.post("/{space_id}/invites", response_model=invites_module.InviteOut, status_code=201)
+@limiter.limit("30/hour")
 async def send_space_invite(
+    request: Request,
     space_id: uuid.UUID,
     body: invites_module.CreateInviteRequest,
     background: BackgroundTasks,
@@ -348,7 +365,9 @@ async def send_space_invite(
 
 
 @router.post("/{space_id}/keys", status_code=204)
+@limiter.limit("60/minute")
 async def distribute_keys(
+    request: Request,
     space_id: uuid.UUID,
     body: DistributeKeysRequest,
     db: AsyncSession = Depends(get_db),
@@ -381,7 +400,9 @@ async def distribute_keys(
 
 
 @router.post("/{space_id}/comments", response_model=CommentOut, status_code=201)
+@limiter.limit("60/minute")
 async def add_space_comment(
+    request: Request,
     space_id: uuid.UUID,
     body: CreateCommentRequest,
     db: AsyncSession = Depends(get_db),
@@ -408,8 +429,8 @@ async def add_space_comment(
 @router.get("/{space_id}/comments", response_model=list[CommentOut])
 async def list_space_comments(
     space_id: uuid.UUID,
-    client_id: str,
-    entry_type: str = "clipboard",
+    client_id: Annotated[str, Query(pattern=CLIENT_ID_PATTERN)],
+    entry_type: EntryType = "clipboard",
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):

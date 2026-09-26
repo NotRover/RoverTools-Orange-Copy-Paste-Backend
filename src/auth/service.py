@@ -1,8 +1,12 @@
 import base64
+import binascii
+import hashlib
+import hmac
 import logging
 import os
 import uuid
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
@@ -23,6 +27,41 @@ def _generate_kdf_salt() -> str:
 
 
 # ── Profile bootstrap ───────────────────────────────────────────────────────────
+
+# Longest display name stored, matching the column. A provider's `full_name` claim
+# is not bounded by anything of ours.
+DISPLAY_NAME_MAX = 128
+
+# Hosts a provider avatar may be served from. The URL is handed to every member
+# of a space and rendered by their client, so an arbitrary one would be a way to
+# make other people's apps fetch a URL of the uploader's choosing (a tracking
+# pixel at minimum). Google is the only provider that sets one today.
+_AVATAR_HOSTS = ("lh3.googleusercontent.com",)
+_AVATAR_HOST_SUFFIXES = (".googleusercontent.com",)
+
+
+def clean_display_name(name: object) -> str | None:
+    """A claim-supplied name as something safe to store, or None."""
+    if not isinstance(name, str):
+        return None
+    name = name.strip()[:DISPLAY_NAME_MAX]
+    return name or None
+
+
+def clean_avatar_url(url: object) -> str | None:
+    """The avatar URL when it is https on an allow-listed host, else None."""
+    if not isinstance(url, str) or len(url) > 2048:
+        return None
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return None
+    if parts.scheme != "https" or not host or parts.username or parts.password:
+        return None
+    if host in _AVATAR_HOSTS or host.endswith(_AVATAR_HOST_SUFFIXES):
+        return url
+    return None
 
 
 async def ensure_profile(
@@ -84,18 +123,105 @@ async def ensure_profile(
     return profile
 
 
-async def set_wrapped_umk(db: AsyncSession, user_id: str, wrapped_umk: str) -> None:
-    """Store (or replace) the password-wrapped UMK envelope for the account.
-    Set once on first setup; replaced when the account password changes."""
+# ── UMK proof ─────────────────────────────────────────────────────────────────
+
+
+UMK_PROOF_BYTES = 32
+
+
+def _proof_required() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="umk_proof_required")
+
+
+def hash_umk_proof(header: str | None) -> str | None:
+    """hex sha256 of the decoded `X-Umk-Proof`, or None when the header is absent.
+
+    400 `invalid_umk_proof` when present but not base64 of exactly 32 bytes: a
+    malformed proof is a client bug, not a wrong answer.
+    """
+    if not header:
+        return None
+    try:
+        raw = base64.b64decode(header, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_umk_proof") from exc
+    if len(raw) != UMK_PROOF_BYTES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_umk_proof")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def enforce_umk_proof(profile: Profile, header: str | None) -> None:
+    """Apply the UMK proof rule to one key-material write. Mutates, does not commit.
+
+    - Stored hash set: the header is required and must hash to it (constant-time
+      compare), else 403 `umk_proof_required`.
+    - Stored hash NULL (an account no proof-carrying client has touched yet): the
+      request proceeds, and a proof it carries is stored - trust on first use.
+    """
+    presented = hash_umk_proof(header)
+    if profile.umk_proof_hash is None:
+        if presented is not None:
+            profile.umk_proof_hash = presented
+        return
+    if presented is None or not hmac.compare_digest(presented, profile.umk_proof_hash):
+        raise _proof_required()
+
+
+def is_recovery_session(claims: dict) -> bool:
+    """True when the token came from a Supabase recovery link (`amr` method `recovery`)."""
+    amr = claims.get("amr")
+    if not isinstance(amr, list):
+        return False
+    for entry in amr:
+        method = entry.get("method") if isinstance(entry, dict) else entry
+        if method == "recovery":
+            return True
+    return False
+
+
+async def _profile_or_404(db: AsyncSession, user_id: str) -> Profile:
     profile = await db.scalar(select(Profile).where(Profile.id == uuid.UUID(user_id)))
     if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    return profile
+
+
+async def set_wrapped_umk(
+    db: AsyncSession,
+    user_id: str,
+    wrapped_umk: str,
+    proof_header: str | None,
+    *,
+    reset: bool = False,
+    claims: dict | None = None,
+) -> None:
+    """Store (or replace) the password-wrapped UMK envelope for the account.
+    Set once on first setup; replaced when the account password changes.
+
+    `reset` is the account-reset path: the user lost the old key and starts over
+    with a new UMK, so no proof of the old one can exist. Allowed only from a
+    Supabase recovery-link session (`amr` method `recovery`), and only with a
+    proof of the *new* UMK, which replaces the stored hash. The replaced envelope
+    is kept in `pw_wrapped_umk_prev`. A `reset` from any other session is judged
+    like an ordinary write.
+    """
+    profile = await _profile_or_404(db, user_id)
+    if reset and is_recovery_session(claims or {}):
+        presented = hash_umk_proof(proof_header)
+        if presented is None:
+            raise _proof_required()
+        if profile.pw_wrapped_umk is not None:
+            profile.pw_wrapped_umk_prev = profile.pw_wrapped_umk
+        profile.umk_proof_hash = presented
+        logger.info("account reset from a recovery session for profile %s", profile.id)
+    else:
+        enforce_umk_proof(profile, proof_header)
     profile.pw_wrapped_umk = wrapped_umk
     profile.updated_at = _now_ms()
     await db.commit()
 
 
-async def clear_recovery_wrapped_umk(db: AsyncSession, user_id: str) -> None:
+async def clear_recovery_wrapped_umk(db: AsyncSession, user_id: str, proof_header: str | None) -> None:
     """Drop the recovery envelope.
 
     Needed because an envelope can outlive the key it holds: an account that
@@ -103,15 +229,16 @@ async def clear_recovery_wrapped_umk(db: AsyncSession, user_id: str) -> None:
     recovering client a key that decrypts nothing. Clearing it is also what makes
     the client ask for a fresh code at the next sign-in.
     """
-    profile = await db.scalar(select(Profile).where(Profile.id == uuid.UUID(user_id)))
-    if not profile:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    profile = await _profile_or_404(db, user_id)
+    enforce_umk_proof(profile, proof_header)
     profile.recovery_wrapped_umk = None
     profile.updated_at = _now_ms()
     await db.commit()
 
 
-async def set_recovery_wrapped_umk(db: AsyncSession, user_id: str, recovery_wrapped_umk: str) -> None:
+async def set_recovery_wrapped_umk(
+    db: AsyncSession, user_id: str, recovery_wrapped_umk: str, proof_header: str | None
+) -> None:
     """Store (or replace) the recovery-code envelope for the account.
 
     Replacing is how regenerating a code works: the previous code stops opening
@@ -119,9 +246,8 @@ async def set_recovery_wrapped_umk(db: AsyncSession, user_id: str, recovery_wrap
     one recovery code is live at a time, on purpose - a code the user believes is
     revoked must not still work.
     """
-    profile = await db.scalar(select(Profile).where(Profile.id == uuid.UUID(user_id)))
-    if not profile:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    profile = await _profile_or_404(db, user_id)
+    enforce_umk_proof(profile, proof_header)
     profile.recovery_wrapped_umk = recovery_wrapped_umk
     profile.updated_at = _now_ms()
     await db.commit()
@@ -182,12 +308,25 @@ async def register_device(db: AsyncSession, user_id: str, req) -> Device:
     return device
 
 
-async def revoke_device(db: AsyncSession, device_id: uuid.UUID, requesting_user_id: str) -> None:
+async def revoke_device(
+    db: AsyncSession, device_id: uuid.UUID, requesting_user_id: str, proof_header: str | None
+) -> None:
+    """Mark the device revoked and drop its UMK wrap. Needs the UMK proof.
+
+    The router then drops the device cache, publishes `device:revoked` and closes
+    the device's sockets. The device's Supabase session is NOT ended: GoTrue's
+    admin logout is per user, not per session, and no session id is recorded per
+    device. A revoked device can hold a valid access token until it expires, but
+    every device-scoped route and the socket refuse it, and it has no wrap left to
+    restore the UMK from.
+    """
     device = await db.scalar(select(Device).where(Device.id == device_id))
     if not device:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
     if str(device.user_id) != requesting_user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your device")
+    profile = await _profile_or_404(db, requesting_user_id)
+    enforce_umk_proof(profile, proof_header)
     device.revoked = True
     device.wrapped_umk = None
     await db.commit()
@@ -250,11 +389,19 @@ async def store_wrapped_umk(
     target_device_id: uuid.UUID,
     requesting_user_id: str,
     wrapped_umk: str,
+    proof_header: str | None,
 ) -> None:
+    """Wrap the UMK for one of the caller's devices. Needs the UMK proof, and
+    refuses a revoked target (409 `device_revoked`): a wrap written there would
+    re-open silent restore for a device the owner cut off."""
     target_device = await db.scalar(select(Device).where(Device.id == target_device_id))
     if not target_device:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
     if str(target_device.user_id) != requesting_user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your device")
+    if target_device.revoked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="device_revoked")
+    profile = await _profile_or_404(db, requesting_user_id)
+    enforce_umk_proof(profile, proof_header)
     target_device.wrapped_umk = wrapped_umk
     await db.commit()

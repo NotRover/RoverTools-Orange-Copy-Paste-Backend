@@ -3,6 +3,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from src.sync.schemas import ClientId
+
+# A keyring is a JSON array of wrapped 32-byte keys; each wrap is well under
+# 100 bytes, so this is room for a ring far longer than any space will rotate
+# through, and a ceiling on what one member can make the server store.
+MAX_WRAPPED_KEYRING_BYTES = 16384
+
 
 # ── Space ─────────────────────────────────────────────────────────────────────
 
@@ -117,11 +124,11 @@ class JoinResponse(BaseModel):
 class WrappedKeyringEntry(BaseModel):
     user_id: uuid.UUID
     # JSON array of X25519-wrapped Space Keys, newest first — opaque to the server.
-    wrapped_space_keys: str
+    wrapped_space_keys: str = Field(min_length=1, max_length=MAX_WRAPPED_KEYRING_BYTES)
 
 
 class DistributeKeysRequest(BaseModel):
-    wrapped_keyrings: list[WrappedKeyringEntry]
+    wrapped_keyrings: list[WrappedKeyringEntry] = Field(max_length=256)
     # Fingerprint of the newest key in the rings above. Honoured only from the
     # owner, who is the only one that mints a key: a member relaying an existing
     # ring has nothing new to declare, and letting it write here would let it
@@ -135,7 +142,7 @@ class DistributeKeysRequest(BaseModel):
 class CreateCommentRequest(BaseModel):
     # The entry being commented on, addressed the way every space route
     # addresses one.
-    client_id: str = Field(min_length=1, max_length=128)
+    client_id: ClientId
     entry_type: Literal["clipboard", "note"] = "clipboard"
     # Sealed under a random per-comment key; the server never sees the text or
     # who was mentioned in it.

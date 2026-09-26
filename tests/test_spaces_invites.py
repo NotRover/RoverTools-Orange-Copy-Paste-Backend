@@ -2,11 +2,18 @@
 
 import json
 import uuid
+from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
 
+from src.blobs.s3 import ObjectHead
 from tests.conftest import make_token
+
+
+def cid(label: str) -> str:
+    """A readable test label as the canonical UUID the server requires."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, label))
 
 
 async def make_user(client: AsyncClient, email: str | None = None) -> dict:
@@ -239,19 +246,45 @@ async def test_invite_to_existing_member_conflicts(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_invite_to_an_address_with_no_account_is_rejected(client: AsyncClient):
+async def test_an_invite_does_not_say_whether_an_address_has_an_account(client: AsyncClient, fake_redis):
+    """A 404 for an unknown address made this route a lookup of who is signed
+    up. Both answers now have the same status and the same fields; only the
+    event and the email, which the inviter never sees, depend on it."""
     owner = await make_user(client, "owner-noacct@example.com")
+    await make_user(client, "someone-here@example.com")
     created = await create_space(client, owner)
 
-    resp = await client.post(
-        f"/api/v1/spaces/{created['space_id']}/invites",
-        json={"email": "nobody-here@example.com"},
-        headers=clean(owner),
-    )
-    assert resp.status_code == 404
+    sent = []
+    with patch("src.spaces.invites.email.send_sharing_invite") as mail:
+        for address in ("nobody-here@example.com", "someone-here@example.com"):
+            resp = await client.post(
+                f"/api/v1/spaces/{created['space_id']}/invites",
+                json={"email": address},
+                headers=clean(owner),
+            )
+            assert resp.status_code == 201, resp.text
+            sent.append(resp.json())
+    assert set(sent[0]) == set(sent[1])
+    assert sent[0]["status"] == sent[1]["status"] == "pending"
+    # Only the registered address is mailed.
+    assert [c.args[0] for c in mail.call_args_list] == ["someone-here@example.com"]
 
-    listed = await client.get("/api/v1/invites", headers=clean(owner))
-    assert listed.json()["sent"] == []
+
+@pytest.mark.asyncio
+async def test_re_inviting_within_ten_minutes_sends_no_second_email(client: AsyncClient):
+    owner = await make_user(client, "owner-resend@example.com")
+    await make_user(client, "resend-target@example.com")
+    created = await create_space(client, owner)
+
+    with patch("src.spaces.invites.email.send_sharing_invite") as mail:
+        for _ in range(3):
+            resp = await client.post(
+                f"/api/v1/spaces/{created['space_id']}/invites",
+                json={"email": "resend-target@example.com"},
+                headers=clean(owner),
+            )
+            assert resp.status_code == 201, resp.text
+    assert mail.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -300,22 +333,67 @@ async def test_keyring_distribution_and_restart_recovery(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_only_owner_can_distribute_keys(client: AsyncClient):
+async def test_a_member_may_fill_a_missing_wrap_but_never_overwrite_one(client: AsyncClient, fake_redis):
+    """Relaying the ring to somebody who has none is what any member is for.
+    Replacing a wrap somebody already holds - the owner's above all, their only
+    copy across a restart - is how a member would swap in a key that is not
+    this space's, so a non-owner's write onto such a row is dropped, and
+    nothing is announced for it."""
     owner = await make_user(client, "dist-owner@example.com")
     member = await make_user(client, "dist-member@example.com")
+    newcomer = await make_user(client, "dist-new@example.com")
     created = await create_space(client, owner)
+    sid = created["space_id"]
     await join(client, member, created, owner)
+    await join(client, newcomer, created, owner)
+    await distribute(client, owner, sid, {owner["_user_id"]: '["own"]', member["_user_id"]: '["m"]'})
 
+    pubsub = fake_redis.pubsub()
+    await pubsub.subscribe(f"user:{owner['_user_id']}", f"user:{newcomer['_user_id']}")
+    await pubsub.get_message(timeout=0.2)
+    await pubsub.get_message(timeout=0.2)
+    try:
+        await distribute(
+            client,
+            member,
+            sid,
+            {
+                owner["_user_id"]: '["attacker-keyring"]',
+                member["_user_id"]: '["attacker-keyring"]',
+                newcomer["_user_id"]: '["relayed"]',
+            },
+        )
+        rekeyed = []
+        while (msg := await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)) is not None:
+            rekeyed.append(msg["channel"])
+    finally:
+        await pubsub.aclose()
+    assert rekeyed == [f"user:{newcomer['_user_id']}"]
+
+    def ring(who: dict) -> str | None:
+        return next(
+            sp["my_wrapped_space_keys"] for sp in listings[who["_user_id"]] if sp["id"] == sid
+        )
+
+    listings = {
+        u["_user_id"]: (await client.get("/api/v1/spaces", headers=clean(u))).json()
+        for u in (owner, member, newcomer)
+    }
+    assert ring(owner) == '["own"]'
+    assert ring(member) == '["m"]'
+    assert ring(newcomer) == '["relayed"]'
+
+
+@pytest.mark.asyncio
+async def test_a_keyring_has_a_size_cap(client: AsyncClient):
+    owner = await make_user(client, "dist-cap@example.com")
+    created = await create_space(client, owner)
     resp = await client.post(
         f"/api/v1/spaces/{created['space_id']}/keys",
-        json={
-            "wrapped_keyrings": [
-                {"user_id": member["_user_id"], "wrapped_space_keys": '["attacker-keyring"]'}
-            ]
-        },
-        headers=clean(member),
+        json={"wrapped_keyrings": [{"user_id": owner["_user_id"], "wrapped_space_keys": "x" * 16385}]},
+        headers=clean(owner),
     )
-    assert resp.status_code == 403
+    assert resp.status_code == 422
 
 
 # ── Rekey on removal ───────────────────────────────────────────────────
@@ -354,9 +432,11 @@ async def test_removing_a_member_clears_remaining_keyrings(client: AsyncClient):
     space = (await client.get(f"/api/v1/spaces/{sid}", headers=clean(owner))).json()
     member_ids = {m["user_id"] for m in space["members"]}
     assert leaves["_user_id"] not in member_ids
-    # Every remaining member's keyring was cleared — the rekey trigger.
-    assert all(m["has_space_key"] is False for m in space["members"])
-    assert space["my_wrapped_space_keys"] is None
+    # Every remaining non-owner keyring was cleared — the rekey trigger. The
+    # owner's is kept: it is their only copy of the ring across a restart.
+    assert all(m["has_space_key"] is False for m in space["members"] if m["role"] != "owner")
+    assert space["my_wrapped_space_keys"] == '["k1-owner"]'
+    assert space["rekey_requested_at"] is not None
 
 
 @pytest.mark.asyncio
@@ -389,7 +469,7 @@ async def test_share_history_off_hides_earlier_entries_from_new_members(client: 
         json={
             "entries": [
                 {
-                    "client_id": "before-join",
+                    "client_id": cid("before-join"),
                     "entry_type": "clipboard",
                     "kind": "text",
                     "encrypted_content": "ciphertext",
@@ -409,14 +489,14 @@ async def test_share_history_off_hides_earlier_entries_from_new_members(client: 
 
     pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
     assert pulled.status_code == 200
-    assert all(e["client_id"] != "before-join" for e in pulled.json()["entries"])
+    assert all(e["client_id"] != cid("before-join") for e in pulled.json()["entries"])
 
     late = await client.post(
         "/api/v1/sync/push",
         json={
             "entries": [
                 {
-                    "client_id": "after-join",
+                    "client_id": cid("after-join"),
                     "entry_type": "clipboard",
                     "kind": "text",
                     "encrypted_content": "ciphertext",
@@ -433,8 +513,8 @@ async def test_share_history_off_hides_earlier_entries_from_new_members(client: 
 
     pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
     ids = {e["client_id"] for e in pulled.json()["entries"]}
-    assert "after-join" in ids
-    assert "before-join" not in ids
+    assert cid("after-join") in ids
+    assert cid("before-join") not in ids
 
 
 @pytest.mark.asyncio
@@ -448,7 +528,7 @@ async def test_share_history_on_serves_full_history_to_new_members(client: Async
         json={
             "entries": [
                 {
-                    "client_id": "old-entry",
+                    "client_id": cid("old-entry"),
                     "entry_type": "clipboard",
                     "kind": "text",
                     "encrypted_content": "ciphertext",
@@ -467,7 +547,7 @@ async def test_share_history_on_serves_full_history_to_new_members(client: Async
 
     pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
     ids = {e["client_id"] for e in pulled.json()["entries"]}
-    assert "old-entry" in ids
+    assert cid("old-entry") in ids
 
 
 @pytest.mark.asyncio
@@ -483,7 +563,7 @@ async def test_opening_share_history_reaches_members_who_already_joined(client: 
         json={
             "entries": [
                 {
-                    "client_id": "walled-off",
+                    "client_id": cid("walled-off"),
                     "entry_type": "clipboard",
                     "kind": "text",
                     "encrypted_content": "ciphertext",
@@ -501,7 +581,7 @@ async def test_opening_share_history_reaches_members_who_already_joined(client: 
     await join(client, member, created, owner)
 
     pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
-    assert all(e["client_id"] != "walled-off" for e in pulled.json()["entries"])
+    assert all(e["client_id"] != cid("walled-off") for e in pulled.json()["entries"])
 
     patched = await client.patch(
         f"/api/v1/spaces/{sid}", json={"share_history": True}, headers=clean(owner)
@@ -510,7 +590,7 @@ async def test_opening_share_history_reaches_members_who_already_joined(client: 
     assert patched.json()["share_history"] is True
 
     pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
-    assert "walled-off" in {e["client_id"] for e in pulled.json()["entries"]}
+    assert cid("walled-off") in {e["client_id"] for e in pulled.json()["entries"]}
 
 
 @pytest.mark.asyncio
@@ -541,7 +621,7 @@ async def test_closing_share_history_keeps_existing_members_access(client: Async
         json={
             "entries": [
                 {
-                    "client_id": "still-visible",
+                    "client_id": cid("still-visible"),
                     "entry_type": "clipboard",
                     "kind": "text",
                     "encrypted_content": "ciphertext",
@@ -564,7 +644,7 @@ async def test_closing_share_history_keeps_existing_members_access(client: Async
     assert resp.status_code == 200, resp.text
 
     pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
-    assert "still-visible" in {e["client_id"] for e in pulled.json()["entries"]}
+    assert cid("still-visible") in {e["client_id"] for e in pulled.json()["entries"]}
 
 
 # ── Multi-space fan-out ────────────────────────────────────────────────
@@ -589,7 +669,7 @@ async def test_entry_in_two_spaces_reaches_both_memberships(client: AsyncClient)
         json={
             "entries": [
                 {
-                    "client_id": "fan-1",
+                    "client_id": cid("fan-1"),
                     "entry_type": "clipboard",
                     "kind": "text",
                     "encrypted_content": "ciphertext",
@@ -608,19 +688,29 @@ async def test_entry_in_two_spaces_reaches_both_memberships(client: AsyncClient)
     for u in (member_a, member_b):
         pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(u))
         ids = {e["client_id"] for e in pulled.json()["entries"]}
-        assert "fan-1" in ids, f"member of a shared space did not receive the entry: {u['_user_id']}"
+        assert cid("fan-1") in ids, f"member of a shared space did not receive the entry: {u['_user_id']}"
 
     pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(outsider))
-    assert all(e["client_id"] != "fan-1" for e in pulled.json()["entries"])
+    assert all(e["client_id"] != cid("fan-1") for e in pulled.json()["entries"])
 
-    # The envelope rides along verbatim for members.
+    # A member sees the spaces they are in and those wraps only: not the other
+    # space the entry went to, and not the author's personal wrap.
     entry = next(
         e
         for e in (await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member_a))).json()["entries"]
-        if e["client_id"] == "fan-1"
+        if e["client_id"] == cid("fan-1")
     )
-    assert a["space_id"] in entry["wrapped_keys"]
-    assert set(entry["space_ids"]) == {a["space_id"], b["space_id"]}
+    assert entry["space_ids"] == [a["space_id"]]
+    assert json.loads(entry["wrapped_keys"]) == {a["space_id"]: "wa"}
+
+    # The author still sees the whole row.
+    own = next(
+        e
+        for e in (await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(owner))).json()["entries"]
+        if e["client_id"] == cid("fan-1")
+    )
+    assert set(own["space_ids"]) == {a["space_id"], b["space_id"]}
+    assert set(json.loads(own["wrapped_keys"])) == {"personal", a["space_id"], b["space_id"]}
 
 
 # ── Shared blob access ─────────────────────────────────────────────────
@@ -643,9 +733,10 @@ async def test_space_member_can_download_shared_blob(client: AsyncClient):
     )
     assert up.status_code == 200, up.text
     blob_key = up.json()["blob_key"]
-    confirm = await client.post(
-        "/api/v1/blobs/confirm-upload", json={"blob_key": blob_key}, headers=clean(owner)
-    )
+    with patch("src.blobs.s3.head_object", return_value=ObjectHead(size_bytes=1024, checksum_sha256=None)):
+        confirm = await client.post(
+            "/api/v1/blobs/confirm-upload", json={"blob_key": blob_key}, headers=clean(owner)
+        )
     assert confirm.status_code == 204
 
     push = await client.post(
@@ -653,7 +744,7 @@ async def test_space_member_can_download_shared_blob(client: AsyncClient):
         json={
             "entries": [
                 {
-                    "client_id": "img-1",
+                    "client_id": cid("img-1"),
                     "entry_type": "clipboard",
                     "kind": "image",
                     "encrypted_content": "ciphertext",
@@ -715,20 +806,20 @@ async def test_member_can_remove_their_own_entry_from_a_space(client: AsyncClien
 
     member = await make_user(client, "rm1-member@example.com")
     await join(client, member, created, owner)
-    await _push_into_space(client, member, sid, "mine")
+    await _push_into_space(client, member, sid, cid("mine"))
 
     resp = await client.delete(
-        f"/api/v1/spaces/{sid}/entries/mine?entry_type=clipboard", headers=clean(member)
+        f"/api/v1/spaces/{sid}/entries/{cid('mine')}?entry_type=clipboard", headers=clean(member)
     )
     assert resp.status_code == 204, resp.text
 
     # Gone from the space for everyone else...
     pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(owner))
-    assert all(e["client_id"] != "mine" for e in pulled.json()["entries"])
+    assert all(e["client_id"] != cid("mine") for e in pulled.json()["entries"])
 
     # ...but still the author's own row.
     own = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(member))
-    mine = [e for e in own.json()["entries"] if e["client_id"] == "mine"]
+    mine = [e for e in own.json()["entries"] if e["client_id"] == cid("mine")]
     assert len(mine) == 1
     assert mine[0]["space_ids"] == []
 
@@ -745,10 +836,10 @@ async def test_member_cannot_remove_someone_elses_entry(client: AsyncClient):
     other = await make_user(client, "rm2-other@example.com")
     for who in (author, other):
         await join(client, who, created, owner)
-    await _push_into_space(client, author, sid, "theirs")
+    await _push_into_space(client, author, sid, cid("theirs"))
 
     resp = await client.delete(
-        f"/api/v1/spaces/{sid}/entries/theirs?entry_type=clipboard", headers=clean(other)
+        f"/api/v1/spaces/{sid}/entries/{cid('theirs')}?entry_type=clipboard", headers=clean(other)
     )
     assert resp.status_code == 403, resp.text
 
@@ -762,10 +853,10 @@ async def test_owner_can_remove_a_members_entry(client: AsyncClient):
 
     member = await make_user(client, "rm3-member@example.com")
     await join(client, member, created, owner)
-    await _push_into_space(client, member, sid, "posted")
+    await _push_into_space(client, member, sid, cid("posted"))
 
     resp = await client.delete(
-        f"/api/v1/spaces/{sid}/entries/posted?entry_type=clipboard", headers=clean(owner)
+        f"/api/v1/spaces/{sid}/entries/{cid('posted')}?entry_type=clipboard", headers=clean(owner)
     )
     assert resp.status_code == 204, resp.text
 
@@ -805,16 +896,16 @@ async def test_a_member_cannot_plant_a_rival_copy_of_someone_elses_entry(client:
     impostor = await make_user(client, "auth1-impostor@example.com")
     for who in (author, impostor):
         await join(client, who, created, owner)
-    await _push_into_space(client, author, sid, "shared-note")
+    await _push_into_space(client, author, sid, cid("shared-note"))
 
-    body = await _push_raw(client, impostor, sid, "shared-note")
+    body = await _push_raw(client, impostor, sid, cid("shared-note"))
     assert body["accepted"] == []
     assert [c["reason"] for c in body["conflicts"]] == ["not_your_entry"]
 
     # And nothing reached the space: the owner still pulls exactly one row for
     # that client_id, the author's.
     pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(owner))
-    rows = [e for e in pulled.json()["entries"] if e["client_id"] == "shared-note"]
+    rows = [e for e in pulled.json()["entries"] if e["client_id"] == cid("shared-note")]
     assert len(rows) == 1
     assert rows[0]["user_id"] == author["_user_id"]
 
@@ -828,9 +919,9 @@ async def test_the_author_can_still_update_their_own_entry(client: AsyncClient):
 
     author = await make_user(client, "auth2-author@example.com")
     await join(client, author, created, owner)
-    await _push_into_space(client, author, sid, "mine-to-edit")
+    await _push_into_space(client, author, sid, cid("mine-to-edit"))
 
-    body = await _push_raw(client, author, sid, "mine-to-edit")
+    body = await _push_raw(client, author, sid, cid("mine-to-edit"))
     assert body["conflicts"] == []
     assert len(body["accepted"]) == 1
 
@@ -843,8 +934,8 @@ async def test_the_same_client_id_outside_a_shared_space_is_left_alone(client: A
     first = await make_user(client, "auth3-first@example.com")
     second = await make_user(client, "auth3-second@example.com")
 
-    assert len((await _push_raw(client, first, None, "same-id"))["accepted"]) == 1
-    body = await _push_raw(client, second, None, "same-id")
+    assert len((await _push_raw(client, first, None, cid("same-id")))["accepted"]) == 1
+    body = await _push_raw(client, second, None, cid("same-id"))
     assert body["conflicts"] == []
     assert len(body["accepted"]) == 1
 
@@ -861,10 +952,10 @@ async def test_a_collision_in_a_space_the_pusher_is_not_sharing_into_is_left_alo
 
     author = await make_user(client, "auth4-author@example.com")
     await join(client, author, created, owner)
-    await _push_into_space(client, author, sid, "collides")
+    await _push_into_space(client, author, sid, cid("collides"))
 
     outsider = await make_user(client, "auth4-outsider@example.com")
-    body = await _push_raw(client, outsider, None, "collides")
+    body = await _push_raw(client, outsider, None, cid("collides"))
     assert body["conflicts"] == []
     assert len(body["accepted"]) == 1
 
@@ -1066,3 +1157,251 @@ async def test_a_stranger_cannot_read_or_decide_requests(client: AsyncClient):
         headers=clean(outsider),
     )
     assert nope.status_code == 403, nope.text
+
+
+# ── Who may write into a space ─────────────────────────────────────────
+
+
+def _space_entry(label: str, space_ids: list[str], ts: int, *, deleted: bool = False) -> dict:
+    return {
+        "client_id": cid(label),
+        "entry_type": "clipboard",
+        "kind": "text",
+        "encrypted_content": "ciphertext",
+        "created_at": ts,
+        "updated_at": ts,
+        "deleted_at": ts if deleted else None,
+        "space_ids": space_ids,
+        "wrapped_keys": "{}",
+    }
+
+
+async def _push(client: AsyncClient, who: dict, entry: dict):
+    return await client.post("/api/v1/sync/push", json={"entries": [entry]}, headers=clean(who))
+
+
+@pytest.mark.asyncio
+async def test_a_push_into_a_space_the_pusher_is_not_in_is_refused(client: AsyncClient):
+    """`space_ids` is the fan-out target and the pull arm's match, so without
+    this any account could publish into any space whose id it had seen."""
+    owner = await make_user(client, "nm-owner@example.com")
+    outsider = await make_user(client, "nm-outsider@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+
+    resp = await _push(client, outsider, _space_entry("nm-1", [sid], 1))
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "not_a_member"
+
+    # A space that does not exist reads the same.
+    resp = await _push(client, outsider, _space_entry("nm-2", [str(uuid.uuid4())], 1))
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "not_a_member"
+
+    # And an update cannot add the space either.
+    assert (await _push(client, outsider, _space_entry("nm-3", [], 1))).status_code == 200
+    resp = await _push(client, outsider, _space_entry("nm-3", [sid], 2))
+    assert resp.status_code == 422
+
+    pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(owner))
+    assert pulled.json()["entries"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_removed_member_can_no_longer_push_into_the_space(client: AsyncClient):
+    owner = await make_user(client, "rmp-owner@example.com")
+    member = await make_user(client, "rmp-member@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+    await join(client, member, created, owner)
+    assert (await _push(client, member, _space_entry("rmp-1", [sid], 1))).status_code == 200
+
+    gone = await client.delete(f"/api/v1/spaces/{sid}/members/{member['_user_id']}", headers=clean(owner))
+    assert gone.status_code == 204
+
+    resp = await _push(client, member, _space_entry("rmp-2", [sid], 1))
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "not_a_member"
+
+    # Deleting what they shared before still works: a tombstone keeps the
+    # row's spaces, and that is not adding one.
+    resp = await _push(client, member, _space_entry("rmp-1", [sid], 5, deleted=True))
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["accepted"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_update_cannot_share_a_rival_copy_into_a_space(client: AsyncClient):
+    """The rival check used to run on insert only. A member who already held
+    their own personal row under the author's client_id could then update it
+    into the space and sit beside the author's row."""
+    owner = await make_user(client, "rv-owner@example.com")
+    author = await make_user(client, "rv-author@example.com")
+    impostor = await make_user(client, "rv-impostor@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+    for who in (author, impostor):
+        await join(client, who, created, owner)
+
+    assert (await _push(client, author, _space_entry("rv-1", [sid], 1))).status_code == 200
+    # A personal row first: no space overlap, so the insert is allowed.
+    first = await _push(client, impostor, _space_entry("rv-1", [], 1))
+    assert len(first.json()["accepted"]) == 1
+
+    body = (await _push(client, impostor, _space_entry("rv-1", [sid], 2))).json()
+    assert body["accepted"] == []
+    assert [c["reason"] for c in body["conflicts"]] == ["not_your_entry"]
+
+
+@pytest.mark.asyncio
+async def test_a_member_cannot_read_another_accounts_blob_through_a_planted_row(
+    client: AsyncClient, db
+):
+    """Download access follows the entry, so it only counts entries written by
+    the blob's owner - otherwise naming another account's key on a row in a
+    space of your own was a way to read it."""
+    from src.sync.models import SyncEntry
+
+    victim = await make_user(client, "pb-victim@example.com")
+    thief = await make_user(client, "pb-thief@example.com")
+    lair = await create_space(client, thief)
+
+    with patch("src.blobs.s3.generate_presigned_put", return_value="https://r2.example.com/put"):
+        up = await client.post(
+            "/api/v1/blobs/request-upload",
+            json={"mime_type": "image/png", "size_bytes": 10, "checksum": "ab" * 32},
+            headers=clean(victim),
+        )
+    key = up.json()["blob_key"]
+    with patch("src.blobs.s3.head_object", return_value=ObjectHead(size_bytes=10, checksum_sha256=None)):
+        await client.post("/api/v1/blobs/confirm-upload", json={"blob_key": key}, headers=clean(victim))
+
+    # Push refuses the row outright...
+    planted = _space_entry("pb-1", [lair["space_id"]], 1)
+    planted["blob_key"] = key
+    resp = await _push(client, thief, planted)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "invalid_blob"
+
+    # ...and a row like it already in the table does not open the blob either.
+    db.add(
+        SyncEntry(
+            client_id=cid("pb-1"),
+            user_id=uuid.UUID(thief["_user_id"]),
+            device_id=uuid.uuid4(),
+            entry_type="clipboard",
+            encrypted_content="x",
+            created_at=1,
+            updated_at=1,
+            server_ts=1,
+            space_ids=[uuid.UUID(lair["space_id"])],
+            wrapped_keys="{}",
+            blob_key=key,
+        )
+    )
+    await db.commit()
+    denied = await client.get(f"/api/v1/blobs/{key}/download-url", headers=clean(thief))
+    assert denied.status_code == 404
+
+
+# ── What a non-owner or non-member can make the server announce ────────
+
+
+async def _drain(pubsub) -> list[dict]:
+    out = []
+    while True:
+        msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
+        if msg is None:
+            return out
+        out.append(json.loads(msg["data"]))
+
+
+@pytest.mark.asyncio
+async def test_a_non_owner_deleting_a_space_announces_nothing(client: AsyncClient, fake_redis):
+    owner = await make_user(client, "del-owner@example.com")
+    member = await make_user(client, "del-member@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+    await join(client, member, created, owner)
+
+    pubsub = fake_redis.pubsub()
+    await pubsub.subscribe(f"space:{sid}")
+    try:
+        await _drain(pubsub)
+        resp = await client.delete(f"/api/v1/spaces/{sid}", headers=clean(member))
+        assert resp.status_code == 403
+        assert await _drain(pubsub) == []
+    finally:
+        await pubsub.aclose()
+
+    assert (await client.get(f"/api/v1/spaces/{sid}", headers=clean(owner))).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_leaving_a_space_you_are_not_in_announces_nothing(client: AsyncClient, fake_redis):
+    owner = await make_user(client, "lv2-owner@example.com")
+    stranger = await make_user(client, "lv2-stranger@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+
+    pubsub = fake_redis.pubsub()
+    await pubsub.subscribe(f"space:{sid}")
+    try:
+        await _drain(pubsub)
+        resp = await client.delete(
+            f"/api/v1/spaces/{sid}/members/{stranger['_user_id']}", headers=clean(stranger)
+        )
+        assert resp.status_code == 204
+        assert await _drain(pubsub) == []
+    finally:
+        await pubsub.aclose()
+
+
+@pytest.mark.asyncio
+async def test_removing_an_entry_is_one_404_for_a_non_member(client: AsyncClient):
+    """Not a member, no such entry, no such space: one answer, so the route
+    says nothing about what exists in a space the caller cannot see."""
+    owner = await make_user(client, "rmx-owner@example.com")
+    outsider = await make_user(client, "rmx-outsider@example.com")
+    created = await create_space(client, owner)
+    sid = created["space_id"]
+    await _push_into_space(client, owner, sid, cid("rmx-real"))
+
+    answers = []
+    for space_id, label in ((sid, "rmx-real"), (sid, "rmx-none"), (str(uuid.uuid4()), "rmx-real")):
+        resp = await client.delete(
+            f"/api/v1/spaces/{space_id}/entries/{cid(label)}?entry_type=clipboard", headers=clean(outsider)
+        )
+        answers.append((resp.status_code, resp.json()))
+    assert answers[0] == answers[1] == answers[2]
+    assert answers[0][0] == 404
+
+    # The entry is still in the space.
+    pulled = await client.get("/api/v1/sync/pull?after_ts=0", headers=clean(owner))
+    assert [e["space_ids"] for e in pulled.json()["entries"]] == [[sid]]
+
+    bad = await client.delete(f"/api/v1/spaces/{sid}/entries/not-a-uuid", headers=clean(owner))
+    assert bad.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_an_unverified_address_cannot_accept_an_addressed_invite(client: AsyncClient):
+    """An invite is addressed to an email. A token that says the address is not
+    verified is not yet that person, whatever it claims in `email`."""
+    owner = await make_user(client)
+    space = await create_space(client, owner)
+    invite = await client.post(
+        f"/api/v1/spaces/{space['space_id']}/invites",
+        json={"email": "unverified@example.com"},
+        headers=clean(owner),
+    )
+    assert invite.status_code == 201, invite.text
+
+    user_id = str(uuid.uuid4())
+    token = make_token(user_id, "unverified@example.com", email_verified=False)
+    refused = await client.post(
+        f"/api/v1/invites/{invite.json()['id']}/accept",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"] == "email_unverified"

@@ -23,8 +23,15 @@ run-name: >-
 # already at the repository head, the preview says so and succeeds: a commit that
 # touches migrations/ without adding a revision must not turn the branch red.
 #
-# Needs one repository secret, DATABASE_URL, holding the Supabase connection
-# string in the same `postgresql+asyncpg://` form the app uses. Use the session
+# Needs one secret, DATABASE_URL, holding the Supabase connection string in the
+# same `postgresql+asyncpg://` form the app uses. It is an ENVIRONMENT secret on
+# the `production` GitHub Environment, not a repository secret: the environment
+# is restricted to the `main` branch, so a workflow run from any other branch (or
+# a workflow file edited on one) cannot read it. See docs/DEPLOY.md section 8.
+#
+# What touches the database: only `alembic current` (reads the version row) and
+# `alembic upgrade` without --sql. `heads` and `history` read the scripts, and
+# `upgrade --sql` renders SQL offline without connecting. Use the session
 # pooler (port 5432), not the transaction pooler (6543) - `migrations/env.py`
 # builds its engine without the prepared-statement workaround that 6543 needs,
 # so the guard below refuses that port rather than failing halfway through DDL.
@@ -68,8 +75,19 @@ jobs:
   migrate:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Holds DATABASE_URL and carries the branch restriction. Configure it in the
+    # repository settings (Environments > production > Deployment branches: main).
+    environment: production
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # env.py imports the app's models, which load src/config.py, and these have
+      # no default there. Migrations never use them; placeholders satisfy the load.
+      REDIS_URL: redis://unused:6379/0
+      AWS_ACCESS_KEY_ID: unused
+      AWS_SECRET_ACCESS_KEY: unused
+      # Through the environment, never `${{ }}` inside a script: an input pasted
+      # into shell source is a way to run shell. Empty on a push.
+      CONFIRM: ${{ inputs.confirm }}
       # A push carries no inputs, so it resolves to the one action that changes
       # nothing. Every step below reads these rather than `inputs.*`, so the two
       # triggers cannot drift apart.
@@ -82,7 +100,7 @@ jobs:
       - name: Check the inputs before touching anything
         run: |
           if [ -z "${DATABASE_URL}" ]; then
-            echo "::error::DATABASE_URL secret is not set on this repository."
+            echo "::error::DATABASE_URL is not set on the production environment."
             exit 1
           fi
           case "${DATABASE_URL}" in
@@ -94,7 +112,7 @@ jobs:
               echo "::error::That is the transaction pooler. Use the session pooler on port 5432."
               exit 1 ;;
           esac
-          if [ "${ACTION}" = "upgrade" ] && [ "${{ inputs.confirm }}" != "migrate" ]; then
+          if [ "${ACTION}" = "upgrade" ] && [ "${CONFIRM}" != "migrate" ]; then
             echo "::error::Upgrade needs confirm=migrate. Nothing has been run."
             {
               echo '### Refused'
@@ -138,7 +156,7 @@ jobs:
               echo '### Could not reach the database'
               echo ''
               echo 'The revision could not be read, so this run reports nothing about'
-              echo 'the schema. Check `DATABASE_URL` in the repository secrets.'
+              echo 'the schema. Check `DATABASE_URL` on the `production` environment.'
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
