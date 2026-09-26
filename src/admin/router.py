@@ -23,16 +23,25 @@ Two routers with deliberately different versioning (see ``src/version.py``):
 
 Set ``ADMIN_API_KEY`` in the environment to enable the admin/metrics/stats
 endpoints; when it is unset they all return ``503 Service Unavailable``.
+
+Every admin-key route is rate limited per client IP (``ADMIN_RATE_LIMIT``), and
+``ADMIN_MAX_FAILURES`` wrong keys from one IP lock that IP out for
+``ADMIN_FAILURE_WINDOW_SECONDS``. Caddy also refuses ``/internal/*`` from the
+internet except ``/internal/healthz`` (``caddy/Caddyfile``), so in production
+these are reached from inside the box only.
 """
 
+import hmac
 import logging
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
+from limits import parse
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,6 +64,7 @@ from src import realtime
 from src.config import settings
 from src.database import get_db
 from src.dependencies import get_redis
+from src.limiter import client_ip, limiter
 from src.version import INTERNAL_VERSIONED_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -67,14 +77,57 @@ admin_router = APIRouter(prefix=INTERNAL_VERSIONED_PREFIX, tags=["admin"])
 
 # ── Admin key dependency ───────────────────────────────────────────────────────
 
+ADMIN_RATE_LIMIT = "60/minute"
+ADMIN_MAX_FAILURES = 10
+ADMIN_FAILURE_WINDOW_SECONDS = 900
 
-def require_admin_key(x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None) -> None:
+_admin_limit = parse(ADMIN_RATE_LIMIT)
+
+
+def _failure_key(ip: str) -> str:
+    return f"adminfail:{ip}"
+
+
+def _admin_rate_limit(request: Request) -> None:
+    """Per-IP ceiling on every admin-key route, including the announcement routes
+    mounted from another module (a dependency, so it covers routes whose handler
+    has no `request` parameter for `@limiter.limit`)."""
+    if not limiter.enabled:
+        return
+    if not limiter.limiter.hit(_admin_limit, "admin", client_ip(request)):
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
+
+
+async def require_admin_key(
+    request: Request,
+    x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None,
+    redis: Redis = Depends(get_redis),
+) -> None:
+    _admin_rate_limit(request)
     if not settings.admin_api_key:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Admin endpoints are disabled (ADMIN_API_KEY not set)",
         )
-    if x_admin_key != settings.admin_api_key:
+    key = _failure_key(client_ip(request))
+    try:
+        failures = int(await redis.get(key) or 0)
+    except (RedisError, ValueError):
+        failures = 0  # the counter is a brake, not the lock; the compare still runs
+    if failures >= ADMIN_MAX_FAILURES:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many failed attempts")
+    # Constant-time: `!=` on strings returns at the first differing byte, which
+    # leaks how much of a guess was right.
+    if x_admin_key is None or not hmac.compare_digest(
+        x_admin_key.encode(), settings.admin_api_key.encode()
+    ):
+        try:
+            pipe = redis.pipeline(transaction=False)
+            pipe.incr(key)
+            pipe.expire(key, ADMIN_FAILURE_WINDOW_SECONDS)
+            await pipe.execute()
+        except RedisError as exc:
+            logger.warning("could not record a failed admin key attempt: %s", exc)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin key")
 
 

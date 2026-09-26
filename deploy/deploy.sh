@@ -116,6 +116,35 @@ if [[ "$LOCAL" == "$REMOTE" && -n "$RUNNING" && "$FORCE" != "--force" ]]; then
 fi
 
 echo "deploy: ${LOCAL:0:12} -> ${REMOTE:0:12}"
+
+# Refuse to deploy a commit nobody we trust signed. Without this, anyone who can
+# push to main (a stolen GitHub token, a compromised account) gets code running on
+# the box with every secret in .env within one poll. The signer list is read from
+# the checkout as it is NOW, before the reset: reading it from the incoming commit
+# would let that commit vouch for itself by adding its own key. Copied aside so
+# nothing below can change it mid-check.
+#
+# Gated on the file listing at least one key, so the deploy that introduces this
+# check does not break the pipeline. Until an operator adds keys it protects
+# nothing, and says so on every deploy. Setup: docs/DEPLOY.md section 9.
+STAGE="signature check"
+SIGNERS="$APP_DIR/deploy/allowed_signers"
+if [[ -f "$SIGNERS" ]] && grep -qvE '^[[:space:]]*(#|$)' "$SIGNERS"; then
+	TRUSTED="$(mktemp)"
+	cp "$SIGNERS" "$TRUSTED"
+	if ! git -c gpg.ssh.allowedSignersFile="$TRUSTED" verify-commit "$REMOTE"; then
+		rm -f "$TRUSTED"
+		echo "deploy: ${REMOTE:0:12} is not signed by a key in deploy/allowed_signers - refusing to deploy" >&2
+		exit 1
+	fi
+	rm -f "$TRUSTED"
+	echo "deploy: signature on ${REMOTE:0:12} verified"
+else
+	echo "deploy: WARNING: deploy/allowed_signers lists no keys, so commit signatures are NOT checked." >&2
+	echo "deploy: WARNING: anyone who can push to main can run code on this box. See docs/DEPLOY.md section 9." >&2
+fi
+
+STAGE="git reset"
 git reset --hard --quiet origin/main
 
 # Bash reads this script from the handle it opened at startup, so the copy executing

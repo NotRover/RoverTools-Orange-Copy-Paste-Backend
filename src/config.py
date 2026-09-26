@@ -7,11 +7,15 @@ class Settings(BaseSettings):
     # ── Database ────────────────────────────────────────────────────────────────
     # Supabase Postgres connection string in prod (Project Settings → Database →
     # Connection string → URI, with the async driver). Local Postgres for dev.
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/clipboard"
+    # Required, with no default: a default here is a well-known password that a
+    # deployment which forgot to set this would quietly run on.
+    database_url: str
 
     # ── Redis ───────────────────────────────────────────────────────────────────
     # Sole responsibilities: realtime pub/sub fan-out + device presence.
-    redis_url: str = "redis://localhost:6379/0"
+    # Required, and carries the Redis password in production
+    # (`redis://:<REDIS_PASSWORD>@redis:6379/0`).
+    redis_url: str
 
     # ── Supabase Auth ─────────────────────────────────────────────────────────────
     # We do NOT sign tokens — Supabase Auth issues them and we only verify.
@@ -31,12 +35,18 @@ class Settings(BaseSettings):
     # ── Blob storage (S3-compatible: Cloudflare R2 in prod, MinIO in dev) ─────────
     s3_endpoint_url: str = "http://localhost:9000"
     s3_bucket: str = "clipboard-blobs"
-    aws_access_key_id: str = "minioadmin"
-    aws_secret_access_key: str = "minioadmin"
+    # Required: the MinIO defaults that used to sit here are public knowledge.
+    aws_access_key_id: str
+    aws_secret_access_key: str
     aws_region: str = "auto"
 
     # ── App ─────────────────────────────────────────────────────────────────────
-    app_env: str = "development"
+    # "production" unless told otherwise, so an unset variable never turns on
+    # development behaviour on a real host.
+    app_env: str = "production"
+    # Log every SQL statement. Needs APP_ENV=development as well: statement logs
+    # carry ciphertext and ids, and must not reach a production journal.
+    sql_echo: bool = False
     app_cors_origins: str = "tauri://localhost,http://localhost:1420"
     # Origin the human-facing pages are reached at, and the base of every link
     # this service puts in front of a person (space invites, the password-reset
@@ -100,8 +110,14 @@ class Settings(BaseSettings):
     email_from: str = "Orange Clipboard <noreply@example.com>"
 
     @property
+    def sql_echo_enabled(self) -> bool:
+        return self.app_env == "development" and self.sql_echo
+
+    @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.app_cors_origins.split(",") if o.strip()]
 
 
-settings = Settings()
+# The required fields are filled from the environment / .env by pydantic-settings,
+# which a static checker cannot see; it reads this as a call missing arguments.
+settings = Settings()  # ty: ignore[missing-argument]

@@ -118,7 +118,13 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "Content-Security-Policy",
             "default-src 'none'; connect-src 'self'; frame-ancestors 'none'",
         )
-        # HSTS — only set in production; Tauri's http://tauri.localhost doesn't use TLS locally
+        # HSTS on HTTPS only. Behind Caddy the hop to this process is plain HTTP, so
+        # the scheme is https only because uvicorn runs with --proxy-headers and
+        # trusts Caddy's X-Forwarded-Proto (--forwarded-allow-ips is Caddy's fixed
+        # address, see the Dockerfile and docker-compose.prod.yml). Without that
+        # trust this branch never ran. Caddy sets the same header at the edge; this
+        # one covers any deployment that terminates TLS elsewhere. Local dev over
+        # http://localhost gets none, which is right.
         if request.url.scheme == "https":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response

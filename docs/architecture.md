@@ -160,7 +160,7 @@ owns only what the app itself must store:
 - **Recovery envelope** — the same UMK wrapped a second time, under a key derived
   from a recovery code the user holds instead of a password they remember. Same
   `kdf_salt` as the password envelope, distinct AAD (`umk-recovery-v1` against
-  `umk-envelope-v1`), so the two can never be mistaken for one another. The server
+  `umk-envelope-v2`), so the two can never be mistaken for one another. The server
   holds an opaque blob it cannot open, exactly like `pw_wrapped_umk`; there is no
   server-decryptable recovery path and there must never be one.
 - **Device registration** — each install registers a device row (carries the device
@@ -174,8 +174,8 @@ owns only what the app itself must store:
   wrap to a key they own — so a change is refused with 409. Device keys stay writable,
   since each only ever opens that device's own copy of the UMK.
 
-The backend never issues tokens; it only **verifies** the Supabase JWT (HS256,
-project secret) on protected routes.
+The backend never issues tokens; it only **verifies** the Supabase JWT on protected routes
+(see [section 9](#9-auth-flow)).
 
 ### 2.2 Sync (`src/sync/`)
 
@@ -199,15 +199,23 @@ client-wins write, publishes `settings:updated` so other devices pull.
 
 Brokers direct-to-object-store uploads.
 
-- `request-upload` → presigned PUT URL + `blob_key` (server never buffers bytes).
-- `confirm-upload` → marks the blob confirmed. **This is where the meter starts:** a
-  confirmed blob counts against the quota whether or not an entry references it yet.
+- `request-upload` → presigned PUT URL + `blob_key` (server never buffers bytes). The
+  URL is signed for the declared `size_bytes` as `Content-Length`, so the store refuses
+  a body of any other length. An unconfirmed row counts against the quota for as long
+  as its PUT URL can still be used, so a burst of requests cannot reserve more than the
+  quota.
+- `confirm-upload` → reads the object's size (and SHA-256, where the store reports one)
+  back from the store and compares it with what was declared; on a mismatch the object
+  and the row are deleted and the answer is 409. Quota is checked again here. **This is
+  where the meter starts:** a confirmed blob counts against the quota whether or not an
+  entry references it yet.
 - `release` → un-confirms a blob whose entry never landed, giving the bytes straight
   back (the client uploads and confirms *before* pushing the entry, so a refused or
   locally-failed push leaves an orphan). Refuses with 409 while a live entry still
   references the key, so it can never take an image away from an entry using it;
   404 if the key is not the caller's; a no-op (204) if it is already unconfirmed.
-- `{blob_key}/download-url` → presigned GET URL.
+- `{blob_key}/download-url` → presigned GET URL, always signed with
+  `Content-Disposition: attachment`, so a stored object is never rendered inline.
 - `quota` → usage (computed on demand: `SUM(size_bytes)` over confirmed blobs) and
   the per-user quota, plus the two sync ceilings the client cannot see on its own
   (`entry_count` / `entry_limit`, and `max_entry_bytes`; [section 6.3](#63-size-and-row-limits)).
@@ -218,8 +226,9 @@ Brokers direct-to-object-store uploads.
 sums `blobs` rows `WHERE user_id = <caller> AND confirmed`, and a row is only ever
 created by `request-upload`, for the uploader. Receiving a shared image creates no
 row: `download-url` hands the reader a presigned GET on the *owner's* key
-(`{owner_id}/{hex}`) after `_shares_space_with_blob` confirms a live entry carries it
-into a space they belong to, and answers 404 rather than 403 to everyone else so the
+(`{owner_id}/{hex}`) after `_shares_space_with_blob` confirms a live entry **written by the blob's owner**
+carries it into a space they belong to (a row another account wrote naming the key
+does not count, and push refuses to write one: `invalid_blob`, section 5.2), and answers 404 rather than 403 to everyone else so the
 key's existence is not confirmed. One bucket, namespaced by owner.
 
 The deliberate consequence: **the owner deleting the entry breaks it for every
@@ -314,7 +323,7 @@ env change.
 | Blob storage       | Cloudflare **R2** (S3-compatible)     | Direct presigned PUT/GET; zero egress; MinIO for local dev       |
 | Background jobs    | in-process asyncio + PG advisory lock | Presence sweep + orphan blob cleanup; no Celery/broker           |
 | Email              | Brevo REST (default) or stdlib SMTP   | Space invites only; via `BackgroundTasks`                        |
-| KDF (E2E)          | Argon2id (client-side)                | Memory-hard; password → key-wrapping key for the random UMK      |
+| KDF (E2E)          | Argon2id + HKDF-SHA256 (client-side)  | Memory-hard stretch, then split: one half is the Supabase credential, the other wraps the random UMK |
 | Content encryption | AES-256-GCM (client-side)             | AEAD; per-entry content key, server stores ciphertext only       |
 | Key exchange       | X25519 (client-side)                  | Multi-device UMK wrapping + Space Key wrapping                   |
 
@@ -356,6 +365,8 @@ CREATE TABLE profiles (
     identity_pubkey  TEXT,                        -- base64 X25519 public key (E2E)
     pw_wrapped_umk   TEXT,                        -- base64; random UMK wrapped under the KEK
     recovery_wrapped_umk TEXT,                    -- base64; the same UMK wrapped under the recovery code
+    umk_proof_hash   TEXT,                        -- hex sha256 of the client's X-Umk-Proof; set on first use (0020)
+    pw_wrapped_umk_prev TEXT,                     -- the password envelope an account reset replaced (0020)
     blob_bytes_quota BIGINT NOT NULL DEFAULT 52428800,  -- 50 MB
     created_at       BIGINT NOT NULL,
     updated_at       BIGINT NOT NULL
@@ -418,7 +429,10 @@ CREATE INDEX idx_sync_entries_spaces  ON sync_entries USING GIN(space_ids);
 channels a write fans out to and which memberships can pull the row. `wrapped_keys`
 is stored and echoed verbatim — the server cannot tell one wrap from another, and a
 row whose `space_ids` is empty is a personal entry. A tombstone keeps the
-`space_ids` the entry had, so a delete reaches the same members the entry did.
+`space_ids` the entry had, so a delete reaches the same members the entry did. It is
+stored **stripped**: whatever the push carried, the server writes `encrypted_content = ''`,
+`encrypted_metadata`, `blob_key` and `blob_size` NULL and `wrapped_keys = '{}'`, so a
+deleted row holds no ciphertext and no key wraps.
 
 ### 4.4 `sync_cursors`
 
@@ -429,6 +443,10 @@ CREATE TABLE sync_cursors (
     last_server_ts BIGINT NOT NULL DEFAULT 0
 );
 ```
+
+The key is still `device_id` alone. `POST /sync/cursor` only moves a row whose
+`user_id` is the caller's, so a device id belonging to another account is a no-op,
+never a write to their cursor.
 
 ### 4.5 `user_settings`
 
@@ -713,6 +731,23 @@ act on. After `expires_at` the row stops being served (null means it never expir
 - Auth: `Authorization: Bearer <supabase access token>` on all protected routes.
 - Device scope: `X-Device-Id: <device_id>` header on device-scoped routes (sync,
   settings, key registration). Bootstrap and device registration do **not** require it.
+  The server checks it against `devices` before trusting it, including as the
+  origin device for fan-out:
+
+  | Answer | When |
+  |---|---|
+  | `400` | header missing, or not a UUID |
+  | `403 {"detail": "device_unknown"}` | no such device, or it belongs to another account |
+  | `401 {"detail": "device_revoked"}` | the device was revoked; the client signs itself out |
+
+  A passing check is cached in Redis for 60 s under `dev:{sub}:{device_id}`;
+  revoking the device deletes that key, so the refusal is immediate.
+- UMK proof: `X-Umk-Proof: <base64 of 32 bytes>` on the routes that change key
+  material. Rule, trust-on-first-use and the reset exception: [section 7.1](#71-user-master-key-umk--envelope-model).
+- Rate limits: `429` with `Retry-After` when called too often (limits are per verified
+  user where the route is authenticated, else per client IP). The limit on each route
+  is in its decorator in the code; the client backs off on `Retry-After` and requeues a
+  push that did not go, so a limit delays sync and never drops anything.
 - Errors: `{"detail": "..."}` + HTTP status.
 - Pagination: cursor-based — `?after_ts=<server_ts>&limit=200`.
 
@@ -750,17 +785,18 @@ POST   /api/v1/auth/bootstrap
        Call right after Supabase login. A null recovery_wrapped_umk is what makes
        the client ask the user to save a recovery code.
 
-PUT    /api/v1/auth/umk
-       Body: { wrapped_umk }     -- random UMK wrapped under the password-derived key
+PUT    /api/v1/auth/umk                         -- X-Umk-Proof
+       Body: { wrapped_umk, reset? = false }   -- random UMK wrapped under the password-derived key
        Stores the envelope on first setup (and on password change). Server holds only
-       the wrapped blob, never the key.
+       the wrapped blob, never the key. reset: true starts the account over with a
+       new UMK; see "Account reset" in section 7.1.
 
-PUT    /api/v1/auth/umk/recovery
+PUT    /api/v1/auth/umk/recovery                -- X-Umk-Proof
        Body: { recovery_wrapped_umk }   -- the same UMK wrapped under the recovery code
        Replacing it revokes the previous recovery code, which is what regenerating
        one does. One code is live at a time.
 
-DELETE /api/v1/auth/umk/recovery
+DELETE /api/v1/auth/umk/recovery                -- X-Umk-Proof
        Drops the envelope. An account that starts over with a fresh UMK must clear
        it, or the old code would hand a recovering client a dead key. Idempotent.
 
@@ -771,7 +807,14 @@ POST   /api/v1/auth/devices
 GET    /api/v1/auth/devices
        Returns: [{ id, device_name, platform, app_version, last_seen_at }]
 
-DELETE /api/v1/auth/devices/{device_id}         -- soft-revoke; clears wrapped_umk
+DELETE /api/v1/auth/devices/{device_id}         -- X-Umk-Proof; soft-revoke; clears wrapped_umk
+       Also drops the device's cached check, publishes device:revoked on the user's
+       channel and closes that device's sockets (section 5.8). The device's Supabase
+       session is not ended, by decision: GoTrue can log out a user, not one
+       session, and ending the user's sessions would sign out the device doing
+       the revoking. The revoked device's token stays valid until it expires,
+       but every device-scoped route and the socket refuse it, and the client
+       signs itself out (and out of Supabase) on the first `device_revoked`.
 
 POST   /api/v1/auth/keys/register               -- requires X-Device-Id
        Body: { identity_pubkey, device_pubkey }  (base64 X25519)
@@ -787,8 +830,9 @@ GET    /api/v1/auth/umk/device                  -- requires X-Device-Id
        must be able to tell this answer from a 404 produced by a proxy, a
        rewritten path, or a deployment older than the route.
 
-POST   /api/v1/auth/devices/{device_id}/key-wrap
+POST   /api/v1/auth/devices/{device_id}/key-wrap   -- X-Umk-Proof
        Body: { wrapped_umk }    -- an existing device wraps the UMK for another device
+       409 {"detail": "device_revoked"} when the target device was revoked.
 ```
 
 > Registration, email verification, login, refresh, and password reset are **not**
@@ -805,13 +849,32 @@ POST /api/v1/sync/push
                 conflicts: [{ client_id, reason: 'stale_update' | 'not_your_entry'
                               | 'entry_too_large' | 'account_full' }] }
      At most `max_push_batch` entries per call (422 beyond it, before any work).
-     space_ids  — fan-out targets; default []. wrapped_keys — the CEK envelope as a
-     JSON string, default "{}". Both are stored verbatim and never interpreted.
+     space_ids  — fan-out targets; default [], at most 32. wrapped_keys — the CEK
+     envelope as a JSON string, default "{}", at most 8 KB. Both are stored verbatim
+     and never interpreted.
+     Field rules (422 on the whole request):
+       client_id   canonical lowercase UUID, 36 characters
+       kind        'text' | 'image' | 'html' | 'file' | 'note' | '' (tombstone)
+       created_at, updated_at, deleted_at   0 .. 2^63-1, and at most 5 minutes
+                   ahead of the server clock
+       blob_key    at most 128 characters, the server's own key shape
+     Whole-request refusals (422, nothing in the batch is written):
+       detail "not_a_member"  an entry adds a space the caller is not a current
+                              member of (or that does not exist), on insert or update
+       detail "invalid_blob"  an entry names a blob_key that is not the caller's own
+                              confirmed blob
+     A batch is one transaction under a per-account advisory lock, so two concurrent
+     pushes from one account cannot both pass the row limit.
 
 GET  /api/v1/sync/pull?after_ts=<ts>&limit=200&entry_type=all|clipboard|note
      Returns: { entries: [...], removals: [...], next_cursor: <ts | null> }
      Each entry echoes space_ids + wrapped_keys. Rows come from the caller's own
      user_id OR any space they belong to, per-membership history floor applied.
+     On a row another account wrote, both are trimmed to the caller's view:
+     space_ids to the spaces the caller is in, wrapped_keys to those spaces' wraps
+     (never "personal"). The author's own rows come back whole.
+     after_ts is 0 .. 2^63-1 (422 otherwise). A page never ends partway through one
+     server_ts (section 6.2), so next_cursor stays a plain integer.
      removals: [{ space_id, client_id, entry_type, author_id, removed_by, server_ts }]
      Entries that LEFT one of the caller's spaces since their cursor. Same fields
      as the space:entry_removed event, and for the same reason: apply both through
@@ -848,8 +911,9 @@ insert a *second* row under the same `client_id` rather than updating theirs, wh
 clients collapse into one item with the wrong attribution (client
 `orange-copy-paste-clipboard-app-rust/docs/bugfix-history.md` #8).
 
-So push refuses to insert a row for a `client_id` another account already holds in a
-space this push targets (`_belongs_to_someone_else`). It is the rare rule the server
+So push refuses to write a row for a `client_id` another account already holds in a
+space this push adds (`_belongs_to_someone_else`) - on insert and, since an update can
+add a space too, on the update path as well, for the spaces the update adds. It is the rare rule the server
 *can* enforce without reading anything: it is about which account owns a key, not
 about what the content says. Enforced here rather than only in the client because
 old builds keep running, and every one of them writes through this route.
@@ -870,6 +934,12 @@ tombstone for an entry they hold as received). Contrast the normal case: a tombs
 for an entry you *own* keeps its `space_ids` so the delete reaches the members who
 received it.
 
+**Only members write into a space.** `space_ids` decides fan-out and who can pull the
+row, so a push that adds a space the caller is not a current member of is refused as a
+whole with 422 `not_a_member`. Only *added* spaces are checked: a space already on the
+row may stay there, which is what lets an author who has since left or been removed
+still push the tombstone for what they shared.
+
 ### 5.3 Settings Routes
 
 ```
@@ -883,10 +953,18 @@ PUT  /api/v1/settings           Body: { encrypted_blob, updated_at }
 ```
 POST /api/v1/blobs/request-upload
      Body: { mime_type, size_bytes, checksum }
-     Returns: { blob_key, presigned_put_url, expires_in_seconds }   (413 if > 5 MB;
-               402 if over quota)
+     Returns: { blob_key, presigned_put_url, expires_in_seconds }
+     422 if size_bytes is not 1 .. 5 MB, if mime_type is not one of image/png,
+     image/jpeg, image/jpg, image/webp, image/gif, image/bmp, application/zip,
+     application/octet-stream, or if checksum is not 64 hex characters (SHA-256).
+     402 if over quota, counting unexpired unconfirmed uploads.
+     The PUT must send Content-Length equal to size_bytes; it is part of the signature.
 
-POST /api/v1/blobs/confirm-upload         Body: { blob_key }
+POST /api/v1/blobs/confirm-upload         Body: { blob_key }   → 204
+                                          (409 if the object is missing or its size
+                                           or SHA-256 differs from the declared one -
+                                           the object is then deleted; 402 if
+                                           confirming would exceed the quota)
 POST /api/v1/blobs/release                Body: { blob_key }   → 204
                                           (409 while a live entry references it,
                                            404 if it is not the caller's)
@@ -927,23 +1005,33 @@ PATCH  /api/v1/spaces/{space_id}         Body: { share_history?, members_can_app
        cannot clobber the other.
 DELETE /api/v1/spaces/{space_id}/members/{member_user_id}
        Owner removes a member, or a member removes themselves. 400 if the target is
-       the owner (delete the space instead). Clears the remaining *non-owner* wraps
+       the owner (delete the space instead). Leaving a space you are not in is a 204
+       that changes nothing and publishes nothing. Clears the remaining *non-owner* wraps
        and stamps spaces.rekey_requested_at to ask for a new key (section 7.4).
 DELETE /api/v1/spaces/{space_id}         -- owner only; cascades memberships + invites
+       Ownership is checked before space:deleted is published, so a refused delete
+       (403, 404) announces nothing.
 DELETE /api/v1/spaces/{space_id}/entries/{client_id}?entry_type=clipboard   -> 204
        Take a shared entry down from a space: the owner (any entry) or the member who
        shared it (their own). Moderation, not deletion - the space id and its wrapped
        key copy are dropped from the entry, and the author keeps their personal copy.
-       Emits space:entry_removed to the space channel.
+       Emits space:entry_removed to the space channel. client_id must be a UUID (422);
+       a caller who is not a current member, an unknown space and an entry not in the
+       space all get the same 404, so the route reveals nothing about a space the
+       caller cannot see. A member removing someone else's entry gets 403.
 POST   /api/v1/spaces/{space_id}/invites Body: { email }   -- owner only; see section 5.6
 POST   /api/v1/spaces/{space_id}/keys    -- any member holding the keyring
        Body: { wrapped_keyrings: [{ user_id, wrapped_space_keys }], key_fingerprint? }
-       wrapped_space_keys is a JSON array string; stored verbatim on the membership,
-       alongside wrapped_by = the caller. key_fingerprint is honoured from the space
+       wrapped_space_keys is a JSON array string, 1 .. 16 KB; at most 256 entries in
+       wrapped_keyrings. Stored verbatim on the membership, alongside
+       wrapped_by = the caller. The owner may write any row. Anyone else may only fill
+       a gap: a row that already holds a wrap, and the owner's row always, is skipped
+       without error. key_fingerprint is honoured from the space
        owner only, and clears rekey_requested_at once every member holds a wrap.
        space:rekey is published only to members actually written.
 POST   /api/v1/spaces/{space_id}/comments   Returns: 201 CommentOut   -- any member
        Body: { client_id, entry_type?: "clipboard", encrypted_body, wrapped_key }
+       client_id must be a UUID (422), here and on the GET below.
        Comment on an entry shared into the space. The body arrives encrypted and leaves
        encrypted: stored as given, echoed to the space channel as given. Emits
        space:comment (action "created").
@@ -1034,14 +1122,19 @@ POST   /api/v1/spaces/{id}/invites   Body: { email }   -- owner only, requires X
        The last two are returned to the inviter only, so it can pre-wrap the keyring;
        the copy published to the invitee omits both.
        400 if it's the caller's own email; 409 if already a member.
-       The invitee must already have an account -- 404 otherwise -- so a key can
-       always be wrapped for them at this point.
+       An address with no account gets the same 201 and the same fields as one with
+       an account (invitee_identity_pubkey is then null, as it is for an account that
+       has not registered keys), so the route cannot be used to test who is signed up.
+       The row is stored; no event is published and no email is sent for it.
        Refreshes an existing pending invite instead of stacking duplicates.
-       Publishes invite:received to the invitee when resolvable; emails the code.
+       Publishes invite:received to the invitee when resolvable; emails the code,
+       at most once per 10 minutes per invite (a re-invite inside that window
+       refreshes the row and the event but sends no second email).
 GET    /api/v1/invites               Returns: { sent: [...], received: [...] }
        received = pending, unexpired, matched by user id or the token's email claim
        sent = the caller's 50 most recent, any status, so outcomes are visible
 POST   /api/v1/invites/{id}/accept   Joins the space immediately -- no approval step,
+       403 email_unverified when the token carries email_verified: false.
                                      because naming an email *is* the approval
 POST   /api/v1/invites/{id}/decline
 DELETE /api/v1/invites/{id}          -- inviter revokes a pending invite; needs X-Device-Id
@@ -1101,6 +1194,12 @@ GET  /internal/v1/admin/email       Returns: provider, configured, email_from, *
 POST /internal/v1/admin/email/test  Body: { to }  Returns: { sent, provider, error? }
 ```
 
+Every admin-key route is limited per client IP, and ten wrong keys from one IP
+lock that IP out (`429`) for 15 minutes; the key is compared in constant time.
+In production Caddy answers `404` for every `/internal/*` path except
+`/internal/healthz`, so the admin API and `/internal/metrics` are reachable only
+from inside the box (see `docs/DEPLOY.md`).
+
 Invite delivery is best-effort and its failures are swallowed (see
 `email.send_sharing_invite`), so a broken mail config is invisible from the
 client. The two email routes are how you tell: the first reports what the
@@ -1114,7 +1213,26 @@ Metrics: `orange_users_total`, `orange_devices_total`, `orange_devices_active_to
 
 ### 5.8 WebSocket Event Protocol
 
-**Connection:** `GET /ws?token=<supabase access token>&device_id=<device_id>`
+**Connection:** `GET /ws`, then a handshake message. Credentials are never taken
+from the URL, where proxies and access logs would keep them; a `?token=` query is
+ignored.
+
+1. The server accepts the upgrade and waits up to 10 s for the first text frame:
+   `{"type": "auth", "token": "<supabase access token>", "device_id": "<uuid>"}`.
+2. The token must verify ([section 9](#9-auth-flow)) and the device must exist, belong
+   to `sub` and not be revoked.
+3. The server answers `{"type": "auth_ok"}`, and only then subscribes the socket.
+
+Close codes:
+
+| Code | Means | Client action |
+|---|---|---|
+| `4401` | Handshake failed or timed out, the token expired, or the device was revoked. Nothing else is sent before it. | Refresh the token and reconnect; after `device:revoked`, sign out instead. |
+| `4429` | The user already holds 8 sockets on this replica. | Close a socket you no longer need. |
+| `1011` | The socket stopped reading and was dropped (see `_broadcast_local`). | Reconnect and pull. |
+
+A socket is closed with `4401` when its token's `exp` passes, so a long-lived socket
+never outlives its credential; the client reconnects with a fresh token.
 
 The connection is subscribed to `user:<user_id>` and every `space:<space_id>` the
 user belongs to. The channel set is resolved at connect, and re-resolved by the server
@@ -1129,6 +1247,7 @@ created a space mid-connection is moved onto its channel either way.
 { "event": "sync:entry",   "payload": { ...SyncEntryOut } }   // incl. tombstones (deleted_at set)
 { "event": "device:online",  "payload": { "device_id": "..." } }   // user: channel; own devices
 { "event": "device:offline", "payload": { "device_id": "..." } }
+{ "event": "device:revoked", "payload": { "device_id": "..." } }   // user: channel; the named device signs out, then its sockets are closed with 4401
 { "event": "user:presence",  "payload": { "user_id": "...", "online": true } }   // space: channels
 { "event": "space:entry_removed", "payload": { "space_id": "...", "client_id": "...", "entry_type": "clipboard|note", "author_id": "...", "removed_by": "..." } }
 { "event": "space:membership_changed", "payload": { "space_id": "...", "action": "joined|left|deleted", "user_id": "..." } }
@@ -1150,7 +1269,10 @@ Routing rules worth knowing when implementing a client:
   entry's `space_ids`. Both carry the same payload, and the **origin device is excluded**
   from delivery, so a device never receives its own write back. A socket in a space it
   also authored into can therefore see the same entry twice — dedupe on
-  `(client_id, entry_type)`.
+  `(client_id, entry_type)`. The payload is trimmed **per socket**, the same view pull
+  gives (section 5.2): the author's sockets get the whole row on either channel, and
+  every other socket sees `space_ids` cut to the spaces it is in and `wrapped_keys` cut
+  to those spaces' wraps, never `personal`.
 - There is no `sync:delete`. A delete arrives as `sync:entry` with `deleted_at` set.
 - `device:online` / `device:offline` are per-device and go only to the user's own
   channel. `user:presence` is the per-user fact addressed to that user's spaces, so
@@ -1198,8 +1320,9 @@ Routing rules worth knowing when implementing a client:
 the presence TTL), and `{ "event": "resubscribe" }` — re-resolves the socket's
 channel set. The server already does this itself on any membership change (see
 the connection note above), so `resubscribe` is a client saying it believes it is
-stale rather than the mechanism fan-out depends on. It costs one query and is
-safe to send at any time.
+stale rather than the mechanism fan-out depends on. It costs one query, so the
+server honours at most one per socket every 5 s and ignores the rest. Frames that
+are not a JSON object (arrays, numbers, invalid JSON, binary) are ignored.
 
 ### 5.9 Web Page Routes (unversioned, no auth)
 
@@ -1252,6 +1375,13 @@ caller may have full history in one space and post-join-only in another.
 not share one timestamp. Cursor comparisons are strict (`>`) on pull and the cursor
 write only moves forward (`POST /sync/cursor` ignores a lower value).
 
+Two rows can still share a `server_ts` (two accounts, one millisecond), and a strict
+`>` cursor would step over the second if a page ended between them. So both streams
+order by `(server_ts, id)` and a page never ends partway through one `server_ts`: a
+page cut inside a run is trimmed back to the last complete timestamp, and a page whose
+rows all share one timestamp is extended to return every row at it. The cursor stays
+a plain integer.
+
 ### 6.3 Size and Row Limits
 
 Four ceilings, all in `src/config.py`. The first three are enforced in
@@ -1261,6 +1391,7 @@ Four ceilings, all in `src/config.py`. The first three are enforced in
 |---|---|---|
 | `max_entry_bytes` | 512 KB | `entry_too_large`, checked before the row lookup |
 | `max_entries_per_user` | 3,000 live rows | `account_full` |
+| 3 x `max_entries_per_user` | 9,000 tombstones | `account_full`, new tombstones only |
 | `max_push_batch` | 200 entries | 422 on the request body, before any work |
 | `max_request_bytes` | 8 MB | 413, before the body is read at all |
 
@@ -1290,6 +1421,12 @@ hide is a brand-new tombstone row, so without the exemption it would be the one 
 full account could not make. A cap that blocks its own remedy is a cap the user cannot
 get out from under.
 
+Tombstones have a cap of their own, three times the live-row cap, so an account cannot
+grow the table without bound through deletes. It refuses only a brand-new tombstone
+row; turning a live row into a tombstone is always allowed. Reviving a tombstone (a
+push with `deleted_at` null onto a deleted row) makes a live row again, so it needs a
+free live slot like an insert does.
+
 Both per-account limits count rows by `user_id`, which means an entry somebody else
 shared into your space is **their** row on **their** account and does not count
 against you. Same rule as the storage quota ([section 2.4](#24-blobs-srcblobs)): you are charged for what you
@@ -1317,19 +1454,48 @@ before they hold any key that could decrypt it. See [section 7.5](#75-server-vis
 
 ### 7.1 User Master Key (UMK) — envelope model
 
-The UMK is a **random 32-byte key**, not derived from the password. The password
-only derives a **key-wrapping key (KEK)** that wraps/unwraps the UMK:
+The UMK is a **random 32-byte key**, not derived from the password. The password is
+stretched once on the device and **split in two**: an *auth key* that is the only
+thing Supabase Auth ever receives, and a **key-wrapping key (KEK)** that wraps/unwraps
+the UMK and never leaves the device:
 
 ```
-KEK          = Argon2id(password, kdf_salt, m=65536, t=3, p=4) → 32 bytes
-wrapped_umk  = AES-256-GCM(KEK, UMK)          -- the envelope, stored server-side
-UMK          = AES-256-GCM-open(KEK, wrapped_umk)   -- recovered on login
+salt         = SHA-256("orange-copy-paste/auth-salt/v2:" || lowercase(trim(email)))
+master       = Argon2id(password, salt, m=65536, t=3, p=4) → 32 bytes        -- never leaves the device
+auth_key     = base64(HKDF-SHA256(ikm=master, salt=none, info="orange-copy-paste/auth-key/v2", 32))
+               -- sent to Supabase as the account "password": sign-up, sign-in, PUT /user
+KEK          = HKDF-SHA256(ikm=master, salt=kdf_salt, info="orange-copy-paste/kek/v2", 32)
+wrapped_umk  = AES-256-GCM(KEK, UMK, aad="umk-envelope-v2")   -- the envelope, stored server-side
+UMK          = AES-256-GCM-open(KEK, wrapped_umk)              -- recovered on login
 ```
+
+The raw password is not sent anywhere. Supabase stores a bcrypt hash of `auth_key`;
+recovering `auth_key` from that hash, or capturing it in transit, gives the ability to
+sign in and nothing else, because HKDF is one-way and the two halves are independent.
+The master is salted with the *address* rather than a server value because it has to
+exist before sign-in - it produces the credential - and the address is the one thing
+known about the account at that point. The `kdf_salt` still binds the KEK to the
+account row.
+
+**Why the split.** Before it, the same password was sent to Supabase and fed to
+Argon2id. Supabase Postgres also hosts these tables, so one database dump held
+`bcrypt(password)`, `kdf_salt` and `pw_wrapped_umk`, and a bcrypt-speed guess against
+`auth.users` bypassed the memory-hard KDF for any guessable password. Anyone who could
+read sign-in traffic had the same shortcut.
 
 - **First setup:** the client generates a random UMK, wraps it under the KEK, and
   stores the envelope via `PUT /auth/umk`.
 - **Return / new device:** the client fetches `wrapped_umk` from `bootstrap`, derives
   the KEK from the entered password, and unwraps. A GCM auth failure = wrong password.
+- **Accounts from before the split** (`Argon2id(password, kdf_salt)` as the KEK, AAD
+  `umk-envelope-v1`, raw password on file with Supabase) migrate on their next sign-in,
+  client-side and without a server change: sign-in with `auth_key` is refused, the client
+  retries once with the raw password, opens the envelope with the legacy KEK, re-wraps
+  the same UMK under the new KEK (`PUT /auth/umk`), and only then replaces the Supabase
+  credential (`PUT /user` with `auth_key`). Envelope first, credential second, so a
+  failure between the two leaves the old sign-in working. An envelope in the old format
+  behind a Google sign-in follows the same path. Nothing is re-encrypted; the UMK does
+  not change.
 
 Decoupling the key from the password means a **password change only re-wraps the
 UMK** (one `PUT /auth/umk`) instead of re-encrypting all data. The server holds only
@@ -1340,14 +1506,51 @@ without ever being recoverable *by the server*:
 
 | Envelope | Wrapped under | AAD | Stored |
 |---|---|---|---|
-| Password | `Argon2id(password, kdf_salt)` | `umk-envelope-v1` | `profiles.pw_wrapped_umk` |
+| Password | `HKDF(Argon2id(password, email-salt), kdf_salt)`, the KEK above | `umk-envelope-v2` | `profiles.pw_wrapped_umk` |
 | Recovery code | `Argon2id(recovery_code, kdf_salt)` | `umk-recovery-v1` | `profiles.recovery_wrapped_umk` |
 | Per device | `x25519(device_priv, device_pub)` | key-wrap, no AAD | `devices.wrapped_umk` |
 
 The first two are account-wide and open on any machine; the third is local to one
-install and needs nothing typed. The recovery and password envelopes share
-`kdf_salt` deliberately - same salt, different secret - and the distinct AADs are
-what stop one being fed to the other.
+install and needs nothing typed. The recovery and password envelopes both take in
+`kdf_salt` deliberately - same account binding, different secret - and the distinct
+AADs are what stop one being fed to the other. The recovery code is typed into the
+app and sent nowhere, so it needs no split.
+
+#### UMK proof
+
+A bearer token alone must not be enough to change key material: a stolen access token
+could otherwise replace the password envelope with one under a key the thief chose,
+wrap the UMK for a device they control, or revoke the owner's devices. So those
+routes take `X-Umk-Proof`, 32 bytes the client derives from the UMK itself and sends
+base64-encoded. Only a caller that has unlocked the account can produce it. The server
+stores `sha256(proof)` in `profiles.umk_proof_hash` and never the proof; the proof is
+not a key and opens nothing the server holds.
+
+Routes: `PUT /auth/umk`, `PUT /auth/umk/recovery`, `DELETE /auth/umk/recovery`,
+`POST /auth/devices/{id}/key-wrap`, `DELETE /auth/devices/{id}`.
+
+| Stored hash | Header | Result |
+|---|---|---|
+| NULL | absent | Proceeds. An account no proof-carrying client has touched yet. |
+| NULL | present | Proceeds, and `sha256(header)` is stored (trust on first use). |
+| set | matches (constant-time) | Proceeds. |
+| set | absent or different | `403 {"detail": "umk_proof_required"}` |
+| any | not base64 of exactly 32 bytes | `400 {"detail": "invalid_umk_proof"}` |
+
+A password change keeps the proof, because the UMK does not change.
+
+**Derivation (client).** `proof = HKDF-SHA256(ikm = UMK, salt = none, info =
+"orange-copy-paste/umk-proof/v1", length = 32)`, sent as standard base64. It is a
+one-way function of the UMK, so holding the proof gives nothing back about the key.
+
+**Account reset.** A user who has lost every way to open the old UMK starts over with a
+new one, so they cannot prove the old key. `PUT /auth/umk` with `"reset": true` is
+accepted without a matching proof only when the token's `amr` claim has an entry with
+`method == "recovery"`, which Supabase sets on a session opened from a password-recovery
+link. The header is still required and must carry the proof of the *new* UMK: it
+replaces the stored hash. The replaced envelope moves to `profiles.pw_wrapped_umk_prev`.
+A `reset` from any other session is judged like an ordinary write. After a reset the
+client clears the recovery envelope and re-wraps for its devices with the new proof.
 
 #### Recovery ladder
 
@@ -1434,7 +1637,11 @@ says which of them to use (null = the owner). A distributor also wraps for itsel
 restart.
 
 Minting stays owner-only, so there is still exactly one account deciding what the current
-key is; distribution is open to any keyholder. Why distribution was widened from owner-only
+key is; distribution is open to any keyholder, but a non-owner may only **fill a gap**:
+the server skips a non-owner's write onto a row that already holds a wrap, and onto the
+owner's row always. Reconcile only ever wraps for members with `has_space_key = false`,
+so honest clients lose nothing; a member can no longer overwrite someone's working ring
+with a key that is not this space's. Why distribution was widened from owner-only
 to any keyholder is recorded in the website design record.
 
 **Verifying a received ring.** The server stores whatever wrap it is handed and cannot
@@ -1574,7 +1781,8 @@ Identity is Supabase's; the app layers device + key state on top.
 
 2. POST /api/v1/auth/bootstrap { display_name? }   (Authorization: Bearer <JWT>)
         → ensures a profile, returns kdf_salt + wrapped_umk
-        → client derives KEK = Argon2id(password, kdf_salt); unwraps UMK from wrapped_umk
+        → client derives KEK = HKDF(Argon2id(password, email-salt), kdf_salt); unwraps UMK from wrapped_umk
+          (step 1 used the other HKDF half, auth_key, as the Supabase credential - see section 7.1)
           (or, if null, generates a random UMK, wraps it, and PUT /auth/umk)
 
 3. POST /api/v1/auth/devices { device_name, platform, ... }
@@ -1588,13 +1796,16 @@ Identity is Supabase's; the app layers device + key state on top.
 header and allowlisted to `ES256`/`RS256`/`HS256` before any key is selected, so `none`
 and unknown algorithms are refused up front. Asymmetric tokens verify against the
 project's JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`, cached in-process for
-300 s, so Supabase-side rotation needs no redeploy); `HS256` verifies against
-`SUPABASE_JWT_SECRET`, and when that secret is unset the server answers `500`
-(a deployment/configuration error, not a verdict on the credential) rather than
-judging the token. Algorithm
+300 s, so Supabase-side rotation needs no redeploy). The lookup runs in the threadpool,
+never on the event loop, and a `kid` missing from the cached set forces at most one
+refetch per 60 s across the process; inside that window it is judged against the set
+already held. `HS256` verifies against `SUPABASE_JWT_SECRET`; when that secret is unset
+an HS256 token is answered `401`, as a token this deployment does not accept. Algorithm
 confusion has nothing to forge against, since the two branches draw on unrelated key
 material. Decode requires `exp` and `sub` and checks the audience, with 30 s of leeway
-for clock drift between Supabase and this host. No deny-list — Supabase owns session
+for clock drift between Supabase and this host. When `SUPABASE_URL` is set it also
+requires `iss == {SUPABASE_URL}/auth/v1`, so a token from another project that shares a
+key is refused. No deny-list — Supabase owns session
 revocation. To immediately cut off a user, ban them via the admin suspend endpoint
 (Supabase).
 
@@ -1774,4 +1985,8 @@ points to its home; the mechanism and any values live there, not here.
 - [x] `SUPABASE_SERVICE_ROLE_KEY` is server-only and never returned to clients.
 - [x] Security response headers set on every response via middleware (`src/middleware.py`): `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: geolocation=(), camera=(), microphone=()`, and `Strict-Transport-Security: max-age=31536000; includeSubDomains` on HTTPS responses. A default `Content-Security-Policy` is set here too for JSON routes (value not repeated).
 - [x] All SQL goes through SQLAlchemy parameterized queries.
+- [x] `X-Device-Id` is checked against the caller's unrevoked devices before it is trusted ([section 5](#5-api-design) conventions).
+- [x] Key-material writes need the UMK proof once an account has one ([section 7.1](#71-user-master-key-umk--envelope-model)).
+- [x] Socket credentials travel in the first message, never the URL, and a socket closes when its token expires ([section 5.8](#58-websocket-event-protocol)).
+- [ ] Revoking a device does not end its Supabase session; the device is refused by this service, but its token lives until it expires ([section 5.1](#51-auth-routes)).
 - [x] Asymmetric JWKS verification, so Supabase-side key rotation needs no redeploy; shared HS256 accepted only for legacy projects ([section 9](#9-auth-flow), [section 5.0](#50-versioning)).

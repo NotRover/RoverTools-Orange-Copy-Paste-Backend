@@ -1,12 +1,14 @@
 """Addressed space invites — the persistent counterpart to bearer invite codes.
 
-An invite targets one email that already belongs to an account - an address
-nobody has signed up with is rejected, since the invite has nowhere to appear
-and no device key to wrap the space key to. It survives the invitee being
-offline and gives the inviter visibility into its fate. Creating one publishes
-`invite:received` to the invitee and sends a best-effort email carrying the
-space's short code as the fallback join path. Accepting joins the space directly
-by invite id.
+An invite targets one email. It survives the invitee being offline and gives
+the inviter visibility into its fate. Creating one for an address that belongs to
+an account publishes `invite:received` to the invitee and sends a best-effort
+email carrying the space's short code as the fallback join path. An address
+nobody has signed up with gets the same answer and a pending row, but no event
+and no email: the response must not tell the inviter whether an address is
+registered, and mailing strangers is not something an invite is for. Should that
+address sign up later, the row matches their token's email claim like any other.
+Accepting joins the space directly by invite id.
 
 Status lifecycle: pending → accepted | declined (invitee) | revoked (inviter).
 Expiry is judged against `expires_at` at read/accept time rather than by a
@@ -16,8 +18,8 @@ background transition, so no sweeper is needed.
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from pydantic import BaseModel, EmailStr, Field
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,11 +27,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src import email, realtime as rt
 from src.auth.models import Profile
 from src.database import get_db
+from src.limiter import limiter
 from src.dependencies import get_current_claims, get_current_user_id, get_redis
 from src.spaces import service as spaces_service
 from src.spaces.models import Space, SpaceInvite, SpaceMembership
+from src.spaces.schemas import MAX_WRAPPED_KEYRING_BYTES
 
 _INVITE_TTL_HOURS = 72
+# A re-invite inside this window refreshes the row but sends no second email.
+_EMAIL_RESEND_COOLDOWN_MS = 10 * 60 * 1000
 
 
 def _now_ms() -> int:
@@ -67,7 +73,7 @@ class InviteOut(BaseModel):
 class AttachKeyRequest(BaseModel):
     # JSON array of X25519-wrapped Space Keys, newest first, wrapped for the
     # invitee's identity key. Opaque to the server.
-    wrapped_space_keys: str
+    wrapped_space_keys: str = Field(min_length=1, max_length=MAX_WRAPPED_KEYRING_BYTES)
 
 
 class InviteListResponse(BaseModel):
@@ -118,32 +124,29 @@ async def create_invite(
     invitee_email: str,
 ) -> InviteOut:
     """Create (or refresh) a pending invite from `inviter_id` to `invitee_email`
-    for `space`, notify the invitee over WS when resolvable, and queue the
-    invite email. Callers have already verified the inviter may invite."""
+    for `space`. When the address belongs to an account, notify the invitee over
+    WS and queue the invite email (not again within the resend cooldown). The
+    response is the same shape either way. Callers have already verified the
+    inviter may invite."""
     now = _now_ms()
     normalized = invitee_email.lower()
     inviter_uuid = uuid.UUID(inviter_id)
 
     invitee = await db.scalar(select(Profile).where(Profile.email == normalized))
-    if invitee is None:
-        # An invite is an addressed offer: it has to reach an inbox in the app,
-        # and the space key has to be wrapped to a real device key. Neither is
-        # possible for an address nobody has signed up with, so the row would
-        # sit pending until it expired.
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No RoverTools account uses that email",
-        )
-    if invitee.id == inviter_uuid:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That's your own email")
+    # An unknown address is not an error: answering differently for it would
+    # turn this route into a lookup of who has an account. The row is created
+    # the same way; only the event and the email below depend on `invitee`.
+    if invitee is not None:
+        if invitee.id == inviter_uuid:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That's your own email")
 
-    already_member = await db.scalar(
-        select(SpaceMembership).where(
-            SpaceMembership.space_id == space.id, SpaceMembership.user_id == invitee.id
+        already_member = await db.scalar(
+            select(SpaceMembership).where(
+                SpaceMembership.space_id == space.id, SpaceMembership.user_id == invitee.id
+            )
         )
-    )
-    if already_member:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already a member")
+        if already_member:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already a member")
 
     # One live invite per (space, email): refresh the pending row instead of
     # stacking duplicates the invitee would see as repeated notifications.
@@ -155,9 +158,16 @@ async def create_invite(
         )
     )
     expires_at = int((datetime.now(UTC) + timedelta(hours=_INVITE_TTL_HOURS)).timestamp() * 1000)
+    # Every refresh pushes `expires_at` a full TTL out, so the last refresh was
+    # at `expires_at - TTL`. Pressing "invite" repeatedly must not be a way to
+    # mail somebody over and over.
+    recently_sent = invite is not None and (
+        now - (invite.expires_at - _INVITE_TTL_HOURS * 3600 * 1000) < _EMAIL_RESEND_COOLDOWN_MS
+    )
+    invitee_id = invitee.id if invitee is not None else None
     if invite:
         invite.expires_at = expires_at
-        invite.invitee_user_id = invitee.id
+        invite.invitee_user_id = invitee_id
         # A re-invite starts the handover again: the ring may have rotated since,
         # and attaching the new one is the inviter's next call.
         invite.wrapped_space_keys = None
@@ -166,7 +176,7 @@ async def create_invite(
             space_id=space.id,
             inviter_id=inviter_uuid,
             invitee_email=normalized,
-            invitee_user_id=invitee.id,
+            invitee_user_id=invitee_id,
             status="pending",
             created_at=now,
             expires_at=expires_at,
@@ -176,6 +186,8 @@ async def create_invite(
     await db.refresh(invite)
 
     out = await _invite_to_out(db, invite, space, for_inviter=True)
+    if invitee is None:
+        return out
 
     # The invitee's copy does not carry their own public key back to them, nor the
     # inviter's wrap state - both are the inviter's business.
@@ -185,6 +197,8 @@ async def create_invite(
         out.model_dump(mode="json", exclude={"invitee_identity_pubkey", "has_space_key"}),
     )
 
+    if recently_sent:
+        return out
     inviter = await db.scalar(select(Profile).where(Profile.id == inviter_uuid))
     code = spaces_service.format_invite_code(space.invite_code or "")
     background.add_task(
@@ -294,7 +308,9 @@ async def attach_invite_key(
 
 
 @router.post("/{invite_id}/accept", response_model=AcceptResponse)
+@limiter.limit("30/minute")
 async def accept_invite(
+    request: Request,
     invite_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
@@ -305,8 +321,14 @@ async def accept_invite(
     Emits the same events as an invite-code join (`space:membership_changed`)
     plus `invite:updated` to the inviter.
 
+    403 `email_unverified` when the token says the address is not verified: an
+    invite is addressed to an email, and an account that has not proven it owns
+    that address is not yet the person it was sent to.
+
     Requires: Bearer token (Supabase JWT).
     """
+    if claims.get("email_verified") is False:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="email_unverified")
     inv = await _get_invite_for_invitee(db, invite_id, claims)
     uid = uuid.UUID(claims["sub"])
 

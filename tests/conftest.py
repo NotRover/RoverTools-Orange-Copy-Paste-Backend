@@ -12,6 +12,13 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 
+# src/config.py has no defaults for these; a checkout without a .env still has to
+# import the app. Placeholders only: tests override the database and Redis.
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/clipboard_test")
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
+
 import jwt
 import pytest
 import pytest_asyncio
@@ -22,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from src.config import settings
 from src.database import Base, get_db
 from src.dependencies import get_redis
+from src.limiter import limiter
 from src.main import app
 from src.redis_client import get_redis_pool
 
@@ -39,11 +47,32 @@ def _configure_settings():
     yield
 
 
-def make_token(user_id: str, email: str | None = None) -> str:
+@pytest.fixture(autouse=True)
+def _rate_limits_off():
+    """Rate limits are in-process counters that would carry across tests. Off by
+    default; a test that is about a limit turns them on with `rate_limits_on`."""
+    limiter.enabled = False
+    yield
+    limiter.enabled = False
+
+
+@pytest.fixture
+def rate_limits_on():
+    limiter.reset()
+    limiter.enabled = True
+    yield
+    limiter.reset()
+
+
+def make_token(user_id: str, email: str | None = None, **extra) -> str:
     now = int(time.time())
     claims: dict = {"sub": user_id, "aud": "authenticated", "iat": now, "exp": now + 3600}
+    if settings.supabase_url:
+        # The issuer is checked whenever SUPABASE_URL is set (it is, in a dev .env).
+        claims["iss"] = f"{settings.supabase_url.rstrip('/')}/auth/v1"
     if email:
         claims["email"] = email
+    claims.update(extra)
     return jwt.encode(claims, _TEST_JWT_SECRET, algorithm="HS256")
 
 

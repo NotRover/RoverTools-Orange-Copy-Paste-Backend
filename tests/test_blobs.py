@@ -1,10 +1,24 @@
 """Blob upload/quota endpoint tests (presigned-URL generation is mocked)."""
 
+import time
+import uuid
 from unittest.mock import patch
 
 from httpx import AsyncClient
 
+from src.blobs.s3 import ObjectHead
 from src.config import settings
+
+CHECKSUM = "ab" * 32
+
+
+def cid(label: str) -> str:
+    """A readable test label as the canonical UUID the server requires."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, label))
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 async def test_request_upload(client: AsyncClient, auth_headers: dict):
@@ -12,7 +26,7 @@ async def test_request_upload(client: AsyncClient, auth_headers: dict):
     with patch("src.blobs.s3.generate_presigned_put", return_value="https://r2.example.com/put?sig=test"):
         resp = await client.post(
             "/api/v1/blobs/request-upload",
-            json={"mime_type": "image/png", "size_bytes": 1024, "checksum": "abc123"},
+            json={"mime_type": "image/png", "size_bytes": 1024, "checksum": CHECKSUM},
             headers=headers,
         )
     assert resp.status_code == 200, resp.text
@@ -26,10 +40,99 @@ async def test_request_upload_over_5mb_rejected(client: AsyncClient, auth_header
     headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
     resp = await client.post(
         "/api/v1/blobs/request-upload",
-        json={"mime_type": "image/png", "size_bytes": 6_000_000, "checksum": "abc"},
+        json={"mime_type": "image/png", "size_bytes": 6_000_000, "checksum": CHECKSUM},
         headers=headers,
     )
-    assert resp.status_code == 413
+    assert resp.status_code == 422
+
+
+async def test_request_upload_refuses_a_size_that_is_not_positive(client: AsyncClient, auth_headers: dict):
+    """A negative size was summed into the quota check, so declaring one bought
+    room for every upload after it."""
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    for size in (-5_000_000, 0):
+        resp = await client.post(
+            "/api/v1/blobs/request-upload",
+            json={"mime_type": "image/png", "size_bytes": size, "checksum": CHECKSUM},
+            headers=headers,
+        )
+        assert resp.status_code == 422, size
+
+
+async def test_request_upload_refuses_a_type_off_the_list(client: AsyncClient, auth_headers: dict):
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    for mime in ("text/html", "image/svg+xml", "application/javascript"):
+        resp = await client.post(
+            "/api/v1/blobs/request-upload",
+            json={"mime_type": mime, "size_bytes": 10, "checksum": CHECKSUM},
+            headers=headers,
+        )
+        assert resp.status_code == 422, mime
+
+
+async def test_the_put_url_is_signed_for_the_declared_size(client: AsyncClient, auth_headers: dict):
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    with patch("src.blobs.s3.generate_presigned_put", return_value="https://r2.example.com/put") as put:
+        resp = await client.post(
+            "/api/v1/blobs/request-upload",
+            json={"mime_type": "application/zip", "size_bytes": 777, "checksum": CHECKSUM},
+            headers=headers,
+        )
+    assert resp.status_code == 200, resp.text
+    assert put.call_args.args[1:] == ("application/zip", 777)
+
+
+async def test_unconfirmed_uploads_count_against_the_quota_while_they_can_land(
+    client: AsyncClient, auth_headers: dict, db
+):
+    from sqlalchemy import text
+
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    await db.execute(
+        text("UPDATE profiles SET blob_bytes_quota = 3000 WHERE id = :u"), {"u": auth_headers["_user_id"]}
+    )
+    await db.commit()
+    with patch("src.blobs.s3.generate_presigned_put", return_value="https://r2.example.com/put"):
+        ok = await client.post(
+            "/api/v1/blobs/request-upload",
+            json={"mime_type": "image/png", "size_bytes": 2000, "checksum": CHECKSUM},
+            headers=headers,
+        )
+        assert ok.status_code == 200, ok.text
+        again = await client.post(
+            "/api/v1/blobs/request-upload",
+            json={"mime_type": "image/png", "size_bytes": 2000, "checksum": CHECKSUM},
+            headers=headers,
+        )
+    assert again.status_code == 402
+
+
+async def test_confirm_refuses_an_object_of_the_wrong_size(client: AsyncClient, auth_headers: dict):
+    headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
+    with patch("src.blobs.s3.generate_presigned_put", return_value="https://r2.example.com/put"):
+        resp = await client.post(
+            "/api/v1/blobs/request-upload",
+            json={"mime_type": "image/png", "size_bytes": 1000, "checksum": CHECKSUM},
+            headers=headers,
+        )
+    key = resp.json()["blob_key"]
+    with (
+        patch("src.blobs.s3.head_object", return_value=ObjectHead(size_bytes=5_000_000, checksum_sha256=None)),
+        patch("src.blobs.s3.delete_object") as deleted,
+    ):
+        confirm = await client.post("/api/v1/blobs/confirm-upload", json={"blob_key": key}, headers=headers)
+    assert confirm.status_code == 409
+    deleted.assert_called_once_with(key)
+    assert await _used_bytes(client, headers) == 0
+
+
+async def test_download_urls_are_always_attachments():
+    from src.blobs import s3
+
+    with patch.object(s3, "_client") as client_factory:
+        s3.generate_presigned_get("k")
+    params = client_factory.return_value.generate_presigned_url.call_args.kwargs["Params"]
+    assert params["ResponseContentDisposition"] == "attachment"
 
 
 async def test_quota(client: AsyncClient, auth_headers: dict):
@@ -50,12 +153,13 @@ async def _upload_blob(client: AsyncClient, headers: dict, size: int) -> str:
     with patch("src.blobs.s3.generate_presigned_put", return_value="https://r2.example.com/put"):
         resp = await client.post(
             "/api/v1/blobs/request-upload",
-            json={"mime_type": "image/png", "size_bytes": size, "checksum": "abc"},
+            json={"mime_type": "image/png", "size_bytes": size, "checksum": CHECKSUM},
             headers=headers,
         )
     assert resp.status_code == 200, resp.text
     key = resp.json()["blob_key"]
-    confirm = await client.post("/api/v1/blobs/confirm-upload", json={"blob_key": key}, headers=headers)
+    with patch("src.blobs.s3.head_object", return_value=ObjectHead(size_bytes=size, checksum_sha256=None)):
+        confirm = await client.post("/api/v1/blobs/confirm-upload", json={"blob_key": key}, headers=headers)
     assert confirm.status_code == 204, confirm.text
     return key
 
@@ -66,9 +170,9 @@ async def _used_bytes(client: AsyncClient, headers: dict) -> int:
     return resp.json()["used_bytes"]
 
 
-def _image_entry(client_id: str, blob_key: str | None, *, ts: int, deleted: bool = False) -> dict:
+def _image_entry(label: str, blob_key: str | None, *, ts: int, deleted: bool = False) -> dict:
     return {
-        "client_id": client_id,
+        "client_id": cid(label),
         "entry_type": "clipboard",
         "kind": "image",
         "encrypted_content": "dGVzdA==",
@@ -87,7 +191,7 @@ async def test_tombstone_releases_blob(client: AsyncClient, auth_headers: dict):
     and the orphan reaper only collects unconfirmed ones.
     """
     headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
-    now = 1_800_000_000_000
+    now = _now_ms()
     key = await _upload_blob(client, headers, 1024)
     assert await _used_bytes(client, headers) == 1024
 
@@ -112,7 +216,7 @@ async def test_replacing_an_image_releases_the_old_blob(client: AsyncClient, aut
     permanently leaks one image's worth of quota.
     """
     headers = {k: v for k, v in auth_headers.items() if not k.startswith("_")}
-    now = 1_800_000_000_000
+    now = _now_ms()
     first = await _upload_blob(client, headers, 1024)
     await client.post(
         "/api/v1/sync/push",
@@ -166,7 +270,7 @@ async def test_sweep_spares_blobs_still_in_use(client: AsyncClient, auth_headers
     key = await _upload_blob(client, headers, 4096)
     resp = await client.post(
         "/api/v1/sync/push",
-        json={"entries": [_image_entry("cid-blob-live", key, ts=1_800_000_000_000)]},
+        json={"entries": [_image_entry("cid-blob-live", key, ts=_now_ms())]},
         headers=headers,
     )
     assert resp.status_code == 200, resp.text
@@ -214,7 +318,7 @@ async def test_releasing_a_blob_a_live_entry_uses_is_refused(client: AsyncClient
         json={
             "entries": [
                 {
-                    "client_id": "img-1",
+                    "client_id": cid("img-1"),
                     "entry_type": "clipboard",
                     "kind": "image",
                     "encrypted_content": "ciphertext",

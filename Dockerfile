@@ -33,4 +33,11 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
 
 # Honour $PORT so the image runs unchanged wherever one is assigned; falls back to
 # 8000 for plain `docker run`. Shell form is required for the variable to expand.
-CMD ["sh", "-c", "uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+#
+# --proxy-headers makes uvicorn take the client address and scheme from
+# X-Forwarded-For / X-Forwarded-Proto, but only from a peer in
+# --forwarded-allow-ips. That list is Caddy's fixed address in
+# docker-compose.prod.yml; the fallback, 127.0.0.1, trusts no container at all.
+# Never `*`: the per-IP rate limits and the admin lockout key on the address this
+# yields, and `*` would let any client choose its own.
+CMD ["sh", "-c", "uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]

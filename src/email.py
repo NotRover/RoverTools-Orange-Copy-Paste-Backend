@@ -32,6 +32,12 @@ _MAIL_SHELL = web.read_template("email_shell.html")
 _MAIL_INVITE = web.read_template("email_invite.html")
 _MAIL_TEST = web.read_template("email_test.html")
 
+# A fixed subject: the inviter's display name is chosen by whoever holds the
+# account, and a subject line is the part of a mail a spam filter and a reader
+# judge it by. The name appears in the body only, cut to this many characters.
+_INVITE_SUBJECT = "You have been invited to a space in Orange Copy Paste"
+_INVITER_NAME_MAX = 64
+
 _DEFAULT_FOOTER = "Sent by Orange Copy Paste. You can ignore this message if it was not meant for you."
 
 
@@ -195,8 +201,10 @@ def send_sharing_invite(
     linkify a custom scheme, so the one thing the recipient is meant to click was
     often not clickable at all. The page it lands on hands the invite to the app.
     """
-    subject = f"{from_name or 'Someone'} invited you to a space in Orange Copy Paste"
+    subject = _INVITE_SUBJECT
     join_url = web.join_url(invite_code)
+    # Control characters out, then cut: the name is free text from another user.
+    from_name = "".join(ch for ch in (from_name or "") if ch.isprintable()).strip()[:_INVITER_NAME_MAX]
     invitee = escape(invitee_name) or "there"
     inviter = escape(from_name) or "A user"
     # One display form everywhere: the app, the join page and this mail all show

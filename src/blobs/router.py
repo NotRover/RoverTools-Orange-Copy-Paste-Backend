@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.blobs import service
@@ -12,12 +12,15 @@ from src.blobs.schemas import (
 )
 from src.database import get_db
 from src.dependencies import get_current_user_id
+from src.limiter import limiter
 
 router = APIRouter(prefix="/blobs", tags=["blobs"])
 
 
 @router.post("/request-upload", response_model=RequestUploadResponse)
+@limiter.limit("120/minute")
 async def request_upload(
+    request: Request,
     body: RequestUploadBody,
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
@@ -31,12 +34,17 @@ async def request_upload(
 
 
 @router.post("/confirm-upload", status_code=204)
+@limiter.limit("120/minute")
 async def confirm_upload(
+    request: Request,
     body: ConfirmUploadBody,
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
     """Confirm a completed blob upload and record it against the user's quota.
+
+    409 when the stored object is missing or does not match the declared size
+    (the object is then deleted); 402 when the quota no longer has room.
 
     Requires: Bearer token + X-Device-Id header.
     """
@@ -62,7 +70,9 @@ async def release_upload(
 
 
 @router.get("/{blob_key:path}/download-url", response_model=DownloadUrlResponse)
+@limiter.limit("300/minute")
 async def download_url(
+    request: Request,
     blob_key: str,
     db: AsyncSession = Depends(get_db),
     current: tuple[str, str] = Depends(get_current_user_id),

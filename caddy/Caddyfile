@@ -3,6 +3,25 @@
 api.orangecp.rovertools.ctx.cl {
 	encode zstd gzip
 
+	# HSTS at the edge. Deferred so it replaces, rather than duplicates, the copy
+	# the API sets itself once it trusts X-Forwarded-Proto.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		defer
+	}
+
+	# The admin API and the metrics endpoint are not for the internet. Both still
+	# need the admin key, but nothing outside the box has a reason to reach them,
+	# so they answer 404 here. /internal/metrics is scraped from inside the compose
+	# network only (nothing external scrapes it), so it is blocked too. Reach them
+	# from the box: `docker compose -f docker-compose.prod.yml exec api curl ...`.
+	# /internal/healthz stays public for uptime checks.
+	@internal {
+		path /internal/*
+		not path /internal/healthz
+	}
+	respond @internal 404
+
 	reverse_proxy {
 		# Re-resolve `api` on each request via Docker's embedded DNS (127.0.0.11),
 		# so after a deploy recreates the container Caddy finds its new IP instead
@@ -31,6 +50,18 @@ api.orangecp.rovertools.ctx.cl {
 # to start if METRICS_AUTH_HASH is unset, which is the intended failure.
 status.rovertools.ctx.cl {
 	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		defer
+	}
+
+	# Source allow-list. METRICS_ALLOW_CIDR is space-separated CIDRs from .env,
+	# substituted when the Caddyfile is loaded; the compose default is everyone,
+	# with basic auth still in front. Narrow it to your own address(es) to take
+	# the dashboard off the internet entirely (docs/DEPLOY.md section 12).
+	@not_allowed not remote_ip {$METRICS_ALLOW_CIDR:0.0.0.0/0 ::/0}
+	respond @not_allowed 403
 
 	basic_auth {
 		{env.METRICS_AUTH_USER} {env.METRICS_AUTH_HASH}
