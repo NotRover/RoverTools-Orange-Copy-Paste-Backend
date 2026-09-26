@@ -13,9 +13,13 @@ The `merge_cursors` tests need no database. The rest need Postgres, like every
 other endpoint test here.
 """
 
+import time
+import uuid
+
 import pytest
 from httpx import AsyncClient
 
+from src.sync.models import SyncEntry
 from src.sync.service import merge_cursors
 from tests.test_spaces_invites import clean, create_space, join, make_user
 
@@ -66,9 +70,40 @@ def test_a_zero_cursor_is_a_position_not_an_absence():
 # ── End to end ───────────────────────────────────────────────────────
 
 
-def _shared_entry(client_id: str, space_id: str, ts: int) -> dict:
+def cid(label: str) -> str:
+    """A readable test label as the canonical UUID the server requires."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, label))
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+async def _plant_row(db, user_id: str, label: str, space_id: str, ts: int) -> None:
+    """A second account's row under the same client_id, written straight to the
+    table: push refuses to create one now, but rows like it are still stored
+    from client builds that pushed entries they had received."""
+    db.add(
+        SyncEntry(
+            client_id=cid(label),
+            user_id=uuid.UUID(user_id),
+            device_id=uuid.uuid4(),
+            entry_type="clipboard",
+            kind="text",
+            encrypted_content="c2hhcmVkLXNlY3JldA==",
+            created_at=ts - 1000,
+            updated_at=ts,
+            server_ts=ts,
+            space_ids=[uuid.UUID(space_id)],
+            wrapped_keys="{}",
+        )
+    )
+    await db.commit()
+
+
+def _shared_entry(label: str, space_id: str, ts: int) -> dict:
     return {
-        "client_id": client_id,
+        "client_id": cid(label),
         "entry_type": "clipboard",
         "kind": "text",
         "encrypted_content": "c2hhcmVkLXNlY3JldA==",
@@ -88,7 +123,7 @@ async def _pull(client: AsyncClient, headers: dict, after_ts: int = 0) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_the_recorded_author_is_not_whichever_row_came_back_first(client: AsyncClient):
+async def test_the_recorded_author_is_not_whichever_row_came_back_first(client: AsyncClient, db):
     """Two accounts, one `client_id`, and the owner removing their own item.
 
     Rows are keyed `(user_id, client_id, entry_type)`, so two accounts can each
@@ -113,26 +148,21 @@ async def test_the_recorded_author_is_not_whichever_row_came_back_first(client: 
     space_id = space["space_id"]
     await join(client, member, space, owner)
 
-    ts = 2_000_000_000_000
-    # Both accounts push under the same client_id. Order matters: the member
-    # pushes first, so their row is the older one and the likelier to be
+    ts = _now_ms() - 10_000
+    # Both accounts hold a row under the same client_id. Order matters: the
+    # member's is written first, so it is the older one and the likelier to be
     # returned first by a query with no ORDER BY.
-    for who, at in ((member, ts), (owner, ts + 1000)):
-        pushed = await client.post(
-            "/api/v1/sync/push",
-            json={"entries": [_shared_entry("cid-contested", space_id, at)]},
-            headers=clean(who),
-        )
-        assert pushed.status_code == 200, pushed.text
+    await _plant_row(db, member["_user_id"], "cid-contested", space_id, ts)
+    await _plant_row(db, owner["_user_id"], "cid-contested", space_id, ts + 1000)
 
     gone = await client.delete(
-        f"/api/v1/spaces/{space_id}/entries/cid-contested?entry_type=clipboard",
+        f"/api/v1/spaces/{space_id}/entries/{cid('cid-contested')}?entry_type=clipboard",
         headers=clean(owner),
     )
     assert gone.status_code == 204, gone.text
 
     removals = (await _pull(client, member))["removals"]
-    row = next(r for r in removals if r["client_id"] == "cid-contested")
+    row = next(r for r in removals if r["client_id"] == cid("cid-contested"))
     assert row["removed_by"] == owner["_user_id"]
     assert row["author_id"] == owner["_user_id"], (
         "the remover wrote one of the cleared rows, so naming anyone else "
@@ -141,7 +171,7 @@ async def test_the_recorded_author_is_not_whichever_row_came_back_first(client: 
 
 
 @pytest.mark.asyncio
-async def test_a_contested_client_id_names_an_author_stably(client: AsyncClient):
+async def test_a_contested_client_id_names_an_author_stably(client: AsyncClient, db):
     """Same collision, but the remover wrote none of the rows.
 
     There is no right answer here - one row, two authors - so the requirement is
@@ -157,17 +187,12 @@ async def test_a_contested_client_id_names_an_author_stably(client: AsyncClient)
     await join(client, first, space, owner)
     await join(client, second, space, owner)
 
-    ts = 2_000_000_000_000
+    ts = _now_ms() - 10_000
     for who, at in ((first, ts), (second, ts + 1000)):
-        pushed = await client.post(
-            "/api/v1/sync/push",
-            json={"entries": [_shared_entry("cid-neither", space_id, at)]},
-            headers=clean(who),
-        )
-        assert pushed.status_code == 200, pushed.text
+        await _plant_row(db, who["_user_id"], "cid-neither", space_id, at)
 
     gone = await client.delete(
-        f"/api/v1/spaces/{space_id}/entries/cid-neither?entry_type=clipboard",
+        f"/api/v1/spaces/{space_id}/entries/{cid('cid-neither')}?entry_type=clipboard",
         headers=clean(owner),
     )
     assert gone.status_code == 204, gone.text
@@ -175,7 +200,7 @@ async def test_a_contested_client_id_names_an_author_stably(client: AsyncClient)
     row = next(
         r
         for r in (await _pull(client, first))["removals"]
-        if r["client_id"] == "cid-neither"
+        if r["client_id"] == cid("cid-neither")
     )
     assert row["removed_by"] == owner["_user_id"]
     # Lowest of the two ids, so the choice does not depend on row order.
@@ -198,19 +223,19 @@ async def test_a_member_who_was_offline_learns_the_entry_was_withdrawn(client: A
 
     pushed = await client.post(
         "/api/v1/sync/push",
-        json={"entries": [_shared_entry("cid-withdrawn", space_id, 2_000_000_000_000)]},
+        json={"entries": [_shared_entry("cid-withdrawn", space_id, _now_ms() - 10_000)]},
         headers=clean(owner),
     )
     assert pushed.status_code == 200, pushed.text
 
     # The member sees it, the ordinary way.
     seen = await _pull(client, member)
-    assert [e["client_id"] for e in seen["entries"]] == ["cid-withdrawn"]
+    assert [e["client_id"] for e in seen["entries"]] == [cid("cid-withdrawn")]
     cursor = max(e["server_ts"] for e in seen["entries"])
 
     # The owner takes it down while the member is not connected.
     gone = await client.delete(
-        f"/api/v1/spaces/{space_id}/entries/cid-withdrawn?entry_type=clipboard",
+        f"/api/v1/spaces/{space_id}/entries/{cid('cid-withdrawn')}?entry_type=clipboard",
         headers=clean(owner),
     )
     assert gone.status_code == 204, gone.text
@@ -223,7 +248,7 @@ async def test_a_member_who_was_offline_learns_the_entry_was_withdrawn(client: A
     assert [e["client_id"] for e in after["entries"]] == []
     assert len(after["removals"]) == 1, after
     removal = after["removals"][0]
-    assert removal["client_id"] == "cid-withdrawn"
+    assert removal["client_id"] == cid("cid-withdrawn")
     assert removal["space_id"] == space_id
     assert removal["entry_type"] == "clipboard"
     # Moderated, not self-withdrawn: the pair is what lets the client say which.
@@ -241,7 +266,7 @@ async def test_un_sharing_by_push_is_recorded_too(client: AsyncClient):
     space_id = space["space_id"]
     await join(client, member, space, owner)
 
-    ts = 2_000_000_000_000
+    ts = _now_ms() - 10_000
     r1 = await client.post(
         "/api/v1/sync/push",
         json={"entries": [_shared_entry("cid-unshared", space_id, ts)]},
@@ -260,7 +285,7 @@ async def test_un_sharing_by_push_is_recorded_too(client: AsyncClient):
 
     after = await _pull(client, member, after_ts=cursor)
     assert [e["client_id"] for e in after["entries"]] == []
-    assert [r["client_id"] for r in after["removals"]] == ["cid-unshared"]
+    assert [r["client_id"] for r in after["removals"]] == [cid("cid-unshared")]
     # Self-inflicted: this path is a push from the entry's own owner, so the two
     # ids match and the client shows "withdrawn" rather than "removed".
     assert after["removals"][0]["author_id"] == after["removals"][0]["removed_by"]
@@ -277,14 +302,14 @@ async def test_a_re_shared_entry_survives_its_own_removal_record(client: AsyncCl
     space_id = space["space_id"]
     await join(client, member, space, owner)
 
-    ts = 2_000_000_000_000
+    ts = _now_ms() - 10_000
     await client.post(
         "/api/v1/sync/push",
         json={"entries": [_shared_entry("cid-again", space_id, ts)]},
         headers=clean(owner),
     )
     await client.delete(
-        f"/api/v1/spaces/{space_id}/entries/cid-again?entry_type=clipboard",
+        f"/api/v1/spaces/{space_id}/entries/{cid('cid-again')}?entry_type=clipboard",
         headers=clean(owner),
     )
     again = await client.post(
@@ -295,8 +320,8 @@ async def test_a_re_shared_entry_survives_its_own_removal_record(client: AsyncCl
     assert again.status_code == 200, again.text
 
     full = await _pull(client, member)
-    entry = next(e for e in full["entries"] if e["client_id"] == "cid-again")
-    removal = next(r for r in full["removals"] if r["client_id"] == "cid-again")
+    entry = next(e for e in full["entries"] if e["client_id"] == cid("cid-again"))
+    removal = next(r for r in full["removals"] if r["client_id"] == cid("cid-again"))
     assert entry["server_ts"] > removal["server_ts"], (
         "the re-share must be newer than the withdrawal, or applying removals "
         "first would drop a live entry"
@@ -314,7 +339,7 @@ async def test_removing_twice_leaves_one_record_with_the_later_timestamp(client:
     space_id = space["space_id"]
     await join(client, member, space, owner)
 
-    ts = 2_000_000_000_000
+    ts = _now_ms() - 10_000
     for offset in (0, 5000):
         await client.post(
             "/api/v1/sync/push",
@@ -322,13 +347,13 @@ async def test_removing_twice_leaves_one_record_with_the_later_timestamp(client:
             headers=clean(owner),
         )
         gone = await client.delete(
-            f"/api/v1/spaces/{space_id}/entries/cid-twice?entry_type=clipboard",
+            f"/api/v1/spaces/{space_id}/entries/{cid('cid-twice')}?entry_type=clipboard",
             headers=clean(owner),
         )
         assert gone.status_code == 204, gone.text
 
     after = await _pull(client, member)
-    mine = [r for r in after["removals"] if r["client_id"] == "cid-twice"]
+    mine = [r for r in after["removals"] if r["client_id"] == cid("cid-twice")]
     assert len(mine) == 1, mine
 
 
@@ -343,11 +368,11 @@ async def test_a_stranger_is_not_told_about_another_space(client: AsyncClient):
 
     await client.post(
         "/api/v1/sync/push",
-        json={"entries": [_shared_entry("cid-private", space_id, 2_000_000_000_000)]},
+        json={"entries": [_shared_entry("cid-private", space_id, _now_ms() - 10_000)]},
         headers=clean(owner),
     )
     await client.delete(
-        f"/api/v1/spaces/{space_id}/entries/cid-private?entry_type=clipboard",
+        f"/api/v1/spaces/{space_id}/entries/{cid('cid-private')}?entry_type=clipboard",
         headers=clean(owner),
     )
 

@@ -32,6 +32,9 @@ class BootstrapResponse(BaseModel):
 class SetWrappedUmkRequest(BaseModel):
     # base64 AES-GCM envelope: the random UMK wrapped under the password-derived key.
     wrapped_umk: str = Field(max_length=512)
+    # Account reset: replace the envelope with one holding a brand-new UMK. Only
+    # honoured from a Supabase recovery-link session (`amr` method `recovery`).
+    reset: bool = False
 
 
 class SetRecoveryUmkRequest(BaseModel):

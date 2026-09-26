@@ -673,6 +673,19 @@ to read, never to infer.
 [`.github/workflows/migrate.yml`](../.github/workflows/migrate.yml) is the normal way to do
 this, and it holds the production `DATABASE_URL` so nobody has to paste one.
 
+**Set up the `production` environment once.** The URL is an environment secret, not a
+repository secret, so only a run from `main` can read it:
+
+1. Repository **Settings > Environments > New environment**, name it `production`.
+2. Under **Deployment branches and tags**, choose **Selected branches and tags** and add
+   `main`.
+3. Under **Environment secrets**, add `DATABASE_URL` (the session pooler URI on port 5432).
+4. Delete the old repository secret of the same name (**Settings > Secrets and variables >
+   Actions**), so no workflow can reach it outside the environment.
+
+Until step 3 is done every run fails at its first check with "DATABASE_URL is not set on
+the production environment", and nothing touches the database.
+
 It runs itself, read-only, on any push to `main` that touches `migrations/**`, and posts the
 pending DDL to the run summary. Applying is always a separate, deliberate dispatch:
 
@@ -769,6 +782,49 @@ flowchart LR
   all live in the checkout, so a change to any of them ships on the next poll like app code
   does. For the Caddyfile that takes a deliberate reload step in `deploy.sh` - see the trap
   below.
+
+### Signed commits only
+
+`deploy.sh` checks the signature on the commit it is about to deploy, before
+`git reset --hard`, against `deploy/allowed_signers`. A commit that no listed key signed is
+not deployed, and the run fails with a red Discord embed. This is what stops a stolen GitHub
+token or account from putting code on the box.
+
+**It protects nothing until you add a key.** While the file lists no keys, every deploy logs
+`WARNING: deploy/allowed_signers lists no keys` and carries on unchecked, so the deploy that
+introduced the check did not break the pipeline.
+
+To turn it on:
+
+1. On each machine you push from, sign commits with an SSH key:
+
+   ```bash
+   git config --global gpg.format ssh
+   git config --global user.signingkey ~/.ssh/id_ed25519.pub
+   git config --global commit.gpgsign true
+   ```
+
+2. Add each key to `deploy/allowed_signers`, one line per key, using the email in your
+   commits:
+
+   ```
+   you@example.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
+   ```
+
+3. Commit that change **signed**, and check it locally before pushing:
+
+   ```bash
+   git -c gpg.ssh.allowedSignersFile=deploy/allowed_signers verify-commit HEAD
+   ```
+
+The box reads the file from the checkout it is already running, not from the incoming
+commit, so a commit cannot vouch for itself by adding its own key. That also means the
+commit that first adds your key is deployed unchecked, and every commit after it is checked.
+
+**Merging on GitHub breaks this.** A squash or merge commit made with the GitHub merge
+button is signed by GitHub's own GPG key, which `allowed_signers` does not hold, and "Rebase
+and merge" drops signatures. Merge locally (`git merge --ff-only` of a signed branch, or a
+signed merge commit) and push `main` yourself.
 
 ### What "zero downtime" means here
 
@@ -920,9 +976,19 @@ Never in the image, never in git. They live in `~/app/.env` (`/home/ubuntu/app/.
 - `S3_ENDPOINT_URL`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`.
 - `BREVO_API_KEY`, `EMAIL_FROM` (or the SMTP set).
 - `ADMIN_API_KEY`.
-- `APP_ENV=production`, `DOCS_ENABLED=false`.
+- `APP_ENV=production`, `DOCS_ENABLED=false`. Both are the defaults now, so an unset value
+  never switches on development behaviour.
+- `DATABASE_URL`, `REDIS_URL`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` have no
+  default: the API refuses to start without them.
 - `METRICS_AUTH_USER`, `METRICS_AUTH_HASH` — read by **Caddy**, never by the app. Basic auth
   for the Netdata dashboard (section 12). Caddy refuses to start without the hash, on purpose.
+- `METRICS_ALLOW_CIDR` — read by **Caddy**. Optional source allow-list for the status site
+  (section 12).
+
+`FORWARDED_ALLOW_IPS` is **not** in `.env`. `docker-compose.prod.yml` sets it to Caddy's
+fixed address on the `edge` network, which is the only peer whose `X-Forwarded-For` the API
+believes. The per-IP rate limits and the admin lockout key on the address that yields, so it
+must never be `*`.
 - **`PUBLIC_BASE_URL=https://api.example.com`** — the base of every user-facing link
   (invites, password-reset redirect). `APP_CORS_ORIGINS` already lists the Tauri client
   origins and does not change.
@@ -962,9 +1028,14 @@ Check, in order:
 - **Auth works end to end** — sign in via Supabase, then call an authenticated route with
   `Authorization: Bearer <jwt>` and `X-Device-Id: <id>`. A 401 here almost always means a
   JWT config mismatch (section 13).
-- **WebSocket connects and stays open**: `wss://api.example.com/ws?token=<jwt>&device_id=<id>`.
-- If `ADMIN_API_KEY` is set, `/internal/metrics` with `X-Admin-Key` returns 200 (503 means
-  the key is unset).
+- **WebSocket connects and stays open**: `wss://api.example.com/ws`, then send
+  `{"type":"auth","token":"<jwt>","device_id":"<id>"}` as the first message and expect
+  `{"type":"auth_ok"}`. A close with code 4401 means the token or the device was refused.
+- **`/internal/*` is closed to the internet**: `curl -i https://api.example.com/internal/v1/stats`
+  returns 404 from Caddy.
+- If `ADMIN_API_KEY` is set, `/internal/metrics` answers 200 **from inside the box** (503
+  means the key is unset):
+  `docker compose -f docker-compose.prod.yml exec api python -c "import os,urllib.request as u; print(u.urlopen(u.Request('http://127.0.0.1:8000/internal/metrics', headers={'X-Admin-Key': os.environ['ADMIN_API_KEY']})).status)"`
 
 Also run the drills. **Deploy** — push a trivial change (or `deploy/deploy.sh --force`) and
 watch the swap; measure the gap rather than assume it:
@@ -1007,6 +1078,26 @@ at `https://status.example.com` behind basic auth, with its metrics database in 
 `netdatalib` volume. It replaced Uptime Kuma, which answered "is it up" and nothing else. Out of the box it charts CPU, memory, disk space and IO, network, pressure
 stall, systemd unit states, and per-container CPU/memory/IO for every service in the stack -
 at one-second resolution, with alarms already defined for the things that matter.
+
+**Host access is narrowed.** The container mounts `/proc`, `/sys`, `/etc/os-release`,
+`/etc/passwd`, `/etc/group`, `/etc/localtime` and `/var/log`, read-only, and not the whole host
+filesystem; it runs with `SYS_PTRACE` only, without `SYS_ADMIN` or `apparmor:unconfined`.
+Two things those used to buy are expected to go: per-mount disk-space charts for host
+filesystems (the old `/host/root` mount) and mapping container network interfaces to
+container names. After the first deploy with this change, open the dashboard and check that
+the root filesystem still has a disk-space chart and alarm. If it does not, and you want the
+disk-full alarm back, re-add `- /:/host/root:ro,rslave` to the `netdata` volumes in
+`docker-compose.prod.yml`, knowing it gives the agent read access to every file on the box.
+
+**Restrict who can reach it.** `METRICS_ALLOW_CIDR` in `.env` is a space-separated list of
+source ranges Caddy lets through to the status site; everyone else gets 403 before basic
+auth. Unset, it allows everyone. To limit it to your own address:
+
+```bash
+cd ~/app
+echo 'METRICS_ALLOW_CIDR=203.0.113.7/32 2001:db8::/64' >> .env
+./deploy/deploy.sh --force
+```
 
 **Basic auth is not optional.** The agent dashboard has no login of its own and reports
 processes, listening ports, disk layout and container internals. Published bare, it is a free

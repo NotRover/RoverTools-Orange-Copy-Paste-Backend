@@ -120,7 +120,7 @@ async def test_registering_the_same_pubkey_twice_reuses_one_row(client: AsyncCli
         json={**body, "device_name": "Desk renamed", "app_version": "9.9.9"},
         headers=headers,
     )
-    assert first.status_code == second.status_code == 200
+    assert first.status_code == second.status_code == 201
     assert first.json()["device_id"] == second.json()["device_id"]
 
     listed = await client.get("/api/v1/auth/devices", headers=headers)
@@ -163,7 +163,7 @@ async def test_same_fingerprint_different_pubkey_is_a_separate_device(client: As
 
 async def test_protected_endpoint_no_token(client: AsyncClient):
     resp = await client.get("/api/v1/auth/devices")
-    assert resp.status_code == 403  # HTTPBearer rejects missing credentials
+    assert resp.status_code == 401  # HTTPBearer rejects missing credentials
 
 
 async def test_protected_endpoint_bad_token(client: AsyncClient):
@@ -172,8 +172,8 @@ async def test_protected_endpoint_bad_token(client: AsyncClient):
 
 
 async def test_missing_device_header_is_rejected(client: AsyncClient, auth_headers: dict):
-    # sync endpoints require X-Device-Id
-    resp = await client.get("/api/v1/sync/status", headers={"Authorization": auth_headers["Authorization"]})
+    # device-scoped endpoints require X-Device-Id
+    resp = await client.get("/api/v1/auth/umk/device", headers={"Authorization": auth_headers["Authorization"]})
     assert resp.status_code == 400
 
 

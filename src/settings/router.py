@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database import get_db
 from src.dependencies import get_current_user_id, get_redis
+from src.limiter import limiter
 from src import realtime as rt
 from src.settings import service
 from src.settings.schemas import SettingsOut, SettingsPutRequest, SettingsPutResponse
@@ -28,7 +29,9 @@ async def get_settings(
 
 
 @router.put("", response_model=SettingsPutResponse)
+@limiter.limit("60/minute")
 async def put_settings(
+    request: Request,
     body: SettingsPutRequest,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),

@@ -24,7 +24,7 @@ engine = create_async_engine(
     pool_size=5,
     max_overflow=10,
     pool_pre_ping=True,
-    echo=settings.app_env == "development",
+    echo=settings.sql_echo_enabled,
     connect_args=_connect_args(settings.database_url),
 )
 

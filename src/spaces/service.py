@@ -302,7 +302,9 @@ async def add_membership(
 
 async def remove_member(
     db: AsyncSession, space_id: uuid.UUID, target_user_id: uuid.UUID, requesting_user_id: str
-) -> None:
+) -> bool:
+    """Returns whether a membership was actually deleted. Leaving a space you are
+    not in is a no-op, and the caller announces nothing for it."""
     rid = uuid.UUID(requesting_user_id)
     s = await db.scalar(select(Space).where(Space.id == space_id))
     if not s:
@@ -321,7 +323,7 @@ async def remove_member(
         )
     )
     if not m:
-        return
+        return False
 
     await db.delete(m)
     # A departure invalidates the Space Key: clear the other members' wrapped
@@ -354,15 +356,21 @@ async def remove_member(
     for inv in pending.all():
         inv.wrapped_space_keys = None
     await db.commit()
+    return True
 
 
-async def delete_space(db: AsyncSession, space_id: uuid.UUID, user_id: str) -> None:
-    uid = uuid.UUID(user_id)
+async def require_owned_space(db: AsyncSession, space_id: uuid.UUID, user_id: str) -> Space:
+    """The space, if the caller owns it; 404 / 403 otherwise."""
     s = await db.scalar(select(Space).where(Space.id == space_id))
     if not s:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Space not found")
-    if s.owner_id != uid:
+    if s.owner_id != uuid.UUID(user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
+    return s
+
+
+async def delete_space(db: AsyncSession, space_id: uuid.UUID, user_id: str) -> None:
+    s = await require_owned_space(db, space_id, user_id)
     await db.delete(s)
     await db.commit()
 
@@ -383,6 +391,15 @@ async def distribute_keys(
     relaying a ring has nothing new to declare, and writing here would let it
     redefine what everyone else verifies against - which is the check that catches
     a bad ring in the first place.
+
+    Nor may a member overwrite a wrap somebody already holds: a non-owner writes
+    only onto a member row whose `wrapped_space_keys` is NULL, and never onto the
+    owner's. Filling a gap is all a relay is for, and an overwrite is how a
+    member would swap a working ring for one that is not this space's - the
+    owner's wrap especially, since it is the owner's only copy of the ring across
+    a restart. The owner may write any row. Rows the caller may not write are
+    skipped, like rows for people who are not members, rather than failing the
+    batch: a reconcile racing another keyholder is ordinary.
 
     `wrapped_by` records the caller so the recipient knows whose public key to
     compute its shared secret against.
@@ -413,6 +430,8 @@ async def distribute_keys(
             )
         )
         if not m:
+            continue
+        if not is_owner and (m.user_id == s.owner_id or m.wrapped_space_keys is not None):
             continue
         m.wrapped_space_keys = entry.wrapped_space_keys
         m.wrapped_by = uid
@@ -490,8 +509,9 @@ async def remove_entry_from_space(
     """Take a shared entry down from a space. Returns the recorded author id.
 
     Two callers, one effect. The space owner may take down anything in the space
-    (moderation); any member may take down what they themselves shared
-    (unsharing). Nobody else gets to touch it.
+    (moderation); any current member may take down what they themselves shared
+    (unsharing). Nobody else gets to touch it, and a non-member gets the same
+    404 whether or not the entry is there.
 
     Moderation, not deletion: the space id and its wrapped copy of the CEK are
     dropped from the entry, so the space stops carrying it and future members
@@ -507,9 +527,21 @@ async def remove_entry_from_space(
     the comment at the selection below.
     """
     uid = uuid.UUID(user_id)
+    # One answer for every way this can miss - no such space, not a member of
+    # it, no such entry in it - so the route cannot be used to learn which
+    # spaces exist or what is in a space the caller cannot see.
+    not_found = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not in this space")
     s = await db.scalar(select(Space).where(Space.id == space_id))
     if not s:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Space not found")
+        raise not_found
+    if s.owner_id != uid:
+        member = await db.scalar(
+            select(SpaceMembership.user_id).where(
+                SpaceMembership.space_id == space_id, SpaceMembership.user_id == uid
+            )
+        )
+        if member is None:
+            raise not_found
 
     rows = await db.scalars(
         select(SyncEntry).where(
@@ -520,7 +552,7 @@ async def remove_entry_from_space(
     )
     matched = rows.all()
     if not matched:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not in this space")
+        raise not_found
 
     # A non-owner may only take down rows they wrote. Narrowing rather than
     # rejecting outright keeps the owner path untouched: they still clear every
