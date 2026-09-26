@@ -1,19 +1,15 @@
-# Contributing to the RoverTools' Orange Copy Paste backend
+# Contributing to the Orange Copy Paste sync server
 
-This repository is the **cloud-sync backend** for Orange Copy Paste, the cross-device
-clipboard app: a FastAPI service backed by Supabase (Postgres + auth),
-Redis, and S3/R2 object storage. It is a stateless relay and store — it verifies
-tokens, persists ciphertext, fans out changes over WebSocket, and brokers blob
-storage. It never sees plaintext or key material.
-
-If you are a *user* of the app, see https://orange-copy-paste-app.pages.dev.
-This file is for people building or changing the backend.
+This file is for people changing the sync server. What the server is and how to
+run it locally is in the [README](README.md). To use the app, see the
+[user guide](https://orange-copy-paste-app.pages.dev/docs/) instead.
 
 ## Ways to contribute
 
 - Report a bug or request a feature by opening an issue.
 - Fix a bug or build a feature via a pull request.
-- Improve the docs in `docs/`.
+- Improve the docs in `docs/`. Every doc and every message a person reads follows
+  the workspace [writing guide](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-App/blob/main/docs/writing-docs.md).
 
 For anything larger than a small fix, open an issue first so we can agree on the
 approach.
@@ -31,7 +27,7 @@ approach.
 | `tests/` | pytest suite, one module per domain |
 
 Routers stay thin: HTTP concerns in the route, logic in the domain service.
-Never hardcode route prefixes — they come from `src/version.py`.
+Never hardcode route prefixes; they come from `src/version.py`.
 
 ## Getting set up
 
@@ -75,7 +71,10 @@ Run the tests for any logic change:
 uv run pytest
 ```
 
-`ruff` and `ty` are not on the venv PATH — always invoke them through `uv run`.
+`ruff` and `ty` are not on the venv PATH, so always run them through `uv run`.
+
+For a docs change, or any text a person reads (emails, web pages, error messages),
+run the checklist at the end of the writing guide.
 
 Please also:
 
@@ -95,7 +94,7 @@ deliberate step, not automatically on deploy.
 
 `docs/architecture.md` is the source of truth for everything that crosses the
 wire. A change to a payload, route, socket event, or the crypto envelope means a
-change to the client as well — coordinate both. Update `docs/architecture.md` in
+change to the client as well, so coordinate both. Update `docs/architecture.md` in
 the same pull request as the code that changes the contract.
 
 ## License

@@ -1,45 +1,30 @@
-# RoverTools' Orange Copy Paste — Backend
+# Orange Copy Paste: sync server
 
-The cloud-sync API behind the [Orange Copy Paste desktop app](../orange-copy-paste-clipboard-app-rust): a FastAPI service that stores encrypted clipboard entries and notes, fans changes out to a user's devices in real time, and brokers sharing between users.
+The sync server for the [Orange Copy Paste desktop app](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-App): a FastAPI service that stores users' encrypted clipboard entries and notes, sends changes to their other devices as they happen, and handles sharing between people in spaces.
 
-It is a **stateless relay and store**. All encryption happens on the client, so the server holds ciphertext, public keys, and opaque wrapped keys — never plaintext, and never a key it could decrypt with. It also never issues identity tokens: Supabase Auth signs them, this service only verifies them.
+![A shared space in the app](https://raw.githubusercontent.com/NotRover/RoverTools-Orange-Copy-Paste-App/main/docs/images/spaces.png)
 
-- **Runtime:** Python 3.14+, FastAPI + uvicorn, managed with `uv`
-- **Data:** Supabase Postgres via SQLAlchemy async + asyncpg, migrations with Alembic
-- **Realtime:** WebSocket fan-out over Redis pub/sub
-- **Blobs:** S3-compatible object storage (Cloudflare R2 in production, MinIO in dev)
-- **Auth:** Supabase Auth (GoTrue) JWTs, verified with PyJWT
+It is a **stateless relay and store**. The app encrypts everything before sending it, so this server holds encrypted items, public keys and locked keys, and never a key that could open them. It does not sign anyone in either: Supabase Auth issues the tokens, and this server only checks them.
 
-**Documentation:** the wire contract lives in [`docs/architecture.md`](docs/architecture.md); a friendlier self-hosting guide and the rest of the docs are at **[orange-copy-paste-app.pages.dev](https://orange-copy-paste-app.pages.dev)**. This service is one of three repos — see [Related repositories](#related-repositories).
+- **Runtime:** Python 3.14 or newer, FastAPI and uvicorn, managed with `uv`.
+- **Data:** Supabase Postgres through async SQLAlchemy and asyncpg, with Alembic migrations.
+- **Live updates:** WebSockets, fanned out across server copies through Redis pub/sub.
+- **Files:** S3-compatible storage: Cloudflare R2 in production, MinIO in development.
+- **Auth:** Supabase Auth tokens, checked with PyJWT.
 
----
-
-## Table of contents
-
-- [Architecture at a glance](#architecture-at-a-glance)
-- [Getting started](#getting-started)
-- [Configuration](#configuration)
-- [API surface](#api-surface)
-- [The client contract](#the-client-contract)
-- [Project structure](#project-structure)
-- [Development](#development)
-- [Deployment](#deployment)
-- [Related repositories](#related-repositories)
-- [Further reading](#further-reading)
-
----
+The exact contract with the app, route by route, is in [`docs/architecture.md`](docs/architecture.md). To run your own instance for real use, follow [Self-hosting](https://orange-copy-paste-app.pages.dev/docs/developers/self-hosting/).
 
 ## Architecture at a glance
 
 ```mermaid
 flowchart LR
-    C["Desktop client"]
+    C["Desktop app"]
     F["FastAPI"]
-    PG["Postgres<br/>ciphertext, keys, membership"]
-    R["Redis<br/>pub/sub fan-out, device presence"]
-    S["S3 / R2<br/>presigned blob upload & download"]
+    PG["Postgres<br/>encrypted items, keys, membership"]
+    R["Redis<br/>fan-out, device presence"]
+    S["S3 / R2<br/>file upload and download"]
     C -- "HTTPS" --> F
-    C -- "WSS /ws" --> F
+    C -- "WSS" --> F
     F --> PG
     F --> R
     F --> S
@@ -52,191 +37,150 @@ flowchart LR
     class PG,R,S store
 ```
 
-- **Auth is delegated.** The client authenticates against Supabase directly and attaches the resulting access token to every call here. This service verifies it — asymmetric ES256/RS256 against the project's JWKS, or legacy HS256 for older projects — and reads `sub` as the user id. There is no login, refresh, or password route on this server.
-- **Sync is last-write-wins.** Entries are keyed by `(user_id, client_id, entry_type)` and resolved on `updated_at`. Deletes are tombstones — a push carrying `deleted_at` — so there is deliberately no delete route, and a tombstone always wins a conflict.
-- **Realtime is horizontal.** Each process holds its own WebSocket connections and subscribes to Redis (`user:*`, `space:*`). Any process can publish, so every replica delivers, and the API scales out behind a load balancer without sticky sessions.
-- **Blobs bypass the API.** Large attachments are uploaded straight to object storage through presigned URLs; the service only issues them, tracks quota, and reaps unconfirmed uploads.
-- **Background work runs in-process.** One replica wins a Postgres advisory lock and becomes the leader, sweeping expired device presence every minute and orphaned blobs hourly. No Celery, no beat scheduler.
+- **Sign-in is Supabase's job.** The app signs in with Supabase directly and sends the resulting token with every request. This server checks it against the project's published keys, or the legacy shared secret on older projects. There is no login, refresh or password route here.
+- **The newest edit wins.** When two devices change the same item, the later edit is kept. Deletes are markers on the item rather than a delete route, and a delete always wins a conflict.
+- **Live updates scale out.** Each server copy holds its own WebSocket connections and listens on Redis, and any copy can publish, so every copy delivers. No sticky sessions are needed behind a load balancer.
+- **Files skip the server.** The app uploads and downloads files directly from storage through short-lived links. The server only issues the links, tracks quota, and cleans up uploads that were never confirmed.
+- **Background work runs in-process.** One copy takes a Postgres lock and becomes the leader: it clears stale device presence every minute and orphaned files every hour. There is no separate job queue.
 
----
+## Run it locally
 
-## Getting started
+You need Python 3.14 or newer, [`uv`](https://docs.astral.sh/uv/), Docker, and a Supabase project for sign-in.
 
-**Prerequisites:** Python 3.14+, [`uv`](https://docs.astral.sh/uv/), and Docker (for the local Postgres/Redis/MinIO stack).
+1. Copy the example settings and set `SUPABASE_URL` to your project's URL. The other values have working local defaults.
+   ```bash
+   cp .env.example .env
+   ```
+2. Start the server with Postgres, Redis and MinIO beside it. The API listens on port 8000, and the MinIO console on port 9001 (`minioadmin` / `minioadmin`).
+   ```bash
+   docker-compose up
+   ```
+   Or run the API on your computer against those services:
+   ```bash
+   uv run uvicorn src.main:app --reload
+   ```
+3. Create the tables:
+   ```bash
+   uv run alembic upgrade head
+   ```
+4. Check it is running:
+   ```bash
+   curl http://localhost:8000/internal/healthz
+   ```
+   A healthy server answers with status 200.
 
-```bash
-cp .env.example .env
-```
+To browse the API at `/api/docs` (Swagger), `/api/redoc`, or the schema at `/api/openapi.json`, set `DOCS_ENABLED=true` in `.env`. It is off by default, so a deployment never publishes them by accident.
 
-Fill in at minimum `SUPABASE_URL` — the rest have working local defaults. Then bring up the full stack:
-
-```bash
-docker-compose up
-```
-
-That starts the API on `:8000` plus Postgres, Redis, and MinIO (console at `:9001`, `minioadmin`/`minioadmin`), and creates the blob bucket. Alternatively run the API on the host against those services:
-
-```bash
-uv run uvicorn src.main:app --reload
-```
-
-Apply migrations before first use:
-
-```bash
-uv run alembic upgrade head
-```
-
-Then check it's alive:
-
-```bash
-curl http://localhost:8000/internal/healthz
-```
-
-Interactive docs are at `/api/docs` (Swagger) and `/api/redoc`, with the schema at
-`/api/openapi.json`. All three need `DOCS_ENABLED=true` (already set in
-`.env.example`); without it they return 404, so a deployment never publishes them
-by accident.
-
-> **Blob testing gotcha:** inside Compose the API signs URLs pointing at the `minio` hostname, which a desktop client on your host cannot resolve. To exercise uploads end-to-end from the real app, run the API on the host with `S3_ENDPOINT_URL=http://localhost:9000`.
-
----
+To test file uploads from the real app, run the API on your computer rather than in Docker, with `S3_ENDPOINT_URL=http://localhost:9000`. Inside Docker, upload links point at the `minio` host name, which the app on your computer cannot reach.
 
 ## Configuration
 
-All settings come from environment variables (or `.env`) via `pydantic-settings`; see `src/config.py` for defaults and [`.env.example`](.env.example) for annotated guidance.
+All settings come from environment variables or `.env`. Defaults are in `src/config.py`, and each variable is explained in [`.env.example`](.env.example).
 
-| Variable | Purpose |
+| Variable | What it is for |
 | --- | --- |
-| `DATABASE_URL` | Postgres connection string with the asyncpg driver. Use Supabase's **connection pooler** host in production. |
-| `REDIS_URL` | Pub/sub fan-out and device presence. `redis://:<pw>@redis:6379/0` in the prod compose network; `rediss://` for a TLS endpoint. |
-| `SUPABASE_URL` | Required. Identifies the project and derives the JWKS endpoint used to verify tokens. |
-| `SUPABASE_JWT_SECRET` | Legacy HS256 secret. Leave blank for projects created from 2025-10-01 onward, which sign asymmetrically. Both schemes are accepted, so a project mid-migration works. |
-| `SUPABASE_JWT_AUDIENCE` | Expected `aud` claim, default `authenticated`. |
-| `SUPABASE_SERVICE_ROLE_KEY` | Server-only. Enables admin ban/delete through the Supabase Admin API. Never expose to clients. |
-| `S3_ENDPOINT_URL`, `S3_BUCKET`, `AWS_*` | Object storage for attachment blobs. |
-| `APP_CORS_ORIGINS` | Comma-separated allowed origins, e.g. `tauri://localhost,http://localhost:1420`. |
-| `DEFAULT_BLOB_QUOTA_BYTES` | Per-user storage quota, default 50 MB; overridable per user via the admin API. |
-| `EMAIL_PROVIDER`, `BREVO_API_KEY` / `SMTP_*`, `EMAIL_FROM` | Outbound mail for sharing invites only — verification and password reset belong to Supabase. |
-| `ADMIN_API_KEY` | Gate for `/internal/metrics` and `/internal/v1/*`. Leave empty to disable those endpoints (they return 503). |
+| `DATABASE_URL` | Postgres connection with the asyncpg driver. Use Supabase's connection pooler in production. |
+| `REDIS_URL` | Fan-out and device presence. Use `rediss://` for a TLS endpoint. |
+| `SUPABASE_URL` | Required. Identifies the project, and where its token-signing keys are published. |
+| `SUPABASE_JWT_SECRET` | Legacy shared secret. Leave it blank for projects that sign tokens with published keys; both kinds are accepted. |
+| `SUPABASE_JWT_AUDIENCE` | The expected token audience, `authenticated` by default. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Server only. Lets admin tools ban or delete accounts. Never give it to an app. |
+| `S3_ENDPOINT_URL`, `S3_BUCKET`, `AWS_*` | File storage. |
+| `APP_CORS_ORIGINS` | Allowed origins, comma separated. |
+| `DEFAULT_BLOB_QUOTA_BYTES` | File storage per user, 50 MB by default, and changeable per user through the admin API. |
+| `EMAIL_PROVIDER`, `BREVO_API_KEY` or `SMTP_*`, `EMAIL_FROM` | Email for space invites only. Supabase sends sign-up and password emails. |
+| `ADMIN_API_KEY` | Unlocks the metrics and admin endpoints. Leave it empty to turn them off. |
+| `DOCS_ENABLED` | Serves the interactive API docs. Off by default. |
 
----
+## What the API covers
 
-## API surface
+Product routes are versioned and get their prefixes from `src/version.py`; health and metrics probes are not versioned, because load balancers and scrapers hard-code their paths.
 
-Product endpoints are versioned under `/api/v1`; infrastructure probes deliberately are not, because load balancers and metrics scrapers hardcode their paths. Prefixes come from `src/version.py` — never hardcode `/api/v1`. Every response carries an `X-API-Version` header.
+- **auth:** account setup, storing the locked master key and recovery copy, device registration, and public keys.
+- **sync:** push, pull and a per-type breakdown.
+- **settings:** one encrypted settings blob per user.
+- **blobs:** file upload and download links, confirmation, and quota.
+- **spaces** and **invites:** spaces, membership, join requests, invites, and handing out space keys.
+- **realtime:** the WebSocket that carries live changes and presence.
+- **ops and admin:** health and metrics probes, and a management API behind an admin key.
 
-The domains, at a glance:
+Every route, payload and socket event is in [`docs/architecture.md`](docs/architecture.md). This README leaves them out on purpose, so it cannot drift from the contract.
 
-- **auth** — account bootstrap, master-key and recovery-key storage, device registration, public-key registration and per-device key wrapping.
-- **sync** — push, pull, cursor, and a per-type breakdown; last-write-wins.
-- **settings** — one encrypted per-user settings blob.
-- **blobs** — presigned upload/download, confirm/release, and quota.
-- **spaces** — shared spaces, membership, and space-key distribution.
-- **invites** — space invitations: list, accept, decline, revoke, and key delivery.
-- **realtime** — the `/ws` WebSocket, authenticated with `?token=<jwt>&device_id=<id>`; events are published to `user:{id}` and `space:{id}` channels (`sync:entry`, `space:membership_changed`, `space:rekey`, `invite:*`, and presence) and carry an origin device so a client never re-applies its own write.
-- **ops / admin** — unversioned `/internal` probes and metrics, and the versioned `/internal/v1` management API behind `X-Admin-Key`.
+## Rules shared with the app
 
-The full, current endpoint list, payload shapes, and event protocol live in
-[`docs/architecture.md`](docs/architecture.md) — the source of truth for the wire
-contract. This overview intentionally does not restate them, so it cannot drift.
+Changing one side means changing the other, and updating `docs/architecture.md` in the same change.
 
----
-
-## The client contract
-
-These bind this service to the desktop app. Changing one side means changing the other.
-
-- **Every device-scoped route needs both** `Authorization: Bearer <jwt>` and an `X-Device-Id` header; the WebSocket takes the same pair as query parameters. Token parsing lives once in `src/dependencies.py` — routes depend on it rather than re-parsing.
-- **`entry_type` is singular** — `"clipboard"` or `"note"`.
-- **Deletes are tombstones.** Push with `deleted_at` set; tombstones beat any concurrent edit regardless of timestamp.
-- **The server cannot read content.** Entry bodies are AES-256-GCM ciphertext bound to their `client_id` as AAD. It stores the user's password-wrapped master key, per-device wrapped copies, and X25519-wrapped group keys — all opaque blobs it has no key for.
-- **Space keys are distributed, not derived.** A random per-space key is wrapped separately for each member's public key; membership changes trigger a `space:rekey` event rather than any server-side key handling.
-
-The definitive reference for payload shapes, data models, and the event protocol is [`docs/architecture.md`](docs/architecture.md).
-
----
+- Routes that act for a device need both the sign-in token and the device's ID. Checking them lives once, in `src/dependencies.py`; routes depend on it instead of reading tokens themselves.
+- Deletes are markers on the item, never a delete route.
+- The server cannot read content, and holds no key that could open it.
+- Space keys are made by the app and locked for each member. Changing members triggers a new key from the app, never key handling on the server.
 
 ## Project structure
 
 ```text
 src/
-├─ main.py              # app composition: middleware, routers, lifespan (Redis + maintenance)
-├─ version.py           # single source for API/service versions and route prefixes
-├─ config.py            # pydantic-settings configuration
-├─ dependencies.py      # JWT verification + X-Device-Id extraction (shared by every route)
-├─ middleware.py        # security headers, X-API-Version
-├─ database.py          # async engine + session dependency
-├─ redis_client.py      # connection pool lifecycle
-├─ limiter.py           # slowapi rate limiter instance
-├─ background.py        # leader-elected maintenance: presence sweep, orphan blob cleanup
-├─ realtime.py          # /ws endpoint, in-process hub, Redis pub/sub fan-out, presence
-├─ email.py             # Brevo / SMTP delivery for invites
-├─ supabase_admin.py    # Supabase Admin API calls (ban, delete)
-├─ auth/                # profiles, bootstrap, devices, public keys; tokens.py verifies JWTs
-├─ sync/                # push/pull/cursor/breakdown + last-write-wins service
-├─ settings/            # encrypted per-user settings blob
-├─ spaces/              # spaces, invites, join approval, space-key distribution
-├─ blobs/               # presigned upload/download (s3.py), quota accounting
-├─ announcements/       # server-authored messages to users
-├─ admin/               # probes and the versioned management API
-└─ web/                 # human-facing HTML pages (templates/)
+|- main.py              app setup: middleware, routes, startup and shutdown
+|- version.py           API and service versions, and route prefixes
+|- config.py            settings
+|- dependencies.py      token and device checks, shared by every route
+|- middleware.py        security headers, the API version header
+|- database.py          database engine and sessions
+|- redis_client.py      Redis connection pool
+|- limiter.py           rate limiting
+|- background.py        leader-only maintenance: presence and orphaned files
+|- realtime.py          WebSocket endpoint, fan-out, presence
+|- email.py             invite email through Brevo or SMTP
+|- supabase_admin.py    Supabase admin calls (ban, delete)
+|- auth/                accounts, setup, devices, public keys; tokens.py checks tokens
+|- sync/                push, pull and conflict handling
+|- settings/            the encrypted settings blob
+|- spaces/              spaces, invites, join requests, key handover
+|- blobs/               file links and quota
+|- announcements/       messages from the server to users
+|- admin/               probes and the management API
+`- web/                 web pages people open in a browser (templates/)
 
-migrations/versions/    # Alembic 0001…0019
-tests/                  # pytest: auth, sync, blobs, space invites, announcements
-docs/                   # architecture.md, DEPLOY.md, ANNOUNCEMENTS.md
+migrations/versions/    Alembic migrations
+tests/                  pytest, one module per area
+docs/                   architecture.md, DEPLOY.md, ANNOUNCEMENTS.md
 ```
 
-Routers stay thin — HTTP concerns in the route, logic in the domain service beside it.
+Routes stay thin: HTTP handling in the route, logic in the service beside it.
 
----
-
-## Development
+## Develop
 
 | Task | Command |
 | --- | --- |
 | Lint | `uv run ruff check src` |
-| Types | `uv run ty check src` |
-| Tests | `uv run pytest` |
-| Run locally | `uv run uvicorn src.main:app --reload` |
-| New migration | `uv run alembic revision -m "description"` |
-| Apply migrations | `uv run alembic upgrade head` |
+| Check types | `uv run ty check src` |
+| Run the tests | `uv run pytest` |
+| Run the server with reload | `uv run uvicorn src.main:app --reload` |
+| Write a new migration | `uv run alembic revision -m "description"` |
+| Apply migrations locally | `uv run alembic upgrade head` |
 
-`ruff` and `ty` are not on the venv `PATH` — always go through `uv run`. Both must come back clean on any Python change; tests cover logic changes. Suppressing an error with `# type: ignore` is only acceptable for a documented third-party-stub false positive.
+Always go through `uv run`: `ruff` and `ty` are not on the virtual environment's path. Both must pass for any Python change, and logic changes need tests. `# type: ignore` is only acceptable for a documented false positive in a third-party library's types.
 
-Tests replace Redis with `fakeredis` and mint their own HS256 tokens, but they do need a reachable Postgres — `TEST_DATABASE_URL`, defaulting to a `clipboard_test` database on localhost. Create it once against the Compose Postgres:
+The tests replace Redis with `fakeredis` and make their own tokens, but they need a Postgres database named `clipboard_test`, or whatever `TEST_DATABASE_URL` points at. Create it once:
 
 ```bash
 docker-compose exec db createdb -U postgres clipboard_test
 ```
 
-> **Migrations are written, never auto-applied.** Author the revision, but applying it to any real database is a separate, explicitly approved step.
-
----
+**Deploying never applies migrations.** Write them freely, but applying one to a real database is a separate, deliberate step.
 
 ## Deployment
 
-The backend is self-hosted on a small VPS in Docker: Caddy (TLS + reverse proxy) in front of the stateless FastAPI service, with Redis co-located for realtime fan-out and presence. Supabase (Postgres + Auth) and Cloudflare R2 (blobs) stay external. Deploys are pull-based with no CI service or registry: a systemd timer on the box polls `main`, and on a new commit it builds the image locally and recreates the container. There is one replica, so a deploy has a ~1-3s window where a request can get a 502 and realtime clients reconnect once — accepted deliberately rather than running an overlap tool ([`docs/DEPLOY.md`](docs/DEPLOY.md)).
+Production runs in Docker on a small server: Caddy for TLS in front of the FastAPI service, with Redis beside it. Supabase and Cloudflare R2 are external. A timer on the server checks `main`, and on a new commit builds the image there and restarts the container. With one copy running, a deploy can drop requests for a second or two and make live connections reconnect once; that trade-off is deliberate. The `Dockerfile` also runs as-is under plain `docker run`.
 
-The `Dockerfile` builds from the lockfile and honours `$PORT`, so the image also runs unchanged under plain `docker run`. The full walkthrough — provisioning Supabase and R2, applying migrations, the compose/Caddy/deploy setup, verification, and pointing the desktop app at it — is in [`docs/DEPLOY.md`](docs/DEPLOY.md), with a friendlier version on the [docs site](https://orange-copy-paste-app.pages.dev).
-
----
-
-## Related repositories
-
-The backend is one of three code repositories. It is a submodule of the workspace (App) repo, whose GitHub Releases carry the desktop app's downloads and update feed.
-
-| Repository | What it is |
-| --- | --- |
-| [Orange-Copy-Paste-App](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-App) | The desktop app and workspace — the client of this API |
-| **[Orange-Copy-Paste-Backend](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-Backend)** | This service |
-| [Orange-Copy-Paste-Website](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-Website) | The docs and marketing site |
-
----
+The full setup, from Supabase and R2 to migrations, Caddy and the deploy timer, is in [`docs/DEPLOY.md`](docs/DEPLOY.md). A shorter public version is [Self-hosting](https://orange-copy-paste-app.pages.dev/docs/developers/self-hosting/).
 
 ## Further reading
 
-- **[orange-copy-paste-app.pages.dev](https://orange-copy-paste-app.pages.dev)** — the public site: end-user guides and the Developers section (including a sanitized self-hosting guide).
-- [`docs/architecture.md`](docs/architecture.md) — system overview, service boundaries, data models, full API and WebSocket event reference. The source of truth for the wire contract.
-- [`docs/DEPLOY.md`](docs/DEPLOY.md) — self-hosting: deployment and ongoing operations, with placeholders for your own host, domain, and secrets.
-- [`docs/ANNOUNCEMENTS.md`](docs/ANNOUNCEMENTS.md) — sending a message to users from the server: the calls, the fields, and how to word one.
-- Client repo `docs/architecture.md` — how the desktop app consumes this API.
+- [`docs/architecture.md`](docs/architecture.md): routes, payloads, data model and socket events. The reference for the contract.
+- [`docs/DEPLOY.md`](docs/DEPLOY.md): how the production server is set up, deployed and run.
+- [`docs/ANNOUNCEMENTS.md`](docs/ANNOUNCEMENTS.md): how to send a message to users, and how to word it.
+- The app's [architecture doc](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-App/blob/main/orange-copy-paste-clipboard-app-rust/docs/architecture.md): how the app uses this API.
+
+## Contributing
+
+Setup, checks and pull request rules are in [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities as described in [SECURITY.md](SECURITY.md), never in a public issue. See also the [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). Licensed under the [GNU AGPL v3.0](LICENSE).
