@@ -18,8 +18,10 @@ from src.database import Base
 
 config = context.config
 
-# Override sqlalchemy.url from environment if set
-db_url = os.environ.get("DATABASE_URL")
+# Override sqlalchemy.url from environment if set. Stripped, because a secret
+# pasted into GitHub with a trailing newline reaches here intact, and asyncpg
+# then asks for a database named "postgres" plus a line break, which does not exist.
+db_url = (os.environ.get("DATABASE_URL") or "").strip()
 if db_url:
     config.set_main_option("sqlalchemy.url", db_url)
 
