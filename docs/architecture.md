@@ -1166,7 +1166,7 @@ sequenceDiagram
         API->>R: user:{invitee} invite:received
         R-->>I: badge + accept/decline banner
     end
-    API--)I: invite email with short code (best-effort)
+    API--)I: invite email, no code or link (best-effort)
     I->>API: POST /invites/{id}/accept
     API->>API: add membership (history floor), status=accepted
     API->>R: space:{id} + user:{invitee} space:membership_changed

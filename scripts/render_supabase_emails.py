@@ -63,12 +63,13 @@ TEMPLATES = {
     "confirm_signup": (
         "Confirm your email",
         _para(
-            "You signed up for Orange Copy Paste. Confirm this address and your clipboard "
-            "and notes start syncing between your devices, end to end encrypted."
+            "You signed up for Orange Copy Paste. Confirm this address, then sign in on the "
+            "Account screen in the app to start syncing your clipboard and notes between "
+            "your devices, end-to-end encrypted."
         )
         + _button("Confirm email")
         + _fine(
-            "The link works once and expires in 24 hours. If you did not sign up, ignore "
+            "The link works once and expires in an hour. If you did not sign up, ignore "
             "this message and no account is created."
         ),
     ),

@@ -68,7 +68,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Orange Clipboard API",
+    title="Orange Copy Paste API",
     version=SERVICE_VERSION,
     description=(
         "Smart Clipboard backend — cloud sync, realtime sharing, E2E encryption "
