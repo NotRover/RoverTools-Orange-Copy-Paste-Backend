@@ -1,5 +1,6 @@
 """Spaces, short invite codes, addressed invites, rekey-on-remove, shared blobs."""
 
+import asyncio
 import json
 import uuid
 from unittest.mock import patch
@@ -94,10 +95,18 @@ async def distribute(client: AsyncClient, owner: dict, space_id: str, keyrings: 
 
 
 async def _next_event(pubsub, timeout: float = 1.0) -> dict:
-    """The next published event on a subscription, decoded."""
-    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout)
-    assert msg is not None, "nothing was published"
-    return json.loads(msg["data"])
+    """The next published event on a subscription, decoded.
+
+    Reads until a real message arrives. With `ignore_subscribe_messages`, the
+    subscribe confirmation still consumes a read and comes back as None, so a
+    single read can report "nothing" while the event is next in line.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
+        msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=remaining)
+        if msg is not None:
+            return json.loads(msg["data"])
+    raise AssertionError("nothing was published")
 
 
 @pytest.mark.asyncio
