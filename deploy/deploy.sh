@@ -5,7 +5,8 @@
 # out. No GitHub Actions, no registry — the image never leaves the box.
 #
 # Layout on the box (wherever you cloned the repo, e.g. ~/app):
-#   <checkout>/       git checkout (this repo; read-only deploy key ~/.ssh/id_repo)
+#   <checkout>/       git checkout (this repo; read-only fine-grained token in the HTTPS
+#                     origin URL, docs/DEPLOY.md section 5.6)
 #   <checkout>/.env   secrets, git-ignored, mode 600 (survives git reset)
 # Run by:  systemd timer, or by hand:  ~/app/deploy/deploy.sh [--force]
 #   --force rebuilds and redeploys even when origin/main has not moved.
@@ -18,11 +19,6 @@ COMPOSE="docker-compose.prod.yml"
 IMAGE_REPO="rovertools-api"
 KEEP_IMAGES=5
 FORCE="${1:-}"
-
-# Pull with the read-only deploy key by default (manual runs and the timer alike),
-# unless the caller already set GIT_SSH_COMMAND.
-: "${GIT_SSH_COMMAND:=ssh -i $HOME/.ssh/id_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new}"
-export GIT_SSH_COMMAND
 
 # One deploy at a time — a build can outlast the poll interval. Testing fd 9 rather
 # than assuming: an open fd survives exec, so after the re-exec below this process
@@ -43,7 +39,8 @@ BOX="$(hostname)"
 # Deploy notifications, to the same Discord channel Netdata alarms use. The deploy
 # reports on itself rather than relying on something else noticing: a oneshot unit
 # that is inactive between runs is a weak thing to infer health from, and a pipeline
-# that breaks quietly is the failure mode that cost us most this month (section 15).
+# that breaks quietly is the failure mode that cost us most this month (docs/DEPLOY.md
+# section 12, "The deploy reports on itself").
 # Only a real deploy or a failure sends - the ~90s no-op polls stay silent.
 # The webhook is optional: no value means deploys stay silent, never that they fail.
 # Trailing whitespace is stripped because a CR from an editor would corrupt the URL.
@@ -102,7 +99,7 @@ trap 'rc=$?; if (( rc != 0 )); then FIELDS=""; field "Failed at" "$STAGE"; field
 
 # Nothing pings a monitor here: the notify() calls above are the report. A oneshot
 # unit is idle by design, so its systemd state cannot distinguish a healthy pipeline
-# from a stopped timer (section 15).
+# from a stopped timer (docs/DEPLOY.md section 12).
 STAGE="git fetch"
 git fetch --quiet origin main
 LOCAL="$(git rev-parse HEAD)"
@@ -150,7 +147,8 @@ git reset --hard --quiet origin/main
 # Bash reads this script from the handle it opened at startup, so the copy executing
 # right now is the PRE-pull one. Without this, a change to deploy.sh takes effect only
 # on the NEXT poll - and worse, a step added here does nothing on the very deploy that
-# introduced it, silently. That cost three debugging rounds; see section 15.
+# introduced it, silently. That cost three debugging rounds; see docs/DEPLOY.md
+# section 9, "The files".
 # --force because the reset already moved HEAD, so a fresh run would find no diff and
 # quietly no-op. DEPLOY_REEXEC guards against looping if the hash somehow keeps moving.
 if [[ -z "${DEPLOY_REEXEC:-}" && "$SELF_HASH" != "$(sha256sum "$SELF" | cut -d' ' -f1)" ]]; then
@@ -198,7 +196,7 @@ fi
 
 # Ship Netdata config from the repo. It cannot be bind-mounted: the entrypoint
 # copies stock config into /etc/netdata on every start, and a read-only mount under
-# that path makes the cp fail and the container crash-loop (section 15). So the
+# that path makes the cp fail and the container crash-loop (docs/DEPLOY.md section 12). So the
 # files live in git under netdata/conf/ (mirroring /etc/netdata/) and the deploy
 # installs them, which keeps the whole monitoring setup reproducible from the repo
 # rather than retyped into a volume by hand. Secrets stay out: the Discord webhook
@@ -210,7 +208,7 @@ if [[ -n "$(docker compose -f "$COMPOSE" ps -q netdata)" ]]; then
 	# fd 3, not stdin. `docker compose exec` reads stdin even with -T, so a loop fed
 	# through stdin has its remaining filenames eaten by the first exec - the loop then
 	# ends after one iteration, prints nothing and exits 0. That is what shipped the
-	# netdata.conf trim as a no-op (section 15). The inner commands get /dev/null too.
+	# netdata.conf trim as a no-op (commit 96f7768). The inner commands get /dev/null too.
 	while IFS= read -r CFG <&3; do
 		NETDATA_SEEN=$((NETDATA_SEEN + 1))
 		DEST="/etc/netdata/${CFG#netdata/conf/}"

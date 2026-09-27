@@ -13,5 +13,6 @@ Type=oneshot
 User=ubuntu
 WorkingDirectory=/home/ubuntu/app
 ExecStart=/bin/bash /home/ubuntu/app/deploy/deploy.sh
-# deploy.sh defaults GIT_SSH_COMMAND to ~/.ssh/id_repo, so no key path is needed here.
+# git fetch authenticates with the token in the checkout's HTTPS origin URL
+# (docs/DEPLOY.md section 5.6), so no credential is set here.
 TimeoutStartSec=600
