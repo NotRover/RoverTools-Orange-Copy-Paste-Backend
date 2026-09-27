@@ -530,7 +530,7 @@ async def remove_entry_from_space(
     # One answer for every way this can miss - no such space, not a member of
     # it, no such entry in it - so the route cannot be used to learn which
     # spaces exist or what is in a space the caller cannot see.
-    not_found = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not in this space")
+    not_found = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That item is no longer in this space. Refresh the space to update the list.")
     s = await db.scalar(select(Space).where(Space.id == space_id))
     if not s:
         raise not_found
@@ -562,7 +562,7 @@ async def remove_entry_from_space(
         if not matched:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only the space owner or the member who shared it can remove this",
+                detail="Only the space owner or the member who shared this item can remove it.",
             )
 
     # Whose entry this was. Rows are keyed `(user_id, client_id, entry_type)`, so
@@ -725,7 +725,7 @@ async def delete_comment(
     if row.author_id != uid and s.owner_id != uid:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the space owner or the member who wrote it can delete this comment",
+            detail="Only the space owner or the member who wrote this comment can delete it.",
         )
 
     # Detached copy: the caller needs the fields after the row is gone.

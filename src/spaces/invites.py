@@ -200,10 +200,7 @@ async def create_invite(
     if recently_sent:
         return out
     inviter = await db.scalar(select(Profile).where(Profile.id == inviter_uuid))
-    code = spaces_service.format_invite_code(space.invite_code or "")
-    background.add_task(
-        email.send_sharing_invite, normalized, "", inviter.display_name if inviter else "", code
-    )
+    background.add_task(email.send_sharing_invite, normalized, "", inviter.display_name if inviter else "")
     return out
 
 
