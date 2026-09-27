@@ -16,7 +16,6 @@ from html import escape
 import httpx
 
 from src.config import settings
-from src.spaces import service as spaces_service
 from src.web import router as web
 
 logger = logging.getLogger(__name__)
@@ -67,7 +66,7 @@ def _send_brevo(to_address: str, subject: str, html_body: str, text_body: str) -
         raise RuntimeError("BREVO_API_KEY is not configured")
 
     parts = settings.email_from.split("<")
-    sender_name = parts[0].strip() if len(parts) > 1 else "Orange Clipboard"
+    sender_name = parts[0].strip() if len(parts) > 1 else "Orange Copy Paste"
     sender_email = parts[-1].rstrip(">").strip()
 
     payload: dict = {
@@ -192,30 +191,22 @@ def send_sharing_invite(
     invitee_email: str,
     invitee_name: str,
     from_name: str,
-    invite_code: str,
 ) -> None:
     """Best-effort delivery - logs and swallows failures so a background send
     never surfaces as a request error to the inviter.
 
-    The link is https rather than `orange://`: mail clients strip or refuse to
-    linkify a custom scheme, so the one thing the recipient is meant to click was
-    often not clickable at all. The page it lands on hands the invite to the app.
+    The mail carries no code or join link. The space's own code expires 72 hours
+    after the space is created and redeeming it only raises a join request, while
+    the addressed invite is already waiting in the recipient's app and lets them
+    straight in. Only people with an account are mailed, so pointing them at the
+    app always works.
     """
     subject = _INVITE_SUBJECT
-    join_url = web.join_url(invite_code)
     # Control characters out, then cut: the name is free text from another user.
     from_name = "".join(ch for ch in (from_name or "") if ch.isprintable()).strip()[:_INVITER_NAME_MAX]
     invitee = escape(invitee_name) or "there"
-    inviter = escape(from_name) or "A user"
-    # One display form everywhere: the app, the join page and this mail all show
-    # the dashed code, so the recipient types back exactly what they read.
-    display_code = spaces_service.format_invite_code(invite_code)
-    code = escape(display_code)
-    body = (
-        _MAIL_INVITE.replace("__INVITEE__", invitee)
-        .replace("__CODE__", code)
-        .replace("__JOIN_URL__", escape(join_url, quote=True))
-    )
+    inviter = escape(from_name) or "Someone"
+    body = _MAIL_INVITE.replace("__INVITEE__", invitee)
     html = _render_mail(
         f"{inviter} invited you to a space",
         body,
@@ -223,8 +214,10 @@ def send_sharing_invite(
     )
     text = (
         f"Hi {invitee_name or 'there'},\n\n"
-        f"{from_name or 'A user'} invited you to a space in Orange Copy Paste.\n\n"
-        f"Join: {join_url}\nInvite code: {display_code}\n\nThis invite expires in 72 hours.\n"
+        f"{from_name or 'Someone'} invited you to a space in Orange Copy Paste.\n\n"
+        "To join, open Orange Copy Paste, go to Spaces, click Invites, then Accept. "
+        "The invite is also in your notifications, with a Join button.\n\n"
+        "The invite expires in 72 hours.\n"
     )
     try:
         _send(invitee_email, subject, html, text)

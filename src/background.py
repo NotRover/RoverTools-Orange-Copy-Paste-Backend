@@ -4,11 +4,17 @@ A single asyncio loop, guarded by a Postgres advisory lock so that across N API
 replicas exactly one runs it at a time. If the holding replica dies, the lock is
 released with its connection and another replica takes over on its next attempt.
 
-Two jobs:
-  • presence sweep — emit `device:offline` for devices whose presence TTL key
-    expired without a clean WebSocket close (backstop to the instant on-close
-    signal in realtime.py).
-  • orphan blob cleanup — delete unconfirmed blobs older than 1h from R2 + DB.
+Four jobs:
+  • presence sweep (every 60s) — emit `device:offline` for devices whose presence
+    TTL key expired without a clean WebSocket close (backstop to the instant
+    on-close signal in realtime.py), and `user:presence` offline when that was
+    the user's last device.
+  • unreferenced blob release (hourly) — un-confirm blobs older than 7 days that
+    no live entry references, so the orphan cleanup collects them.
+  • orphan blob cleanup (hourly) — delete unconfirmed blobs older than 1h from
+    R2 + DB.
+  • removal-record pruning (hourly) — drop `space_entry_removals` rows older
+    than 90 days.
 """
 
 import asyncio

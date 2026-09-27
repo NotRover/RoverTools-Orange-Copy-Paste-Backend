@@ -107,7 +107,7 @@ class Settings(BaseSettings):
     smtp_port: int = 587
     smtp_user: str = ""
     smtp_password: str = ""
-    email_from: str = "Orange Clipboard <noreply@example.com>"
+    email_from: str = "Orange Copy Paste <noreply@example.com>"
 
     @property
     def sql_echo_enabled(self) -> bool:
