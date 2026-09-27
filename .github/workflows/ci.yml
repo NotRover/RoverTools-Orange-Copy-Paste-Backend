@@ -50,10 +50,12 @@ jobs:
         run: uv sync --frozen --extra dev
 
       - name: Lint
-        run: uvx ruff check src tests
+        # Pinned: ruff 0.16 widened its default rule set, which this code is not
+        # written to. Bump deliberately, together with any fixes it asks for.
+        run: uvx ruff@0.15.12 check src tests
 
       - name: Types
-        run: uvx ty check src
+        run: uvx ty@0.0.34 check src
 
       - name: Tests
         run: uv run pytest -q
