@@ -1,4 +1,4 @@
-# RoverTools' Orange Copy Paste — Backend Architecture
+# RoverTools' Orange Copy Paste - Backend Architecture
 
 > **Project:** Orange Copy Paste backend
 > **Stack:** FastAPI + Supabase (Postgres + Auth) + Redis + S3-compatible blob storage
@@ -8,17 +8,17 @@ and every rule the server itself enforces. If it crosses the network, its one tr
 description is here, and a client doc that disagrees is wrong.
 **Not here:** client internals (`orange-copy-paste-clipboard-app-rust/docs/architecture.md`),
 who-may-do-what (root `docs/permissions.md`), cross-component invariants (root
-`docs/architecture.md`). Link to those rather than restating them — one fact, one home.
+`docs/architecture.md`). Link to those rather than restating them - one fact, one home.
 
 ---
 
 ## 1. System Overview
 
 The backend is a **stateless FastAPI application** that leans on **Supabase for
-Postgres + Auth** and keeps everything else vendor-neutral. Because the API holds
-no per-connection state that other instances need (realtime fan-out and presence
-are coordinated through Redis), it **scales horizontally** — run N replicas behind
-a load balancer, no sticky sessions.
+Postgres + Auth** and keeps everything else vendor-neutral. The API holds no
+per-connection state that other instances need, because Redis coordinates realtime
+fan-out and presence. It therefore **scales horizontally**: N replicas behind a load
+balancer, with no sticky sessions.
 
 Two moving parts you operate (FastAPI + Redis); the rest is managed:
 
@@ -125,7 +125,7 @@ src/
 migrations/                     # Alembic
 ├── env.py
 ├── script.py.mako
-└── versions/                   # Revisions through 0019
+└── versions/                   # Revisions through 0020
 tests/                          # pytest, one module per domain (test_auth, test_sync, etc.)
 caddy/                          # Caddyfile (reverse proxy + TLS)
 deploy/                         # On-box build-and-deploy, polled by a systemd timer
@@ -134,7 +134,7 @@ deploy/                         # On-box build-and-deploy, polled by a systemd t
 └── rovertools-deploy.timer
 netdata/                        # Host metrics config
 scripts/                        # One-off scripts (render_supabase_emails.py)
-docs/                           # architecture.md (this file), DEPLOY.md, ANNOUNCEMENTS.md
+docs/                           # architecture.md (this file), DEPLOY.md, ANNOUNCEMENTS.md, supabase-email/
 Dockerfile
 docker-compose.yml              # Dev stack
 docker-compose.prod.yml         # Production stack
@@ -152,27 +152,28 @@ other in-process.
 ### 2.1 Auth-adjacent (`src/auth/`)
 
 Registration, email verification, login, token refresh, and password reset are
-handled by **Supabase Auth** — the client talks to Supabase directly. This module
+handled by **Supabase Auth**; the client talks to Supabase directly. This module
 owns only what the app itself must store:
 
-- **Profile bootstrap** — get-or-create the app profile for a Supabase user and
-  return the KDF salt + both UMK envelopes the client can unwrap to recover its key.
-- **Recovery envelope** — the same UMK wrapped a second time, under a key derived
-  from a recovery code the user holds instead of a password they remember. Same
-  `kdf_salt` as the password envelope, distinct AAD (`umk-recovery-v1` against
-  `umk-envelope-v2`), so the two can never be mistaken for one another. The server
-  holds an opaque blob it cannot open, exactly like `pw_wrapped_umk`; there is no
-  server-decryptable recovery path and there must never be one.
-- **Device registration** — each install registers a device row (carries the device
-  public key and, later, the wrapped UMK); returns a `device_id` the client sends
-  back as `X-Device-Id`.
-- **Public-key management** — store the user's X25519 identity key and per-device
-  wrapped UMK for multi-device E2E. The identity key is **write-once**: it is derived
-  from the UMK, so every device of an account derives the same one and an honest client
-  sends the same value forever. A *different* value means the caller holds a bearer
-  token rather than the UMK, and accepting it would redirect every future Space Key
-  wrap to a key they own — so a change is refused with 409. Device keys stay writable,
-  since each only ever opens that device's own copy of the UMK.
+- **Profile bootstrap** - get-or-create the app profile for a Supabase user, and
+  return the KDF salt and both UMK envelopes the client can unwrap to recover its key.
+- **Recovery envelope** - the same UMK wrapped a second time, under a key derived
+  from a recovery code the user holds instead of a password they remember. It uses the
+  same `kdf_salt` as the password envelope and a distinct AAD (`umk-recovery-v1`
+  against `umk-envelope-v2`), so the two can never be mistaken for one another. The
+  server holds an opaque blob it cannot open, exactly like `pw_wrapped_umk`. There is
+  no server-decryptable recovery path, and there must never be one.
+- **Device registration** - each install registers a device row, which carries the
+  device public key and, later, the wrapped UMK. The route returns a `device_id` that
+  the client sends back as `X-Device-Id`.
+- **Public-key management** - store the user's X25519 identity key and the per-device
+  wrapped UMK for multi-device E2E. The identity key is **write-once**: the server
+  refuses a different value with 409. Device keys stay writable.
+  **Why:** the identity key is derived from the UMK, so every device of an account
+  derives the same one, and an honest client sends the same value forever. A different
+  value means the caller holds a bearer token rather than the UMK. Accepting it would
+  redirect every future Space Key wrap to a key the caller owns. A device key only ever
+  opens that device's own copy of the UMK.
 
 The backend never issues tokens; it only **verifies** the Supabase JWT on protected routes
 (see [section 9](#9-auth-flow)).
@@ -184,11 +185,11 @@ Owns `sync_entries` (clipboard + notes) and per-device `sync_cursors`.
 - Delta push (batches of new/mutated entries) with last-write-wins + tombstones.
 - Delta pull since a cursor, covering the caller's own entries **plus** anything
   shared into a space they belong to (subject to that membership's history floor).
-- Publishes `sync:entry` to Redis after a write — once to the author's `user:` channel
+- Publishes `sync:entry` to Redis after a write - once to the author's `user:` channel
   and once to each `space:` channel named in the entry's `space_ids`. There is no
   `sync:delete`: a tombstone is a normal `sync:entry` with `deleted_at` set.
 - Carries two server-visible routing/key columns it never interprets:
-  `space_ids` (fan-out targets) and `wrapped_keys` (the per-entry CEK envelope, [section 7.2](#72-content-encryption--the-per-entry-cek-envelope)).
+  `space_ids` (fan-out targets) and `wrapped_keys` (the per-entry CEK envelope, [section 7.2](#72-content-encryption---the-per-entry-cek-envelope)).
 
 ### 2.3 Settings (`src/settings/`)
 
@@ -199,42 +200,44 @@ client-wins write, publishes `settings:updated` so other devices pull.
 
 Brokers direct-to-object-store uploads.
 
-- `request-upload` → presigned PUT URL + `blob_key` (server never buffers bytes). The
-  URL is signed for the declared `size_bytes` as `Content-Length`, so the store refuses
-  a body of any other length. An unconfirmed row counts against the quota for as long
-  as its PUT URL can still be used, so a burst of requests cannot reserve more than the
-  quota.
-- `confirm-upload` → reads the object's size (and SHA-256, where the store reports one)
-  back from the store and compares it with what was declared; on a mismatch the object
-  and the row are deleted and the answer is 409. Quota is checked again here. **This is
-  where the meter starts:** a confirmed blob counts against the quota whether or not an
-  entry references it yet.
-- `release` → un-confirms a blob whose entry never landed, giving the bytes straight
-  back (the client uploads and confirms *before* pushing the entry, so a refused or
-  locally-failed push leaves an orphan). Refuses with 409 while a live entry still
-  references the key, so it can never take an image away from an entry using it;
-  404 if the key is not the caller's; a no-op (204) if it is already unconfirmed.
-- `{blob_key}/download-url` → presigned GET URL, always signed with
+- `request-upload` -> presigned PUT URL + `blob_key`. The server never buffers bytes.
+  The URL is signed for the declared `size_bytes` as `Content-Length`, so the store
+  refuses a body of any other length. An unconfirmed row counts against the quota for
+  as long as its PUT URL can still be used, so a burst of requests cannot reserve more
+  than the quota.
+- `confirm-upload` -> reads the object's size back from the store, and its SHA-256
+  where the store reports one, and compares them with what was declared. On a mismatch
+  the server deletes the object and the row and answers 409. Quota is checked again
+  here. **This is where the meter starts:** a confirmed blob counts against the quota
+  whether or not an entry references it yet.
+- `release` -> un-confirms a blob whose entry never landed, which gives the bytes
+  straight back. It answers 409 while a live entry still references the key, 404 if the
+  key is not the caller's, and a no-op 204 if the blob is already unconfirmed.
+  **Why:** the client uploads and confirms *before* pushing the entry, so a refused or
+  locally-failed push leaves an orphan. The 409 means a release can never take an image
+  away from an entry that uses it.
+- `{blob_key}/download-url` -> presigned GET URL, always signed with
   `Content-Disposition: attachment`, so a stored object is never rendered inline.
-- `quota` → usage (computed on demand: `SUM(size_bytes)` over confirmed blobs) and
+- `quota` -> usage (computed on demand: `SUM(size_bytes)` over confirmed blobs) and
   the per-user quota, plus the two sync ceilings the client cannot see on its own
   (`entry_count` / `entry_limit`, and `max_entry_bytes`; [section 6.3](#63-size-and-row-limits)).
 - **5 MB per-entry hard cap**; per-user quota default **50 MB** (configurable
   globally and per-user via the admin API).
 
 **Every byte is charged to whoever uploaded it, and to nobody else.** `_used_bytes`
-sums `blobs` rows `WHERE user_id = <caller> AND confirmed`, and a row is only ever
-created by `request-upload`, for the uploader. Receiving a shared image creates no
-row: `download-url` hands the reader a presigned GET on the *owner's* key
-(`{owner_id}/{hex}`) after `_shares_space_with_blob` confirms a live entry **written by the blob's owner**
-carries it into a space they belong to (a row another account wrote naming the key
-does not count, and push refuses to write one: `invalid_blob`, section 5.2), and answers 404 rather than 403 to everyone else so the
-key's existence is not confirmed. One bucket, namespaced by owner.
+sums `blobs` rows `WHERE user_id = <caller> AND confirmed`. Only `request-upload`
+creates a row, and only for the uploader. Receiving a shared image creates no row.
+`download-url` hands the reader a presigned GET on the *owner's* key
+(`{owner_id}/{hex}`), after `_shares_space_with_blob` confirms that a live entry
+**written by the blob's owner** carries it into a space the reader belongs to. A row
+another account wrote naming the key does not count, and push refuses to write one
+(`invalid_blob`, section 5.2). Everyone else gets 404 rather than 403, so the key's
+existence is not confirmed. One bucket, namespaced by owner.
 
 The deliberate consequence: **the owner deleting the entry breaks it for every
-member.** `release_blob` marks the blob unconfirmed (quota stops counting it
-immediately), the hourly orphan sweep deletes the object, and any member who had not
-already fetched it gets a 404.
+member.** `release_blob` marks the blob unconfirmed, so quota stops counting it
+immediately. The hourly orphan sweep then deletes the object, and any member who had
+not already fetched it gets a 404.
 
 ### 2.5 Spaces (`src/spaces/`)
 
@@ -242,10 +245,10 @@ A **space** is the single sharing primitive: a named, persistent, realtime room 
 entries are encrypted under a Space Key the server never sees. There is no space *type*,
 no member cap, and no server-side scope. See [section 15](#15-spaces-design).
 
-- **Spaces** (`router.py` / `service.py` / `models.py` / `schemas.py`) — create, list,
+- **Spaces** (`router.py` / `service.py` / `models.py` / `schemas.py`) - create, list,
   get, join by invite code, remove member / leave, delete, and per-member Space Key
   distribution.
-- **Addressed invites** (`invites.py`) — one persistent row per (space, invitee email)
+- **Addressed invites** (`invites.py`) - one persistent row per (space, invitee email)
   with accept / decline / revoke and live `invite:*` events, alongside the bearer
   invite code. Mounted separately under `/api/v1/invites`. An invite can carry the
   Space Key wrapped for the invitee, which the accept moves onto the new membership.
@@ -261,7 +264,7 @@ pub/sub bridge, the publish helpers, and device presence. See [section 8](#8-rea
 
 ### 2.7 Admin (`src/admin/`)
 
-Ops-only, gated by `X-Admin-Key` (disabled → 503 if `ADMIN_API_KEY` unset), except
+Ops-only, gated by `X-Admin-Key` (disabled -> 503 if `ADMIN_API_KEY` unset), except
 the public `/internal/healthz`.
 
 - Health, Prometheus metrics, JSON stats (counts from our tables; online-device
@@ -288,22 +291,22 @@ silently ignored.
 
 Four decisions worth keeping:
 
-- **Unversioned**, alongside the infra probes (see [section 5.0](#50-versioning)). `version.py` versions
-  the product API because the desktop app negotiates a contract with it; a URL a
-  person clicks in an email cannot be re-versioned without breaking every link
-  already sent.
+- **Unversioned**, alongside the infra probes (see [section 5.0](#50-versioning)).
+  `version.py` versions the product API because the desktop app negotiates a contract
+  with it. A URL a person clicks in an email cannot be re-versioned without breaking
+  every link already sent.
 - **No database call.** `/join` validates the code's shape only
-  (`spaces.service.normalize_invite_code`). The service cold-starts on the free tier
-  and the page must paint on the first response; a lookup would also confirm to
-  anyone whether a given code exists.
-- **CSP carve-out.** The global header is `default-src 'none'; connect-src 'self'; frame-ancestors 'none'`,
-  which would blank a self-contained page, so `middleware.py` sets it with
-  `setdefault` and `/join` sets its own: inline style and script allowed,
-  everything remote still denied. The header is now overridable, never absent.
-- **HTML lives in `templates/*.html`**, read once at import and rendered by
-  replacing `__PLACEHOLDER__` tokens - no Jinja2 dependency, and the pages stay
-  openable and diffable as pages. Every interpolated value goes through
-  `html.escape`.
+  (`spaces.service.normalize_invite_code`). The page must paint on the first
+  response, with nothing to wait on. A lookup would also confirm to anyone
+  whether a given code exists.
+- **CSP carve-out.** The global header is
+  `default-src 'none'; connect-src 'self'; frame-ancestors 'none'`, which would blank a
+  self-contained page. `middleware.py` therefore sets it with `setdefault`, and `/join`
+  sets its own: inline style and script allowed, everything remote still denied. The
+  header is now overridable, never absent.
+- **HTML lives in `templates/*.html`**, read once at import and rendered by replacing
+  `__PLACEHOLDER__` tokens. There is no Jinja2 dependency, and the pages stay openable
+  and diffable as pages. Every interpolated value goes through `html.escape`.
 
 `settings.public_base_url` is the single source for every link this service hands
 out, and `web.join_url()` the single builder. Pointing a domain at the service is an
@@ -318,10 +321,10 @@ env change.
 | API framework      | FastAPI + uvicorn                     | Async, Pydantic v2, native WebSocket, auto OpenAPI               |
 | Database           | Supabase **Postgres 16**              | Managed; asyncpg + SQLAlchemy 2 async core; RLS available        |
 | Identity / Auth    | Supabase **Auth (GoTrue)**            | Managed signup, email verify, password reset, sessions, JWTs     |
-| JWT verification   | PyJWT — **ES256/RS256 via JWKS**, legacy HS256 | We verify only; Supabase signs. Asymmetric by default, symmetric accepted when `SUPABASE_JWT_SECRET` is set |
+| JWT verification   | PyJWT - **ES256/RS256 via JWKS**, legacy HS256 | We verify only; Supabase signs. Asymmetric by default, symmetric accepted when `SUPABASE_JWT_SECRET` is set |
 | Cache / realtime   | Redis 7                               | Pub/sub fan-out + device presence (nothing else)                 |
 | Blob storage       | Cloudflare **R2** (S3-compatible)     | Direct presigned PUT/GET; zero egress; MinIO for local dev       |
-| Background jobs    | in-process asyncio + PG advisory lock | Presence sweep + orphan blob cleanup; no Celery/broker           |
+| Background jobs    | in-process asyncio + PG advisory lock | Presence sweep + blob and removal-record cleanup; no Celery/broker |
 | Email              | Brevo REST (default) or stdlib SMTP   | Space invites only; via `BackgroundTasks`                        |
 | KDF (E2E)          | Argon2id + HKDF-SHA256 (client-side)  | Memory-hard stretch, then split: one half is the Supabase credential, the other wraps the random UMK |
 | Content encryption | AES-256-GCM (client-side)             | AEAD; per-entry content key, server stores ciphertext only       |
@@ -338,7 +341,7 @@ python-multipart, httpx, slowapi, email-validator
 
 There is **no** `celery`, `python-jose`, or `passlib` dependency. `cryptography`
 comes in only as `pyjwt[crypto]`, which PyJWT needs to verify Supabase's asymmetric
-(ES256/RS256) tokens — the server verifies tokens it never signs, and every
+(ES256/RS256) tokens - the server verifies tokens it never signs, and every
 content-encryption operation is client-side.
 
 ---
@@ -347,13 +350,13 @@ content-encryption operation is client-side.
 
 All server-assigned IDs are UUID v4. Timestamps are `BIGINT` milliseconds since the
 Unix epoch (to match the Tauri app's `u64`). `client_id` is stored as `TEXT` and
-carries the app's own entry ID — itself a UUID v4 — which is what dedup keys on.
+carries the app's own entry ID - itself a UUID v4 - which is what dedup keys on.
 
 ### 4.1 `profiles`
 
 The app-side record for a Supabase Auth user. `id` **equals** the Supabase
 `auth.users.id` (the JWT `sub`); linkage is application-level (no cross-schema FK).
-Email, password, and verification state live in Supabase — not here.
+Email, password, and verification state live in Supabase - not here.
 
 ```sql
 CREATE TABLE profiles (
@@ -373,7 +376,7 @@ CREATE TABLE profiles (
 );
 ```
 
-Storage used is **not** stored — it is computed on demand from confirmed blobs.
+Storage used is **not** stored - it is computed on demand from confirmed blobs.
 
 ### 4.2 `devices`
 
@@ -427,12 +430,12 @@ CREATE INDEX idx_sync_entries_spaces  ON sync_entries USING GIN(space_ids);
 
 `space_ids` is the only sharing fact the server reads: it decides which `space:`
 channels a write fans out to and which memberships can pull the row. `wrapped_keys`
-is stored and echoed verbatim — the server cannot tell one wrap from another, and a
+is stored and echoed verbatim - the server cannot tell one wrap from another, and a
 row whose `space_ids` is empty is a personal entry. A tombstone keeps the
 `space_ids` the entry had, so a delete reaches the same members the entry did. It is
-stored **stripped**: whatever the push carried, the server writes `encrypted_content = ''`,
-`encrypted_metadata`, `blob_key` and `blob_size` NULL and `wrapped_keys = '{}'`, so a
-deleted row holds no ciphertext and no key wraps.
+stored **stripped**, whatever the push carried. The server writes
+`encrypted_content = ''`, sets `encrypted_metadata`, `blob_key` and `blob_size` to NULL,
+and writes `wrapped_keys = '{}'`. A deleted row holds no ciphertext and no key wraps.
 
 ### 4.4 `sync_cursors`
 
@@ -476,33 +479,32 @@ CREATE TABLE spaces (
 CREATE INDEX idx_spaces_owner_id ON spaces(owner_id);
 ```
 
-There is no space *type* and no member cap. `invite_code` is drawn from
-`ABCDEFGHJKMNPQRSTUVWXYZ23456789` (no I/L/O/0/1) so it survives being read aloud or
-retyped; the API normalizes case and strips `-`/spaces on join, and displays it as
-`KX7Q-2M4X`. Anything longer than 8 characters is treated as a legacy
-`token_urlsafe` code and matched case-sensitively.
+There is no space *type* and no member cap. Per column:
 
-Redeeming a code no longer joins the space. It raises a row in
-`space_join_requests` ([section 4.10](#410-space_join_requests)) that somebody already inside has to approve, so a
-leaked or forwarded code buys a knock rather than a membership. `members_can_approve`
-is the only control over who may answer: owner alone by default, or the owner and any
-member. Addressed invites ([section 4.9](#49-space_invites)) are unaffected - naming someone by email *is*
-the approval.
-
-`share_history` is resolved into the joining member's `history_from_ts` **at join
-time**, so flipping it later does not retroactively widen what an existing member can
-pull.
-
-`key_fingerprint` is written by the owner alone, when it mints a key, and is what lets a
-recipient tell a genuine keyring from one a member made up. Any member may hand a key
-over ([section 7.4](#74-space-key-distribution-and-rekey)), so the server -- which cannot open a wrap -- is no longer the only
-thing standing between a newcomer and a wrong key. A hash of 32 random bytes reveals
-nothing about the key it names.
-
-`rekey_requested_at` is the rekey signal. It used to be implicit: a departure cleared
-every member's wrap, and a client seeing an empty wrap while holding keys knew to mint.
-That destroyed the owner's own recovery path, so the flag now carries the request and the
-owner's wrap survives ([section 7.4](#74-space-key-distribution-and-rekey)).
+- **`invite_code`** is drawn from `ABCDEFGHJKMNPQRSTUVWXYZ23456789` (no I/L/O/0/1), so it
+  survives being read aloud or retyped. On join the API normalizes case and strips `-` and
+  spaces; it displays the code as `KX7Q-2M4X`. Anything longer than 8 characters is a
+  legacy `token_urlsafe` code, matched case-sensitively.
+- **Redeeming a code does not join the space.** It raises a row in `space_join_requests`
+  ([section 4.10](#410-space_join_requests)) that somebody already inside must approve, so
+  a leaked or forwarded code buys a knock, not a membership. Addressed invites
+  ([section 4.9](#49-space_invites)) are unaffected: naming someone by email *is* the
+  approval.
+- **`members_can_approve`** is the only control over who may answer a join request: the
+  owner alone (default), or the owner and any member.
+- **`share_history`** is resolved into the joining member's `history_from_ts` **at join
+  time**. Flipping it later does not retroactively widen what an existing member can pull.
+- **`key_fingerprint`** is written by the owner alone, when it mints a key. It lets a
+  recipient tell a genuine keyring from one a member made up. A hash of 32 random bytes
+  reveals nothing about the key it names.
+  **Why:** any member may hand a key over
+  ([section 7.4](#74-space-key-distribution-and-rekey)), and the server cannot open a
+  wrap to check it. The fingerprint gives the newcomer its own check against a wrong key.
+- **`rekey_requested_at`** is the rekey signal. The owner's wrap survives a departure
+  ([section 7.4](#74-space-key-distribution-and-rekey)).
+  **Why:** the signal used to be implicit. A departure cleared every member's wrap, and
+  a client that saw an empty wrap while holding keys knew to mint. That destroyed the
+  owner's own recovery path, so the flag now carries the request instead.
 
 ### 4.7 `space_memberships`
 
@@ -523,17 +525,19 @@ CREATE INDEX idx_sm_user ON space_memberships(user_id);
 `role` has exactly two values. There is no `share_scope` column: filtering what a
 device sends into a space is a client-side setting the server never learns.
 
-`wrapped_space_keys` is a wrapped **keyring**, not a single key — a JSON array,
-newest key first, each element an X25519-wrapped copy for this member. It is an array
-because a rekey must not make older entries unreadable: previous Space Keys exist
-nowhere else, so a member who restarts after a rekey recovers the whole ring and can
-still decrypt entries written under earlier keys. `NULL` is meaningful — it is the
-signal that this member needs a (re)distribution ([section 7.4](#74-space-key-distribution-and-rekey)).
+`wrapped_space_keys` is a wrapped **keyring**, not a single key: a JSON array, newest
+key first, each element an X25519-wrapped copy for this member. `NULL` is meaningful. It
+is the signal that this member needs a (re)distribution
+([section 7.4](#74-space-key-distribution-and-rekey)).
+**Why an array:** a rekey must not make older entries unreadable. Previous Space Keys
+exist nowhere else, so a member who restarts after a rekey recovers the whole ring. It
+can then still decrypt entries written under earlier keys.
 
 `wrapped_by` names the account whose public key the recipient must compute its shared
-secret against. It exists because distribution is no longer owner-only: with several
-possible writers the recipient can no longer assume the counterparty. `NULL` keeps
-meaning "the owner", so every row written before migration 0017 still opens.
+secret against. `NULL` means "the owner", so every row written before migration 0017
+still opens.
+**Why:** distribution is no longer owner-only. With several possible writers, the
+recipient can no longer assume the counterparty.
 
 ### 4.8 `blobs`
 
@@ -549,10 +553,10 @@ CREATE TABLE blobs (
 );
 ```
 
-> **Migration note (0006):** the `users` → `profiles` rename and the column drops that
+> **Migration note (0006):** the `users` -> `profiles` rename and the column drops that
 > produced this shape are recorded in `migrations/versions/0006_supabase_migration.py`.
 
-> **Migration note (0011, spaces):** the destructive groups → spaces transition (and the
+> **Migration note (0011, spaces):** the destructive groups -> spaces transition (and the
 > addition of `sync_entries.wrapped_keys`) is recorded in `migrations/versions/0011_spaces.py`.
 
 ---
@@ -601,9 +605,10 @@ erDiagram
 ### 4.10 `space_join_requests`
 
 The anonymous counterpart to `space_invites`. An invite is addressed and starts with
-the inviter; a request starts with the joiner, whom nobody named, so it carries no
-inviter, no invitee email, and nothing to deliver. Overloading `space_invites` would
-leave half its columns null on every row and put a discriminator in every query.
+the inviter. A request starts with the joiner, whom nobody named, so it carries no
+inviter, no invitee email, and nothing to deliver.
+**Why a separate table:** overloading `space_invites` would leave half its columns null
+on every row and put a discriminator in every query.
 
 ```sql
 CREATE TABLE space_join_requests (
@@ -623,27 +628,27 @@ CREATE INDEX        ix_join_requests_user         ON space_join_requests(user_id
 ```
 
 The unique index is the abuse cap: a leaked code lets strangers knock, and a knock
-must not stack. A declined row is kept rather than deleted, because it is both what
-stops the same person knocking again on a code they still hold and the only record
-anyone has that somebody tried.
+must not stack. A declined row is kept rather than deleted. It stops the same person
+knocking again on a code they still hold, and it is the only record anyone has that
+somebody tried.
 
-One exception to that: an `approved` row whose membership is gone, because the member
-left afterwards. Refusing there would lock them out of a code they still hold with no
-way back, so `request_join` reopens the spent row instead of refusing or duplicating it.
+One exception: an `approved` row whose membership is gone, because the member left
+afterwards. `request_join` reopens that spent row instead of refusing or duplicating it.
+Refusing would lock the former member out of a code they still hold, with no way back.
 
-`wrapped_space_keys` is why approval is worth the round trip. Whoever approves is by
-definition online and holding the keyring at that moment - they are the one clicking -
-so the approval writes the wrap in the same call and `add_membership` moves it onto the
-new membership, exactly as an accepted invite does. The joiner goes from pending
-straight to readable. Joining by code used to be instant and then unreadable for as
-long as it took somebody's app to notice.
+The approval writes the wrap into `wrapped_space_keys` in the same call, and
+`add_membership` moves it onto the new membership, exactly as an accepted invite does.
+The joiner goes from pending straight to readable.
+**Why:** whoever approves is by definition online and holding the keyring at that
+moment, since they are the one clicking. Joining by code used to be instant and then
+unreadable for as long as it took somebody's app to notice.
 
 ### 4.11 `space_comments`
 
 One comment written by a member on one entry shared into a space. Scoped to the space,
 not the entry: the same clipboard item can sit in two spaces, and a remark meant for one
 team must not surface in the other. The entry is addressed the way every other space
-route addresses it, by `(client_id, entry_type)`, not by a foreign key - a `sync_entries`
+route addresses it: by `(client_id, entry_type)`, not by a foreign key. A `sync_entries`
 row is per-account, so there is no single row to point at.
 
 ```sql
@@ -668,12 +673,12 @@ keyring, so every comment stays readable across rotations.
 
 ### 4.12 `space_entry_removals`
 
-One row per (space, entry) recording that shared content was withdrawn from a space, so a
-device that was offline during the removal learns about it on catch-up instead of keeping
-the copy forever. It is not a tombstone for the entry: the author keeps their own copy, and
-what was withdrawn is the *sharing* - the wrapped key for this space is dropped from the
-entry in the same transaction that writes this row. Re-sharing and re-removing the same
-entry updates the row in place and bumps `server_ts` rather than accumulating history.
+One row per (space, entry), recording that shared content was withdrawn from a space. A
+device that was offline during the removal learns about it on catch-up, instead of
+keeping the copy forever. It is not a tombstone for the entry: the author keeps their own
+copy, and what was withdrawn is the *sharing*. The same transaction that writes this row
+drops the entry's wrapped key for this space. Re-sharing and re-removing the same entry
+updates the row in place and bumps `server_ts`, rather than accumulating history.
 
 ```sql
 CREATE TABLE space_entry_removals (
@@ -689,18 +694,19 @@ CREATE UNIQUE INDEX ix_space_entry_removals_entry ON space_entry_removals(space_
 CREATE INDEX        ix_space_entry_removals_pull  ON space_entry_removals(space_id, server_ts);
 ```
 
-`author_id` and `removed_by` both travel to the client because the placeholder it shows
-depends on whether the author withdrew their own post or somebody moderated it - the same
+`author_id` and `removed_by` both travel to the client. The placeholder it shows depends
+on whether the author withdrew their own post or somebody moderated it, the same
 distinction the `space:entry_removed` event carries. A device pulls removals and entries
-against one cursor, and the entry row always carries a newer `server_ts` than any removal
-that preceded it, so applying removals before entries still lands on the right final state.
+against one cursor. The entry row always carries a newer `server_ts` than any removal
+that preceded it, so applying removals before entries still lands on the right final
+state.
 
 ### 4.13 `announcements`
 
-Server-authored messages to users; delivery and read semantics are section 16. The one
-table that holds plaintext, deliberately: nothing in it derives from an entry, a note, or a
-space name, so there is nothing the server would have had to decrypt to write it. A null
-`user_id` is a broadcast to every user; a uuid addresses one account.
+Server-authored messages to users; delivery and read semantics are section 16. This is
+the one table that holds plaintext, deliberately. Nothing in it derives from an entry, a
+note, or a space name, so there is nothing the server would have had to decrypt to write
+it. A null `user_id` is a broadcast to every user; a uuid addresses one account.
 
 ```sql
 CREATE TABLE announcements (
@@ -717,9 +723,9 @@ CREATE INDEX ix_announcements_user_id    ON announcements(user_id);
 CREATE INDEX ix_announcements_created_at ON announcements(created_at);
 ```
 
-`kind` is free-form so the server can use a new value before every client knows it; unknown
-values fall back to "announcement" on the client. `data` is opaque - a link, or an id to
-act on. After `expires_at` the row stops being served (null means it never expires).
+`kind` is free-form, so the server can use a new value before every client knows it.
+Unknown values fall back to "announcement" on the client. `data` is opaque: a link, or an
+id to act on. After `expires_at` the row stops being served (null means it never expires).
 
 ---
 
@@ -743,20 +749,20 @@ act on. After `expires_at` the row stops being served (null means it never expir
   A passing check is cached in Redis for 60 s under `dev:{sub}:{device_id}`;
   revoking the device deletes that key, so the refusal is immediate.
 - UMK proof: `X-Umk-Proof: <base64 of 32 bytes>` on the routes that change key
-  material. Rule, trust-on-first-use and the reset exception: [section 7.1](#71-user-master-key-umk--envelope-model).
-- Rate limits: `429` with `Retry-After` when called too often (limits are per verified
-  user where the route is authenticated, else per client IP). The limit on each route
-  is in its decorator in the code; the client backs off on `Retry-After` and requeues a
-  push that did not go, so a limit delays sync and never drops anything.
+  material. Rule, trust-on-first-use and the reset exception: [section 7.1](#71-user-master-key-umk---envelope-model).
+- Rate limits: `429` with `Retry-After` when called too often. Limits are per verified
+  user where the route is authenticated, else per client IP. The limit on each route is
+  in its decorator in the code. The client backs off on `Retry-After` and requeues a push
+  that did not go, so a limit delays sync and never drops anything.
 - Errors: `{"detail": "..."}` + HTTP status.
-- Pagination: cursor-based — `?after_ts=<server_ts>&limit=200`.
+- Pagination: cursor-based - `?after_ts=<server_ts>&limit=200`.
 
 ### 5.0 Versioning
 
 Source of truth: `src/version.py` (`API_VERSION`, `SERVICE_VERSION`).
 
 - **Product API is versioned** in the path: client-facing under `/api/v1`, admin
-  under `/internal/v1`. `API_VERSION` bumps (`v2`, …) only on a
+  under `/internal/v1`. `API_VERSION` bumps (`v2`, ...) only on a
   backwards-incompatible contract change; `v1` and `v2` run side by side during a
   migration window.
 - **Infra probes are intentionally unversioned**: `/internal/healthz` and
@@ -766,13 +772,14 @@ Source of truth: `src/version.py` (`API_VERSION`, `SERVICE_VERSION`).
   the OpenAPI `version`; it changes freely per release without implying a contract break.
 - Every HTTP response carries an **`X-API-Version`** header (= `API_VERSION`).
 - **Live schema:** Swagger UI at `/api/docs`, ReDoc at `/api/redoc`, raw spec at
-  `/api/openapi.json` - all three **off unless `DOCS_ENABLED=true`**, and 404 when
-  it is not set. The schema is a complete map of the surface, `/internal` admin
-  routes included, so it fails closed: a deployment that configures nothing keeps
-  it private, and `.env.example` turns it on for local work. Every route declares a Pydantic `response_model` and a
-  docstring (surfaced as OpenAPI summary/description); tags group the surface
-  (auth, sync, settings, blobs, spaces, invites, realtime, ops, admin). The WebSocket `/ws`
-  contract is documented in [section 5.8](#58-websocket-event-protocol) (FastAPI does not emit WebSockets into OpenAPI).
+  `/api/openapi.json`. All three are **off unless `DOCS_ENABLED=true`**, and answer 404
+  when it is not set. The schema is a complete map of the surface, `/internal` admin
+  routes included, so it fails closed: a deployment that configures nothing keeps it
+  private. `.env.example` also ships `DOCS_ENABLED=false`; set it to `true` on a dev
+  machine to get the UI. Every route declares a Pydantic `response_model` and a
+  docstring, surfaced as the OpenAPI summary and description. Tags group the surface
+  (auth, sync, settings, blobs, spaces, invites, announcements, realtime, ops, admin). FastAPI does not emit WebSockets into OpenAPI, so the `/ws`
+  contract is documented in [section 5.8](#58-websocket-event-protocol).
 
 ### 5.1 Auth Routes
 
@@ -836,7 +843,7 @@ POST   /api/v1/auth/devices/{device_id}/key-wrap   -- X-Umk-Proof
 ```
 
 > Registration, email verification, login, refresh, and password reset are **not**
-> here — the client performs them against Supabase Auth directly.
+> here - the client performs them against Supabase Auth directly.
 
 ### 5.2 Sync Routes  (require `X-Device-Id`)
 
@@ -902,43 +909,43 @@ GET  /api/v1/sync/breakdown
      bar, which splits URL / document / folder out of content the server cannot read.
 ```
 
-There is no `GET /sync/status` and no delete route: the cursor is client-held (and
-advanced with `POST /sync/cursor`), and a delete is a push with `deleted_at` set.
+There is no `GET /sync/status` and no delete route. The cursor is client-held and
+advanced with `POST /sync/cursor`, and a delete is a push with `deleted_at` set.
 
-**`not_your_entry` — one entry, one author.** Rows are keyed
-`(user_id, client_id, entry_type)`, so a push of an entry another account wrote would
-insert a *second* row under the same `client_id` rather than updating theirs, which
-clients collapse into one item with the wrong attribution (client
-`orange-copy-paste-clipboard-app-rust/docs/bugfix-history.md` #8).
+**`not_your_entry` - one entry, one author.** Rows are keyed
+`(user_id, client_id, entry_type)`. A push of an entry another account wrote would
+therefore insert a *second* row under the same `client_id` rather than updating theirs.
+Clients collapse the two into one item with the wrong attribution (client
+`orange-copy-paste-clipboard-app-rust/docs/bugfix-history.md` #8). The rule:
 
-So push refuses to write a row for a `client_id` another account already holds in a
-space this push adds (`_belongs_to_someone_else`) - on insert and, since an update can
-add a space too, on the update path as well, for the spaces the update adds. It is the rare rule the server
-*can* enforce without reading anything: it is about which account owns a key, not
-about what the content says. Enforced here rather than only in the client because
-old builds keep running, and every one of them writes through this route.
-
-The space-overlap condition is what keeps it from refusing honest pushes: one person
-with two accounts and the same local history holds colliding `client_id`s by
-construction. Only when both rows land in the same space is one claiming to be the
-other.
-
-That same overlap gap is what lets a member delete a *received* entry off their own
-devices without touching the space ("remove from my devices"). The client pushes a
-tombstone for the received `client_id` with **empty `space_ids`** — a self-owned row
-under the deleter's account that overlaps no space, so `_belongs_to_someone_else`
-permits it and fan-out reaches only `user:{deleter}`. The author's row is untouched
-and every other member keeps their copy; the deleter's other devices apply it through
-a self-hide path in the client's merge (they recognise a self-authored, space-less
-tombstone for an entry they hold as received). Contrast the normal case: a tombstone
-for an entry you *own* keeps its `space_ids` so the delete reaches the members who
-received it.
+- **What is refused.** Push refuses to write a row for a `client_id` another account
+  already holds in a space this push adds (`_belongs_to_someone_else`). An update can add
+  a space too, so the check runs on insert and on the update path, for the spaces the
+  update adds.
+- **Why the server enforces it.** It is the rare rule the server *can* enforce without
+  reading anything: it is about which account owns a key, not what the content says. It
+  lives here, not only in the client, because old builds keep running and every one of
+  them writes through this route.
+- **Why only on space overlap.** The overlap condition keeps it from refusing honest
+  pushes. One person with two accounts and the same local history holds colliding
+  `client_id`s by construction. Only when both rows land in the same space is one
+  claiming to be the other.
+- **"Remove from my devices" uses the gap.** A member deletes a *received* entry off their
+  own devices, without touching the space, by pushing a tombstone for the received
+  `client_id` with **empty `space_ids`**. That is a self-owned row under the deleter's
+  account that overlaps no space, so `_belongs_to_someone_else` permits it and fan-out
+  reaches only `user:{deleter}`. The author's row is untouched and every other member
+  keeps their copy. The deleter's other devices apply it through a self-hide path in the
+  client's merge: they recognise a self-authored, space-less tombstone for an entry they
+  hold as received.
+- **Contrast the normal case.** A tombstone for an entry you *own* keeps its `space_ids`,
+  so the delete reaches the members who received it.
 
 **Only members write into a space.** `space_ids` decides fan-out and who can pull the
-row, so a push that adds a space the caller is not a current member of is refused as a
-whole with 422 `not_a_member`. Only *added* spaces are checked: a space already on the
-row may stay there, which is what lets an author who has since left or been removed
-still push the tombstone for what they shared.
+row. The server therefore refuses, as a whole with 422 `not_a_member`, a push that adds
+a space the caller is not a current member of. Only *added* spaces are checked: a space
+already on the row may stay there. That lets an author who has since left or been
+removed still push the tombstone for what they shared.
 
 ### 5.3 Settings Routes
 
@@ -1070,24 +1077,27 @@ DELETE /api/v1/spaces/{space_id}/comments/{comment_id}   -> 204
 ```
 
 `online` is a snapshot and nothing more. It is read from Redis presence at request
-time, and when the presence store is unreachable every member reports `false`
-rather than the request failing - the rest of the response comes from Postgres
-and is still correct. So it may drive what a member list *shows*, and never
-whether an action is allowed or whether a device has really gone away. The same
-applies to `online` on `GET /auth/devices`, and to the `user:presence` event.
+time. When the presence store is unreachable, every member reports `false` rather than
+the request failing; the rest of the response comes from Postgres and is still correct.
+So `online` may drive what a member list *shows*. It must never decide whether an action
+is allowed or whether a device has really gone away. The same applies to `online` on
+`GET /auth/devices` and to the `user:presence` event.
 
-Six fields carry the key-distribution contract. `identity_pubkey` is what a distributor
-wraps for. `has_space_key` lets it wrap only for members who need one — without it, every
-reconcile would re-distribute to everybody, the server would echo that back as
-`space:rekey`, and clients would loop. `my_wrapped_space_keys` is the restart recovery
-path, since Space Keys live in client memory only and `space:rekey` is fire-and-forget;
-`my_wrapped_by` says whose public key opens it. `key_fingerprint` is what the recipient
-checks the unwrapped ring against, and `rekey_requested_at` is the request for a new one.
-A member's keyring is never exposed to anyone else.
+Six fields carry the key-distribution contract. A member's keyring is never exposed to
+anyone else.
+
+| Field | Role |
+|-------|------|
+| `identity_pubkey` | What a distributor wraps for. |
+| `has_space_key` | Lets a distributor wrap only for members who need one. Without it, every reconcile would re-distribute to everybody, the server would echo that back as `space:rekey`, and clients would loop. |
+| `my_wrapped_space_keys` | The restart recovery path: Space Keys live in client memory only, and `space:rekey` is fire-and-forget. |
+| `my_wrapped_by` | Whose public key opens `my_wrapped_space_keys`. |
+| `key_fingerprint` | What the recipient checks the unwrapped ring against. |
+| `rekey_requested_at` | The request for a new key. |
 
 `i_can_approve` and `pending_join_requests` are derived server-side rather than left
-to the client, so the rule about who may approve has exactly one definition
-(`service.may_approve`) and a client cannot drift from it. The count comes back as zero
+to the client. The rule about who may approve therefore has exactly one definition
+(`service.may_approve`), and a client cannot drift from it. The count comes back as zero
 to anybody who could not act on it anyway.
 
 `CommentOut`:
@@ -1104,14 +1114,14 @@ to anybody who could not act on it anyway.
 ```
 
 There is no rotate-invite-code route: a space's code is minted once at creation.
-Rotating it on approval was considered and dropped - the code is printed on links and
-sitting in mailboxes, so rotating it silently breaks every one of them, and approval
-already neutralises a leaked code, which is what rotation was for.
+**Why:** rotating it on approval was considered and dropped. The code is printed on
+links and sitting in mailboxes, so rotating it silently breaks every one of them.
+Approval already neutralises a leaked code, which is what rotation was for.
 
 ### 5.6 Invite Routes (addressed invites)
 
 The bearer `invite_code` is complemented by persistent, per-email invites.
-Lifecycle: `pending → accepted | declined` (invitee) `| revoked` (inviter);
+Lifecycle: `pending -> accepted | declined` (invitee) `| revoked` (inviter);
 expiry (72 h) is judged at read/accept time, no sweeper.
 
 ```
@@ -1134,8 +1144,9 @@ GET    /api/v1/invites               Returns: { sent: [...], received: [...] }
        received = pending, unexpired, matched by user id or the token's email claim
        sent = the caller's 50 most recent, any status, so outcomes are visible
 POST   /api/v1/invites/{id}/accept   Joins the space immediately -- no approval step,
-       403 email_unverified when the token carries email_verified: false.
-                                     because naming an email *is* the approval
+                                     because naming an email *is* the approval.
+                                     403 email_unverified when the token carries
+                                     email_verified: false
 POST   /api/v1/invites/{id}/decline
 DELETE /api/v1/invites/{id}          -- inviter revokes a pending invite; needs X-Device-Id
 PUT    /api/v1/invites/{id}/key      Body: { wrapped_space_keys }  -- inviter only, pending only
@@ -1145,13 +1156,14 @@ PUT    /api/v1/invites/{id}/key      Body: { wrapped_space_keys }  -- inviter on
        Re-inviting drops a stale wrap rather than reusing it.
 ```
 
-`GET /invites` and the accept / decline routes authenticate on the bearer token alone,
-because they match the caller against the token's `email` claim and are not device-scoped;
-they do **not** require `X-Device-Id`. Revoke does, since it goes through the shared
+`GET /invites` and the accept / decline routes authenticate on the bearer token alone.
+They match the caller against the token's `email` claim, are not device-scoped, and do
+**not** require `X-Device-Id`. Revoke does, since it goes through the shared
 device-scoped dependency.
 
-Invitee resolution uses `profiles.email`, a lowercased mirror of the Supabase
-JWT email claim captured at bootstrap ([section 4.9](#49-space_invites)) — no Admin API round-trip.
+Invitee resolution uses `profiles.email`, a lowercased mirror of the Supabase JWT email
+claim captured at bootstrap ([section 4.9](#49-space_invites)). It needs no Admin API
+round-trip.
 
 ```mermaid
 sequenceDiagram
@@ -1192,19 +1204,21 @@ POST  /internal/v1/admin/users/{user_id}/suspend Body: { suspend: bool }   -- de
 DELETE /internal/v1/admin/users/{user_id}        -- deletes profile (cascade) + Supabase user
 GET  /internal/v1/admin/email       Returns: provider, configured, email_from, *_set flags -- no secret
 POST /internal/v1/admin/email/test  Body: { to }  Returns: { sent, provider, error? }
+POST   /internal/v1/admin/announcements        -- post to one user or everyone (section 16)
+DELETE /internal/v1/admin/announcements/{id}   -- stop serving it
 ```
 
-Every admin-key route is limited per client IP, and ten wrong keys from one IP
-lock that IP out (`429`) for 15 minutes; the key is compared in constant time.
-In production Caddy answers `404` for every `/internal/*` path except
-`/internal/healthz`, so the admin API and `/internal/metrics` are reachable only
-from inside the box (see `docs/DEPLOY.md`).
+Every admin-key route is limited per client IP. Ten wrong keys from one IP lock that IP
+out (`429`) for 15 minutes, and the key is compared in constant time. In production
+Caddy answers `404` for every `/internal/*` path except `/internal/healthz`, so the
+admin API and `/internal/metrics` are reachable only from inside the box (see
+`docs/DEPLOY.md`).
 
 Invite delivery is best-effort and its failures are swallowed (see
-`email.send_sharing_invite`), so a broken mail config is invisible from the
-client. The two email routes are how you tell: the first reports what the
-deployment would use and whether its credentials are present, the second sends one
-message and returns the real error. Neither returns a key or a password.
+`email.send_sharing_invite`), so a broken mail config is invisible from the client. The
+two email routes expose it. `GET /admin/email` reports what the deployment would use
+and whether its credentials are present. `POST /admin/email/test` sends one message and
+returns the real error. Neither returns a key or a password.
 
 Metrics: `orange_users_total`, `orange_devices_total`, `orange_devices_active_total`,
 `orange_devices_online`, `orange_sync_entries_total`, `orange_sync_entries_deleted_total`,
@@ -1235,13 +1249,13 @@ A socket is closed with `4401` when its token's `exp` passes, so a long-lived so
 never outlives its credential; the client reconnects with a fresh token.
 
 The connection is subscribed to `user:<user_id>` and every `space:<space_id>` the
-user belongs to. The channel set is resolved at connect, and re-resolved by the server
-whenever a `space:membership_changed` for that user passes down their own channel - on
+user belongs to. The server resolves the channel set at connect. It re-resolves it
+whenever a `space:membership_changed` for that user passes down their own channel, on
 every replica, for every socket that user has open. A client may also ask, with
-`resubscribe` (below), but nothing depends on it doing so: a socket that joined or
+`resubscribe` (below), but nothing depends on it doing so. A socket that joined or
 created a space mid-connection is moved onto its channel either way.
 
-**Server → Client events:**
+**Server -> Client events:**
 
 ```jsonc
 { "event": "sync:entry",   "payload": { ...SyncEntryOut } }   // incl. tombstones (deleted_at set)
@@ -1268,61 +1282,61 @@ Routing rules worth knowing when implementing a client:
 - `sync:entry` is published once to `user:{author}` and once per `space:` channel in the
   entry's `space_ids`. Both carry the same payload, and the **origin device is excluded**
   from delivery, so a device never receives its own write back. A socket in a space it
-  also authored into can therefore see the same entry twice — dedupe on
+  also authored into can therefore see the same entry twice; dedupe on
   `(client_id, entry_type)`. The payload is trimmed **per socket**, the same view pull
-  gives (section 5.2): the author's sockets get the whole row on either channel, and
-  every other socket sees `space_ids` cut to the spaces it is in and `wrapped_keys` cut
-  to those spaces' wraps, never `personal`.
+  gives (section 5.2). The author's sockets get the whole row on either channel. Every
+  other socket sees `space_ids` cut to the spaces it is in, and `wrapped_keys` cut to
+  those spaces' wraps, never `personal`.
 - There is no `sync:delete`. A delete arrives as `sync:entry` with `deleted_at` set.
 - `device:online` / `device:offline` are per-device and go only to the user's own
   channel. `user:presence` is the per-user fact addressed to that user's spaces, so
   other members' lists stay current without polling REST. `online: true` is published on
-  **every** connect rather than only on the offline→online edge: a socket that dies
-  without a close leaves its presence key alive for up to `PRESENCE_TTL`, so a client
-  reconnecting inside that window looks like it never left and an edge-triggered publish
-  would say nothing. `online: false` comes from the clean-close path and, for sockets
-  that died without one, from the presence sweeper. Repeats are expected — a client
-  drops an update that changes nothing.
+  **every** connect, not only on the offline->online edge. `online: false` comes from
+  the clean-close path and, for sockets that died without one, from the presence
+  sweeper. Repeats are expected; a client drops an update that changes nothing.
+  **Why every connect:** a socket that dies without a close leaves its presence key
+  alive for up to `PRESENCE_TTL`. A client reconnecting inside that window looks like it
+  never left, so an edge-triggered publish would say nothing.
 - `space:entry_removed` carries both `author_id` and `removed_by`. `removed_by` is the
-  authoritative half: it is the account that acted. `author_id` is advisory, because the
-  removal record has one row per (space, entry) and can name only one author, while rows
-  are keyed `(user_id, client_id, entry_type)` - so an owner clearing every row under one
-  `client_id` may be clearing several authors' rows and only one of them is recorded
-  (the remover's own if present, else the lowest id). **A client must not compute
-  "did the author remove this" from `author_id == removed_by`.** It holds one copy, it
-  already knows who wrote that copy, and comparing `removed_by` against that is the only
-  answer that is true of the copy in front of the reader.
+  authoritative half: it is the account that acted. `author_id` is advisory. **A client
+  must not compute "did the author remove this" from `author_id == removed_by`.** It
+  holds one copy and already knows who wrote that copy. Comparing `removed_by` against
+  that author is the only answer that is true of the copy in front of the reader.
+  **Why advisory:** the removal record has one row per (space, entry) and can name only
+  one author, while rows are keyed `(user_id, client_id, entry_type)`. An owner clearing
+  every row under one `client_id` may be clearing several authors' rows, and only one of
+  them is recorded (the remover's own if present, else the lowest id).
 - `space:entry_removed` is the *fast* path, not the guarantee. The durable record is a
-  `space_entry_removals` row written in the same transaction that strips the space id,
-  returned by `GET /sync/pull` as `removals`. The event may be missed by anyone not
-  connected at the time, and pub/sub does not buffer for absent subscribers, so a
-  member whose device was closed learns about the withdrawal from the pull instead.
-  Losing the event therefore costs latency, not correctness.
+  `space_entry_removals` row, written in the same transaction that strips the space id
+  and returned by `GET /sync/pull` as `removals`. Anyone not connected at the time may
+  miss the event, and pub/sub does not buffer for absent subscribers. A member whose
+  device was closed learns about the withdrawal from the pull instead, so losing the
+  event costs latency, not correctness.
 - `space:membership_changed` is published to the space channel **and** to the affected
-  user's own channel, because the joiner is not on the space channel yet and a removed
-  member may already be off it. Creating a space is the same case with nobody else in
-  it: `POST /spaces` publishes `action: "joined"` to the creator's own channel alone,
-  which is what puts their open socket on the new space channel. Without it the channel
-  set resolved at connect never grows, and the owner receives nothing published to their
-  own space - entries, comments, removals, presence, or the next membership change -
+  user's own channel. The joiner is not on the space channel yet, and a removed member
+  may already be off it. Creating a space is the same case with nobody else in it:
+  `POST /spaces` publishes `action: "joined"` to the creator's own channel alone. That
+  event puts their open socket on the new space channel. Without it, the channel set
+  resolved at connect never grows. The owner would then receive nothing published to
+  their own space (entries, comments, removals, presence, or the next membership change)
   until the socket reconnects. `action: "deleted"` is published *before* the row is
   deleted, while the channel still has subscribers.
-- `space:join_requested` goes to the space channel when `members_can_approve` is set
-  and to the owner's own channel when it is not, so the fan-out matches who may act on
-  it rather than being filtered client-side. `space:join_decided` is addressed to the
-  requester's own channel - they are not on the space channel, and after a decline they
-  never will be.
+- `space:join_requested` goes to the space channel when `members_can_approve` is set,
+  and to the owner's own channel when it is not. The fan-out therefore matches who may
+  act on it, rather than being filtered client-side. `space:join_decided` is addressed
+  to the requester's own channel: they are not on the space channel, and after a decline
+  they never will be.
 - `space:rekey` is addressed to one member's own channel and is fire-and-forget: nothing
   retries it. A client that was offline recovers the same keyring from
   `SpaceOut.my_wrapped_space_keys` on its next `GET /spaces`.
 
-**Client → Server:** `{ "event": "pong" }` / `{ "event": "ack" }` (either refreshes
-the presence TTL), and `{ "event": "resubscribe" }` — re-resolves the socket's
-channel set. The server already does this itself on any membership change (see
-the connection note above), so `resubscribe` is a client saying it believes it is
-stale rather than the mechanism fan-out depends on. It costs one query, so the
-server honours at most one per socket every 5 s and ignores the rest. Frames that
-are not a JSON object (arrays, numbers, invalid JSON, binary) are ignored.
+**Client -> Server:** `{ "event": "pong" }` / `{ "event": "ack" }` (either refreshes
+the presence TTL), and `{ "event": "resubscribe" }`, which re-resolves the socket's
+channel set. The server already does this itself on any membership change (see the
+connection note above). `resubscribe` is a client saying it believes it is stale, not
+the mechanism fan-out depends on. It costs one query, so the server honours at most one
+per socket every 5 s and ignores the rest. Frames that are not a JSON object (arrays,
+numbers, invalid JSON, binary) are ignored.
 
 ### 5.9 Web Page Routes (unversioned, no auth)
 
@@ -1367,25 +1381,26 @@ Pull:  client → GET /sync/pull?after_ts=<cursor>&limit=200
 ```
 
 The space arm is not redundant with the WebSocket. Without it, an entry another member
-pushed while this device was offline would never arrive at all — live fan-out is the
-only other delivery path. The history floor is applied per membership, since the same
-caller may have full history in one space and post-join-only in another.
+pushed while this device was offline would never arrive at all, because live fan-out is
+the only other delivery path. The history floor is applied per membership, since the
+same caller may have full history in one space and post-join-only in another.
 
 `server_ts` is assigned per accepted entry from wall-clock milliseconds, so a batch does
-not share one timestamp. Cursor comparisons are strict (`>`) on pull and the cursor
+not share one timestamp. Cursor comparisons are strict (`>`) on pull, and the cursor
 write only moves forward (`POST /sync/cursor` ignores a lower value).
 
-Two rows can still share a `server_ts` (two accounts, one millisecond), and a strict
-`>` cursor would step over the second if a page ended between them. So both streams
-order by `(server_ts, id)` and a page never ends partway through one `server_ts`: a
-page cut inside a run is trimmed back to the last complete timestamp, and a page whose
-rows all share one timestamp is extended to return every row at it. The cursor stays
-a plain integer.
+Two rows can still share a `server_ts` (two accounts, one millisecond). A strict `>`
+cursor would step over the second if a page ended between them. So both streams order
+by `(server_ts, id)`, and a page never ends partway through one `server_ts`. A page cut
+inside a run is trimmed back to the last complete timestamp. A page whose rows all share
+one timestamp is extended to return every row at it. The cursor stays a plain integer.
 
 ### 6.3 Size and Row Limits
 
-Four ceilings, all in `src/config.py`. The first three are enforced in
-`push_entries`; the fourth sits in middleware, in front of it.
+Four settings in `src/config.py` set five ceilings; the tombstone cap is derived from the
+live-row cap. The entry-size and row caps are enforced in `push_entries`, the batch cap by
+the request schema (`src/sync/schemas.py`), and the request-size cap in middleware, in
+front of all of them.
 
 | Setting | Default | Refusal |
 |---|---|---|
@@ -1395,47 +1410,42 @@ Four ceilings, all in `src/config.py`. The first three are enforced in
 | `max_push_batch` | 200 entries | 422 on the request body, before any work |
 | `max_request_bytes` | 8 MB | 413, before the body is read at all |
 
-`max_entry_bytes` applies to `encrypted_content` and `encrypted_metadata`
-**separately**. Both are ciphertext on the same row, and capping only the first left
-the second as a way around it. Separately rather than as a sum because the client
-derives its own local limit from this number, and charging metadata against the
-content budget would put that derivation a few bytes off and refuse rows that
-should have fit.
+How each one behaves:
 
-`max_request_bytes` is the only one of the four that is not about a row. The three
-above it are read off an already-parsed body, so by the time any of them runs the
-request has been buffered and built into as many as `max_push_batch` models - which
-is the cost they cannot prevent, whatever they then decide. It is checked against
-`Content-Length` when the client offers one and against the running total either
-way, because a chunked request offers nothing. A body that goes over is answered
-413 from inside the receive channel and its read is then closed as a disconnect, so
-the route never runs; `BodySizeLimitMiddleware` carries the reason that answer
-cannot simply be an exception.
-
-`account_full` counts live rows only (`deleted_at IS NULL`) and refuses only a new
-**live** row. It is checked *after* the update path, so a full account can still be
-edited and emptied; and a new *tombstone* is let through as well - it adds nothing to
-a count that excludes tombstones, and it is the very thing that frees space. That last
-part is what keeps "remove from my devices" for a received entry working at quota: that
-hide is a brand-new tombstone row, so without the exemption it would be the one delete a
-full account could not make. A cap that blocks its own remedy is a cap the user cannot
-get out from under.
-
-Tombstones have a cap of their own, three times the live-row cap, so an account cannot
-grow the table without bound through deletes. It refuses only a brand-new tombstone
-row; turning a live row into a tombstone is always allowed. Reviving a tombstone (a
-push with `deleted_at` null onto a deleted row) makes a live row again, so it needs a
-free live slot like an insert does.
-
-Both per-account limits count rows by `user_id`, which means an entry somebody else
-shared into your space is **their** row on **their** account and does not count
-against you. Same rule as the storage quota ([section 2.4](#24-blobs-srcblobs)): you are charged for what you
-uploaded, nothing else. The account screen shows both as bars beside each other for
-that reason.
-
-Note that `max_entry_bytes` bounds `encrypted_content`, which lives in Postgres, not
-R2 - it is the only thing that bounds it. A row cap bounds total bytes only at
-typical entry sizes.
+- **`max_entry_bytes`** applies to `encrypted_content` and `encrypted_metadata`
+  **separately**. It is the only thing that bounds `encrypted_content`, which lives in
+  Postgres, not R2. A row cap bounds total bytes only at typical entry sizes.
+  **Why separately:** both are ciphertext on the same row, and capping only the first
+  left the second as a way around it. It is not a sum because the client derives its
+  own local limit from this number. Charging metadata against the content budget would
+  put that derivation a few bytes off and refuse rows that should have fit.
+- **`max_request_bytes`** is the only one of the four settings not about a row. It is
+  checked against `Content-Length` when the client offers one, and against the running
+  total either way, because a chunked request offers nothing. A body that goes over is
+  answered 413 from inside the receive channel. Its read is then closed as a disconnect,
+  so the route never runs. `BodySizeLimitMiddleware` carries the reason that answer
+  cannot simply be an exception.
+  **Why:** the other limits are read off an already-parsed body. By the time any of them
+  runs, the request has been buffered and built into as many as `max_push_batch` models,
+  a cost they cannot prevent whatever they decide.
+- **`account_full` (live rows)** counts live rows only (`deleted_at IS NULL`) and refuses
+  only a new **live** row. It is checked *after* the update path, so a full account can
+  still be edited and emptied. A new *tombstone* is let through too. This keeps "remove
+  from my devices" for a received entry working at quota, because that hide is a
+  brand-new tombstone row.
+  **Why:** a tombstone adds nothing to a count that excludes tombstones, and it is the
+  thing that frees space. A cap that blocks its own remedy is one the user cannot get
+  out from under.
+- **`account_full` (tombstones)** caps tombstones at three times the live-row cap, so an
+  account cannot grow the table without bound through deletes. It refuses only a
+  brand-new tombstone row; turning a live row into a tombstone is always allowed.
+  Reviving a tombstone (a push with `deleted_at` null onto a deleted row) makes a live
+  row again, so it needs a free live slot, like an insert.
+- **Whose rows count.** Both per-account limits count rows by `user_id`. An entry
+  somebody else shared into your space is **their** row on **their** account, and does
+  not count against you. The storage quota follows the same rule
+  ([section 2.4](#24-blobs-srcblobs)): you are charged for what you uploaded, nothing
+  else. The account screen shows both as bars side by side for that reason.
 
 ### 6.4 Offline Operation
 
@@ -1446,13 +1456,14 @@ startup/reconnect, queues pushes while offline, and applies WS events as they ar
 
 ## 7. E2E Encryption Design
 
-The invariant: entry payloads reach the server (and Supabase) as **ciphertext only** —
-never plaintext content, note titles, or labels. All key material is generated, wrapped,
-and unwrapped on the client. Space *names* are the deliberate exception: `spaces.name` is
-plaintext, because an invitee is shown the space name before they join and therefore
-before they hold any key that could decrypt it. See [section 7.5](#75-server-visibility) for the full visibility list.
+The invariant: entry payloads reach the server (and Supabase) as **ciphertext only**,
+never as plaintext content, note titles, or labels. The client generates, wraps and
+unwraps all key material. Space *names* are the deliberate exception: `spaces.name` is
+plaintext. An invitee is shown the space name before they join, and therefore before
+they hold any key that could decrypt it. See [section 7.5](#75-server-visibility) for
+the full visibility list.
 
-### 7.1 User Master Key (UMK) — envelope model
+### 7.1 User Master Key (UMK) - envelope model
 
 The UMK is a **random 32-byte key**, not derived from the password. The password is
 stretched once on the device and **split in two**: an *auth key* that is the only
@@ -1469,11 +1480,11 @@ wrapped_umk  = AES-256-GCM(KEK, UMK, aad="umk-envelope-v2")   -- the envelope, s
 UMK          = AES-256-GCM-open(KEK, wrapped_umk)              -- recovered on login
 ```
 
-The raw password is not sent anywhere. Supabase stores a bcrypt hash of `auth_key`;
-recovering `auth_key` from that hash, or capturing it in transit, gives the ability to
+The raw password is not sent anywhere. Supabase stores a bcrypt hash of `auth_key`.
+Recovering `auth_key` from that hash, or capturing it in transit, gives the ability to
 sign in and nothing else, because HKDF is one-way and the two halves are independent.
-The master is salted with the *address* rather than a server value because it has to
-exist before sign-in - it produces the credential - and the address is the one thing
+The master is salted with the *address* rather than a server value. It has to exist
+before sign-in, because it produces the credential, and the address is the one thing
 known about the account at that point. The `kdf_salt` still binds the KEK to the
 account row.
 
@@ -1488,14 +1499,14 @@ read sign-in traffic had the same shortcut.
 - **Return / new device:** the client fetches `wrapped_umk` from `bootstrap`, derives
   the KEK from the entered password, and unwraps. A GCM auth failure = wrong password.
 - **Accounts from before the split** (`Argon2id(password, kdf_salt)` as the KEK, AAD
-  `umk-envelope-v1`, raw password on file with Supabase) migrate on their next sign-in,
-  client-side and without a server change: sign-in with `auth_key` is refused, the client
-  retries once with the raw password, opens the envelope with the legacy KEK, re-wraps
-  the same UMK under the new KEK (`PUT /auth/umk`), and only then replaces the Supabase
-  credential (`PUT /user` with `auth_key`). Envelope first, credential second, so a
-  failure between the two leaves the old sign-in working. An envelope in the old format
-  behind a Google sign-in follows the same path. Nothing is re-encrypted; the UMK does
-  not change.
+  `umk-envelope-v1`, raw password on file with Supabase) migrate on their next sign-in.
+  The migration is client-side and needs no server change. Supabase refuses sign-in with
+  `auth_key`, and the client retries once with the raw password. It opens the envelope
+  with the legacy KEK and re-wraps the same UMK under the new KEK (`PUT /auth/umk`).
+  Only then does it replace the Supabase credential (`PUT /user` with `auth_key`).
+  Envelope first, credential second, so a failure between the two leaves the old
+  sign-in working. An envelope in the old format behind a Google sign-in follows the
+  same path. Nothing is re-encrypted; the UMK does not change.
 
 Decoupling the key from the password means a **password change only re-wraps the
 UMK** (one `PUT /auth/umk`) instead of re-encrypting all data. The server holds only
@@ -1518,13 +1529,14 @@ app and sent nowhere, so it needs no split.
 
 #### UMK proof
 
-A bearer token alone must not be enough to change key material: a stolen access token
-could otherwise replace the password envelope with one under a key the thief chose,
-wrap the UMK for a device they control, or revoke the owner's devices. So those
-routes take `X-Umk-Proof`, 32 bytes the client derives from the UMK itself and sends
+A bearer token alone is not enough to change key material. The routes that do take
+`X-Umk-Proof`: 32 bytes the client derives from the UMK itself and sends
 base64-encoded. Only a caller that has unlocked the account can produce it. The server
-stores `sha256(proof)` in `profiles.umk_proof_hash` and never the proof; the proof is
-not a key and opens nothing the server holds.
+stores `sha256(proof)` in `profiles.umk_proof_hash`, never the proof. The proof is not a
+key and opens nothing the server holds.
+**Why:** without it, a stolen access token could replace the password envelope with one
+under a key the thief chose, wrap the UMK for a device they control, or revoke the
+owner's devices.
 
 Routes: `PUT /auth/umk`, `PUT /auth/umk/recovery`, `DELETE /auth/umk/recovery`,
 `POST /auth/devices/{id}/key-wrap`, `DELETE /auth/devices/{id}`.
@@ -1546,9 +1558,10 @@ one-way function of the UMK, so holding the proof gives nothing back about the k
 **Account reset.** A user who has lost every way to open the old UMK starts over with a
 new one, so they cannot prove the old key. `PUT /auth/umk` with `"reset": true` is
 accepted without a matching proof only when the token's `amr` claim has an entry with
-`method == "recovery"`, which Supabase sets on a session opened from a password-recovery
-link. The header is still required and must carry the proof of the *new* UMK: it
-replaces the stored hash. The replaced envelope moves to `profiles.pw_wrapped_umk_prev`.
+`method == "recovery"`. Supabase sets that entry on a session opened from a
+password-recovery link. The header is still required and must carry the proof of the
+*new* UMK, which replaces the stored hash. The replaced envelope moves to
+`profiles.pw_wrapped_umk_prev`.
 A `reset` from any other session is judged like an ordinary write. After a reset the
 client clears the recovery envelope and re-wraps for its devices with the new proof.
 
@@ -1568,10 +1581,10 @@ What a client tries, cheapest first, when it needs the UMK:
 that needs none means the server can decrypt, which ends the end-to-end guarantee.
 That option does not exist here and must not be added.
 
-### 7.2 Content Encryption — the per-entry CEK envelope
+### 7.2 Content Encryption - the per-entry CEK envelope
 
 Content is **not** encrypted under the UMK or under a Space Key. Every entry gets its own
-random 32-byte **content encryption key (CEK)**; the content is encrypted exactly once
+random 32-byte **content encryption key (CEK)**. The content is encrypted exactly once
 under it, and the CEK is then wrapped once per reader:
 
 ```
@@ -1587,27 +1600,33 @@ wrapped_keys = {                                    -- JSON map, stored as TEXT
 where wrap(k, key) = base64( nonce || AES-256-GCM(key=k, base64(key), aad="key-wrap") )
 ```
 
-This is what makes fan-out cheap and consistent: sharing the same entry into three spaces
-adds three 60-odd-byte wraps, not three copies of the ciphertext, and every reader
-decrypts byte-identical content. Re-sharing an existing entry into a new space means
-re-pushing it with an extra wrap — the ciphertext does not change.
+What the envelope buys:
 
-`aad=client_id` binds the ciphertext to its entry, so a row's content cannot be moved onto
-a different `client_id` without breaking the GCM tag. The `"key-wrap"` AAD does the same
-job for the wraps: a wrapped CEK cannot be replayed as an entry payload or vice versa.
+- **Cheap, consistent fan-out.** Sharing the same entry into three spaces adds three
+  60-odd-byte wraps, not three copies of the ciphertext, and every reader decrypts
+  byte-identical content. Re-sharing an existing entry into a new space means re-pushing
+  it with an extra wrap; the ciphertext does not change.
+- **Bound ciphertext.** `aad=client_id` binds the ciphertext to its entry, so a row's
+  content cannot be moved onto a different `client_id` without breaking the GCM tag.
+- **Bound wraps.** The `"key-wrap"` AAD does the same for the wraps: a wrapped CEK cannot
+  be replayed as an entry payload, or the reverse.
 
-**Decrypt path.** Try `wrapped_keys["personal"]` against the UMK first; if that is absent
-or fails, walk the entry's `space_ids` and trial-decrypt `wrapped_keys[space_id]` against
-each key in that space's keyring, newest first. An AES-GCM auth failure just means "wrong
-key", so trial decryption is safe and no key epoch or version number has to be carried on
-the wire. An entry whose CEK unwraps under no held key is skipped, not dropped — a later
-`space:rekey` or `GET /spaces` can make it readable.
+**Decrypt path.**
+
+1. Try `wrapped_keys["personal"]` against the UMK.
+2. If that is absent or fails, walk the entry's `space_ids` and trial-decrypt
+   `wrapped_keys[space_id]` against each key in that space's keyring, newest first.
+3. If the CEK unwraps under no held key, skip the entry; do not drop it. A later
+   `space:rekey` or `GET /spaces` can make it readable.
+
+An AES-GCM auth failure means "wrong key", so trial decryption is safe, and no key epoch
+or version number has to be carried on the wire.
 
 `encrypted_metadata` encodes `{ groups, pinned, label }` for a clipboard entry and
 `{ title, groups, pinned }` for a note, under the same CEK. `groups` here is the app's
-*local* entry-grouping feature and has nothing to do with sharing. An entry's space routing
-is deliberately *not* in there: the server has to read `space_ids` in the clear to fan out
-at all.
+*local* entry-grouping feature and has nothing to do with sharing. An entry's space
+routing is deliberately *not* in there: the server has to read `space_ids` in the clear
+to fan out at all.
 
 ### 7.3 Multi-Device UMK Sharing (X25519)
 
@@ -1621,40 +1640,42 @@ at all.
 
 Every space has a **Space Key**: a random 32-byte key held in client memory, **minted** by
 the owner and handed over by **any member who holds it**. It never encrypts content
-directly — it only wraps per-entry CEKs ([section 7.2](#72-content-encryption--the-per-entry-cek-envelope)). A member's copy is wrapped for their
-identity key:
+directly; it only wraps per-entry CEKs
+([section 7.2](#72-content-encryption---the-per-entry-cek-envelope)). A member's copy is
+wrapped for their identity key:
 
 ```
 shared  = X25519(distributor_identity_priv, member_identity_pubkey)
 wrapped = wrap(shared, SpaceKey)
 ```
 
-Because X25519 is symmetric in the pair, the recipient derives the same secret from
-`X25519(their_priv, distributor_identity_pubkey)` — which is why
+X25519 is symmetric in the pair, so the recipient derives the same secret from
+`X25519(their_priv, distributor_identity_pubkey)`. That is why
 `SpaceOut.members[].identity_pubkey` carries every member's key, and why `my_wrapped_by`
-says which of them to use (null = the owner). A distributor also wraps for itself
-(`X25519(priv, own_pub)` is a valid secret); that is how a member recovers its ring after a
-restart.
+says which of them to use (null = the owner). A distributor also wraps for itself, since
+`X25519(priv, own_pub)` is a valid secret. That is how a member recovers its ring after
+a restart.
 
-Minting stays owner-only, so there is still exactly one account deciding what the current
-key is; distribution is open to any keyholder, but a non-owner may only **fill a gap**:
-the server skips a non-owner's write onto a row that already holds a wrap, and onto the
-owner's row always. Reconcile only ever wraps for members with `has_space_key = false`,
-so honest clients lose nothing; a member can no longer overwrite someone's working ring
-with a key that is not this space's. Why distribution was widened from owner-only
-to any keyholder is recorded in the website design record.
+The rules:
 
-**Verifying a received ring.** The server stores whatever wrap it is handed and cannot
-check it. With more than one possible writer, a member could hand a newcomer a key that is
-not this space's: the unwrap would succeed and the victim would silently decrypt nothing.
-So the owner writes `spaces.key_fingerprint` when it mints, and a recipient checks the
-unwrapped ring against it before adopting it. A mismatch is surfaced as an error rather
-than retried, since retrying cannot fix a wrong key. A self-write needs no check.
-
-**The keyring.** `space_memberships.wrapped_space_keys` is a JSON *array*, newest key
-first, and every distribution sends the whole ring. Older keys must survive a rekey or
-entries written under them become permanently unreadable, and they exist nowhere but in
-client memory and these wraps.
+- **Minting stays owner-only,** so exactly one account decides what the current key is.
+- **Distribution is open to any keyholder, but a non-owner may only fill a gap.** The
+  server skips a non-owner's write onto a row that already holds a wrap, and always onto
+  the owner's row. Reconcile only ever wraps for members with `has_space_key = false`.
+  Honest clients therefore lose nothing, and a member cannot overwrite someone's working
+  ring with a key that is not this space's. Why distribution was widened from owner-only
+  to any keyholder is recorded in the website design record.
+- **Verifying a received ring.** The owner writes `spaces.key_fingerprint` when it mints.
+  A recipient checks the unwrapped ring against it before adopting it. A mismatch is
+  surfaced as an error, not retried, since retrying cannot fix a wrong key. A self-write
+  needs no check.
+  **Why:** the server stores whatever wrap it is handed and cannot check it. With more
+  than one possible writer, a member could hand a newcomer a key that is not this
+  space's. The unwrap would succeed, and the victim would silently decrypt nothing.
+- **The keyring.** `space_memberships.wrapped_space_keys` is a JSON *array*, newest key
+  first, and every distribution sends the whole ring. Older keys must survive a rekey,
+  or entries written under them become permanently unreadable. They exist nowhere but in
+  client memory and these wraps.
 
 **Reconcile** runs on login, on WebSocket connect, on `space:rekey`, and after any
 membership change. Every member runs it, for each space it is in, given `GET /spaces`:
@@ -1662,27 +1683,27 @@ membership change. Every member runs it, for each space it is in, given `GET /sp
 1. Recover the local ring by unwrapping `my_wrapped_space_keys` against the public key
    `my_wrapped_by` names. Verify it against `key_fingerprint`; on mismatch, refuse and
    report. An empty or absent wrap does **not** clear the in-memory ring.
-2. Only the owner mints. An empty ring means a first key; a non-null `rekey_requested_at`
-   while the ring is non-empty means a new key **prepended** to it, published with a fresh
-   `key_fingerprint`.
+2. Only the owner mints. An empty ring means a first key. A non-null
+   `rekey_requested_at` while the ring is non-empty means a new key **prepended** to it,
+   published with a fresh `key_fingerprint`.
 3. Wrap the full ring for every member with `has_space_key = false` (or for everyone, if a
    key was just minted) and `POST /spaces/{id}/keys`. Members with no registered
    `identity_pubkey` are skipped and retried on the next reconcile.
 
-Distribution only happens while someone lacks keys, so the `space:rekey` events the server
-echoes back cannot drive an endless reconcile loop. A member who cannot yet be helped is
-retried on a backoff, and any keyholder coming online is another chance — in a space with
-more than one person, somebody nearly always is.
+Distribution only happens while someone lacks keys, so the `space:rekey` events the
+server echoes back cannot drive an endless reconcile loop. A member who cannot yet be
+helped is retried on a backoff. Any keyholder coming online is another chance, and in a
+space with more than one person, somebody nearly always is.
 
 **Rekey on departure.** When a member is removed or leaves, the server deletes the
-membership, clears `wrapped_space_keys` for every remaining **non-owner** member, and sets
-`spaces.rekey_requested_at`. That is the entire server-side mechanism; the server never
-sees a key. The owner's next reconcile prepends a fresh key and redistributes, and entries
-pushed from then on wrap their CEK under the new key, which the departed member never
-receives. Distribution clears the flag once every remaining member holds a wrap.
+membership, clears `wrapped_space_keys` for every remaining **non-owner** member, and
+sets `spaces.rekey_requested_at`. That is the entire server-side mechanism; the server
+never sees a key. The owner's next reconcile prepends a fresh key and redistributes.
+Entries pushed from then on wrap their CEK under the new key, which the departed member
+never receives. Distribution clears the flag once every remaining member holds a wrap.
 
-The owner's own wrap is deliberately left alone: it is the owner's only copy of the
-previous ring should their app restart before redistributing, and that ring lives nowhere
+The owner's own wrap is deliberately left alone. It is the owner's only copy of the
+previous ring if their app restarts before redistributing, and that ring lives nowhere
 but in memory and these wraps.
 
 Revocation is **best-effort by construction**, and the edges are real:
@@ -1696,7 +1717,7 @@ Revocation is **best-effort by construction**, and the edges are real:
   exists, and a removed member who still holds the old key could decrypt entries pushed
   under it.
 - A wrap is opened against a public key the *server* returned, unpinned. That is fine
-  against a passive server, which is the threat model here; an active malicious server
+  against a passive server, which is the threat model here. An active malicious server
   could substitute a key it owns. The fingerprint check defends against another member,
   not against the server that also serves the fingerprint.
 
@@ -1723,19 +1744,19 @@ sequenceDiagram
 
 ### 7.5 Server Visibility
 
-Server sees: entry type/kind, timestamps, `pinned`, blob keys and sizes, which spaces an
-entry was shared into (`space_ids`), space membership (user ↔ space), space names, invitee
-emails, and public keys.
+Server sees: entry type/kind, timestamps, `pinned`, blob keys and sizes, which spaces
+an entry was shared into (`space_ids`), space membership (which user is in which space),
+space names, invitee emails, and public keys.
 
-The one plaintext exception is `announcements` ([section 16](#16-announcements)) — rows the *server itself*
-wrote, so there was never a plaintext of the user's to protect.
+The one plaintext exception is `announcements` ([section 16](#16-announcements)): rows
+the *server itself* wrote, so there was never a plaintext of the user's to protect.
 
 Server never sees: `encrypted_content`, `encrypted_metadata`,
 `user_settings.encrypted_blob`, the UMK, any CEK, or any Space Key. `wrapped_keys` and
-`wrapped_space_keys` pass through as opaque strings — the server stores and echoes them
+`wrapped_space_keys` pass through as opaque strings. The server stores and echoes them
 without parsing, and holds no private key that could open either. Send filters and
-auto-copy live in the encrypted settings blob, so the server cannot tell why a given entry
-was or was not shared.
+auto-copy live in the encrypted settings blob, so the server cannot tell why a given
+entry was or was not shared.
 
 ---
 
@@ -1747,27 +1768,28 @@ presence + publish helpers.
 ### 8.1 Fan-out (horizontally scalable)
 
 Each API process keeps an in-memory hub of its **local** sockets and runs one Redis
-`psubscribe("user:*", "space:*", "broadcast:*")` listener. A write publishes an event to Redis; every
-process forwards it to its own local sockets on that channel. No sticky sessions; add
-replicas freely.
+`psubscribe("user:*", "space:*", "broadcast:*")` listener. A write publishes an event to
+Redis, and every process forwards it to its own local sockets on that channel. No sticky
+sessions; add replicas freely.
 
-Origin-device exclusion travels in-band: the publisher attaches `_origin_device` to the
-Redis message, and each process strips that field before delivering and skips sockets whose
-`device_id` matches. That is what keeps a device from receiving its own push back as a
-`sync:entry` — and it is per-device, not per-user, so the author's *other* devices still get
-the event.
+Origin-device exclusion travels in-band. The publisher attaches `_origin_device` to the
+Redis message. Each process strips that field before delivering, and skips sockets whose
+`device_id` matches. That keeps a device from receiving its own push back as a
+`sync:entry`. The exclusion is per-device, not per-user, so the author's *other* devices
+still get the event.
 
 ### 8.2 Presence (connection-driven)
 
-- **Connect** → `SADD user:{uid}:devices {did}`, `SET presence:{uid}:{did} EX 300`,
+- **Connect** -> `SADD user:{uid}:devices {did}`, `SET presence:{uid}:{did} EX 300`,
   publish `device:online` **immediately**.
-- **Clean disconnect** → `SREM`, `DEL presence:{uid}:{did}`, publish `device:offline`
+- **Clean disconnect** -> `SREM`, `DEL presence:{uid}:{did}`, publish `device:offline`
   **immediately**.
-- **Heartbeat** — server pings every 25 s; any client message/`pong` refreshes the
+- **Heartbeat** - server pings every 25 s; any client message/`pong` refreshes the
   presence TTL.
-- **Crash backstop** — a socket that dies without a clean close leaves its presence
-  key to expire; the maintenance sweeper ([section 10](#10-background-maintenance)) then emits `device:offline`. So the
-  instant path is primary and the sweep is a safety net, not a 60 s-latency primary.
+- **Crash backstop** - a socket that dies without a clean close leaves its presence
+  key to expire. The maintenance sweeper ([section 10](#10-background-maintenance)) then
+  emits `device:offline`. The instant path is primary, and the sweep is a safety net,
+  not a 60 s-latency primary.
 
 ---
 
@@ -1792,22 +1814,26 @@ Identity is Supabase's; the app layers device + key state on top.
         → FastAPI verifies the JWT (ES256/RS256 via JWKS, or legacy HS256; aud='authenticated')
 ```
 
-**Token verification** (`src/auth/tokens.py`): the algorithm is read from the token
-header and allowlisted to `ES256`/`RS256`/`HS256` before any key is selected, so `none`
-and unknown algorithms are refused up front. Asymmetric tokens verify against the
-project's JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`, cached in-process for
-300 s, so Supabase-side rotation needs no redeploy). The lookup runs in the threadpool,
-never on the event loop, and a `kid` missing from the cached set forces at most one
-refetch per 60 s across the process; inside that window it is judged against the set
-already held. `HS256` verifies against `SUPABASE_JWT_SECRET`; when that secret is unset
-an HS256 token is answered `401`, as a token this deployment does not accept. Algorithm
-confusion has nothing to forge against, since the two branches draw on unrelated key
-material. Decode requires `exp` and `sub` and checks the audience, with 30 s of leeway
-for clock drift between Supabase and this host. When `SUPABASE_URL` is set it also
-requires `iss == {SUPABASE_URL}/auth/v1`, so a token from another project that shares a
-key is refused. No deny-list — Supabase owns session
-revocation. To immediately cut off a user, ban them via the admin suspend endpoint
-(Supabase).
+**Token verification** (`src/auth/tokens.py`):
+
+- **Algorithm.** Read from the token header and allowlisted to `ES256`/`RS256`/`HS256`
+  before any key is selected, so `none` and unknown algorithms are refused up front.
+- **Asymmetric tokens** verify against the project's JWKS
+  (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`), cached in-process for 300 s, so
+  Supabase-side rotation needs no redeploy. The lookup runs in the threadpool, never on
+  the event loop. A `kid` missing from the cached set forces at most one refetch per 60 s
+  across the process. Inside that window, the token is judged against the set already
+  held.
+- **`HS256`** verifies against `SUPABASE_JWT_SECRET`. When that secret is unset, the
+  server answers an HS256 token with `401`, as a token this deployment does not accept.
+  Algorithm confusion has nothing to forge against, since the two branches draw on
+  unrelated key material.
+- **Claims.** Decode requires `exp` and `sub` and checks the audience, with 30 s of
+  leeway for clock drift between Supabase and this host. When `SUPABASE_URL` is set it
+  also requires `iss == {SUPABASE_URL}/auth/v1`, so a token from another project that
+  shares a key is refused.
+- **Revocation.** No deny-list: Supabase owns session revocation. To cut off a user
+  immediately, ban them via the admin suspend endpoint (Supabase).
 
 **A verification failure answers 401 only when a token was actually judged.** Every
 authenticated route can therefore return one of two statuses on failure, and the
@@ -1818,37 +1844,45 @@ difference is part of the contract:
 | `401` | The token was read and refused: bad signature, unknown `kid` in a key set we *did* fetch, expired, wrong audience, disallowed algorithm | Treat the credential as dead. Re-authenticate. |
 | `503` + `Retry-After` | We could not reach the JWKS endpoint, so nothing was judged (`PyJWKClientConnectionError`) | Retry. The credential is untouched. |
 
-Collapsing the second into the first is not a cosmetic error: the desktop client's
-silent session restore reads 401 as a verdict and ends the session with no retry, so a
-single failed DNS lookup here signs a user out and makes them type a password. An
-unknown `kid` fetched successfully stays 401 on purpose — a forged random `kid` must
-not be a way to drive 5xx out of the service.
+An unknown `kid` in a successfully fetched key set stays 401 on purpose.
+**Why:** collapsing the 503 into a 401 is not a cosmetic error. The desktop client's
+silent session restore reads 401 as a verdict and ends the session with no retry. A
+single failed DNS lookup here would sign a user out and make them type a password. The
+unknown-`kid` case stays 401 because a forged random `kid` must not be a way to drive
+5xx out of the service.
 
 ---
 
 ## 10. Background Maintenance
 
-`src/background.py` replaces Celery + beat. A single asyncio loop, started in the app
-lifespan, guarded by a **Postgres advisory lock** (`pg_try_advisory_lock`), so across
-N replicas exactly one runs it. If the leader dies, its connection drops, the lock
-releases, and another replica takes over on its next attempt.
+`src/background.py` replaces Celery + beat. It runs a single asyncio loop, started in
+the app lifespan and guarded by a **Postgres advisory lock** (`pg_try_advisory_lock`),
+so across N replicas exactly one runs it. If the leader dies, its connection drops, the
+lock releases, and another replica takes over on its next attempt (every 30 s).
 
-Two jobs:
+Four jobs:
 
-- **Presence sweep** (every 60 s) — scan `user:*:devices`; for members whose
-  `presence:{uid}:{did}` key has expired, `SREM` and publish `device:offline`.
-- **Orphan blob cleanup** (hourly) — delete unconfirmed blobs older than 1 h from the
+- **Presence sweep** (every 60 s) - scan `user:*:devices`. For members whose
+  `presence:{uid}:{did}` key has expired, `SREM` and publish `device:offline`. When that
+  leaves the user with no device online, also publish `user:presence` offline to every
+  space they belong to.
+- **Unreferenced blob release** (hourly) - un-confirm confirmed blobs older than 7 days
+  that no live entry references, so they stop counting against the quota. The next
+  orphan cleanup deletes them.
+- **Orphan blob cleanup** (hourly) - delete unconfirmed blobs older than 1 h from the
   object store and the `blobs` table.
+- **Removal-record pruning** (hourly) - delete `space_entry_removals` rows older than
+  90 days. A device offline longer than that keeps its copy of a withdrawn entry.
 
-Email (space invites) is sent separately via FastAPI `BackgroundTasks` (best-effort;
-failures are logged, not surfaced to the request).
+Email (space invites) is sent separately via FastAPI `BackgroundTasks`. It is
+best-effort: failures are logged, not surfaced to the request.
 
 Every message is rendered from `src/web/templates/email_shell.html` plus a body
-fragment, so the invite and the admin test mail share one frame. Supabase sends
-account mail from templates held in its own dashboard, which cannot import from
-here: `scripts/render_supabase_emails.py` renders paste-ready copies off the same
-shell into `docs/supabase-email/`, and has to be re-run and re-pasted when the
-shell changes.
+fragment, so the invite and the admin test mail share one frame. Supabase sends account
+mail from templates held in its own dashboard, which cannot import from here.
+`scripts/render_supabase_emails.py` renders paste-ready copies off the same shell into
+`docs/supabase-email/`. It has to be re-run, and the output re-pasted, when the shell
+changes.
 
 ---
 
@@ -1861,27 +1895,28 @@ Deployment topology, environment variables, and cost live in [`DEPLOY.md`](DEPLO
 ## 15. Spaces Design
 
 A space is a named room any number of users can join, where every member sees the entries
-other members send in, in real time. It is the **only** sharing primitive: the earlier split
-between persistent pool groups and ephemeral Live Share sessions is gone, along with
+other members send in, in real time. It is the **only** sharing primitive. The earlier
+split between persistent pool groups and ephemeral Live Share sessions is gone, along with
 `group_type`, `max_members`, and server-side `share_scope`.
 
-Why one primitive: the two used the same tables, the same key distribution, and the same
-fan-out. The only real differences were a member cap and a scope column the server stored
-but never enforced. Both were removed rather than kept as configuration.
+**Why one primitive:** the two used the same tables, the same key distribution, and the
+same fan-out. The only real differences were a member cap and a scope column the server
+stored but never enforced. Both were removed rather than kept as configuration.
 
 ### 15.1 Personal Sync vs Spaces
 
 They are separate concerns on the same pipe, distinguished by one field:
 
-- **Personal sync** — an entry with `space_ids = []`. Reaches only the author's own
+- **Personal sync** - an entry with `space_ids = []`. Reaches only the author's own
   devices, over `user:{uid}`. This is the baseline: everything a client captures syncs
   personally, whether or not any space exists.
-- **A space** — an entry with one or more `space_ids`. Still reaches the author's own
+- **A space** - an entry with one or more `space_ids`. Still reaches the author's own
   devices, *and* every member of each listed space. The same row serves both, because the
-  CEK envelope carries a `"personal"` wrap alongside the per-space wraps ([section 7.2](#72-content-encryption--the-per-entry-cek-envelope)).
+  CEK envelope carries a `"personal"` wrap alongside the per-space wraps
+  ([section 7.2](#72-content-encryption---the-per-entry-cek-envelope)).
 
-Nothing enters a space implicitly. The client decides per entry, from its own send filters,
-and the server has no view into that decision.
+Nothing enters a space implicitly. The client decides per entry, from its own send
+filters, and the server has no view into that decision.
 
 ### 15.2 Establishing a Space
 
@@ -1896,46 +1931,48 @@ Owner   → reconciles and posts the wrapped keyring (section 7.4)
 ```
 
 Two invitation paths, one membership model. The invite code is a bearer secret usable by
-anyone holding it; an addressed invite targets one email, survives the invitee being
-offline, and reports its outcome back to the inviter.
+anyone holding it, and redeeming it raises a join request. An addressed invite targets
+one email, survives the invitee being offline, and reports its outcome back to the
+inviter.
 
 ### 15.3 Live Entry Fan-out
 
-A client sends an entry into a space by listing the space in `space_ids` and adding that
-space's wrap to `wrapped_keys`, then pushing as normal. The server stores the row and
-publishes `sync:entry` to `user:{author}` and to each `space:{id}`; every member's socket
-receives it and unwraps the CEK locally. Members who were offline pick the same row up on
-their next `GET /sync/pull` through the space arm ([section 6.2](#62-push--pull)), subject to their history floor.
+A client sends an entry into a space by listing the space in `space_ids`, adding that
+space's wrap to `wrapped_keys`, and pushing as normal. The server stores the row and
+publishes `sync:entry` to `user:{author}` and to each `space:{id}`. Every member's socket
+receives it and unwraps the CEK locally. Members who were offline pick the same row up
+on their next `GET /sync/pull` through the space arm ([section 6.2](#62-push--pull)),
+subject to their history floor.
 
 ### 15.4 Leaving, Removal, and Deletion
 
-- `DELETE /spaces/{id}/members/{uid}` — the owner removing a member, or a member removing
-  themselves. Both clear every remaining member's wrapped keyring, which is what drives the
-  rekey ([section 7.4](#74-space-key-distribution-and-rekey)). The owner cannot leave their own space.
-- `DELETE /spaces/{id}` — owner only. `space:membership_changed` with `action: "deleted"`
-  is published first, while the channel still has subscribers; then the row goes and
+- `DELETE /spaces/{id}/members/{uid}` - the owner removing a member, or a member removing
+  themselves. Both clear every remaining non-owner member's wrapped keyring and set
+  `spaces.rekey_requested_at`, which is what drives the rekey
+  ([section 7.4](#74-space-key-distribution-and-rekey)). The owner cannot leave their own
+  space.
+- `DELETE /spaces/{id}` - owner only. `space:membership_changed` with `action: "deleted"`
+  is published first, while the channel still has subscribers. Then the row goes, and
   memberships and invites cascade.
 
 Deleting a space does not delete its entries. Rows keep their `space_ids`, but with no
-memberships left the space arm of the pull query matches nobody, and clients drop keyrings
-for spaces that no longer come back from `GET /spaces` (zeroizing the key bytes). What
-members already decrypted stays in their local history — that is a deliberate consequence
+memberships left the space arm of the pull query matches nobody. Clients drop keyrings
+for spaces that no longer come back from `GET /spaces`, zeroizing the key bytes. What
+members already decrypted stays in their local history. That is a deliberate consequence
 of client-side storage, not a gap to be closed server-side.
 
 ---
 
 ## 16. Announcements
 
-Operator's guide - how to actually send one, and how to word it:
+Operator's guide, covering how to send one and how to word it:
 [`ANNOUNCEMENTS.md`](ANNOUNCEMENTS.md). Nothing sends one automatically yet; the
 machinery is in place and waiting for a reason to use it.
 
-The one table holding plaintext, and deliberately: an announcement is the
-*service* talking - a maintenance window, a quota change, a note to one account.
-Nothing in it derives from an entry, a note, or a space name, so there is nothing
-the server would have had to decrypt in order to write it. Anything that *would*
-need decrypting is not an announcement, and belongs in an event the client can
-phrase itself.
+An announcement is the *service* talking: a maintenance window, a quota change, a note
+to one account. That is why its table may hold plaintext
+([section 4.13](#413-announcements)). Anything that *would* need decrypting is not an
+announcement, and belongs in an event the client can phrase itself.
 
 One table, addressed or not:
 
@@ -1944,26 +1981,24 @@ One table, addressed or not:
 | a uuid | that account only | `user:<id>` |
 | null | everybody | `broadcast:all`, which every socket joins on connect |
 
-Delivery is doubled, because the interesting case is a user who is not looking.
-The row is written first, then pushed over the socket - so a client with nothing
-connected still gets it from `GET /api/v1/announcements`, and one that is
-connected does not wait for its next refresh. The client keys both on
-`announcement:<id>`, making a double delivery a no-op.
+Delivery is doubled, because the interesting case is a user who is not looking. The
+row is written first, then pushed over the socket. A client with nothing connected
+still gets it from `GET /api/v1/announcements`, and one that is connected does not wait
+for its next refresh. The client keys both on `announcement:<id>`, making a double
+delivery a no-op.
 
-**Reads are watermarked, not marked read.** There is no per-user read state here
-- the endpoint answers "what is newer than `since`". That is what lets a client
-dismiss a message without the next refresh resurrecting it: it advances its own
-watermark past whatever it was handed and never asks for that window again. A
-first launch omits `since` and gets the last 30 days, capped at 100 rows newest
-first, so a new device arrives with what is current rather than a changelog.
+**Reads are watermarked, not marked read.** There is no per-user read state here; the
+endpoint answers "what is newer than `since`". A client dismisses a message by advancing
+its own watermark past whatever it was handed, and never asks for that window again, so
+the next refresh does not resurrect it. A first launch omits `since` and gets the last
+30 days, capped at 100 rows newest first. A new device therefore arrives with what is
+current rather than a changelog.
 
-`expires_at` is the other half of that: a notice about Tuesday's maintenance is
-worse than useless on Friday, and without a stop date every new device would be
-told about every window the service ever had.
-
-Posting is an admin act (`POST /internal/v1/admin/announcements`, `X-Admin-Key`).
-`DELETE` stops the row being served; devices already told keep their copy, since
-this is the server forgetting rather than a recall.
+| Control | Effect |
+|---|---|
+| `expires_at` | The row stops being served after it. A notice about Tuesday's maintenance is worse than useless on Friday, and without a stop date every new device would be told about every window the service ever had. |
+| `POST /internal/v1/admin/announcements` (`X-Admin-Key`) | Posting is an admin act. |
+| `DELETE /internal/v1/admin/announcements/{id}` | Stops the row being served. Devices already told keep their copy, since this is the server forgetting rather than a recall. |
 
 ---
 
@@ -1975,9 +2010,9 @@ points to its home; the mechanism and any values live there, not here.
 - [x] Route auth: user routes require a valid Supabase JWT, `/internal/*` an `X-Admin-Key` ([section 9](#9-auth-flow), `docs/permissions.md`).
 - [x] Backend verifies, never signs, tokens; algorithm allowlisted, `exp` required ([section 9](#9-auth-flow)).
 - [x] Sessions, refresh, verification, reset, suspension, and deletion are owned by Supabase, not this service ([section 9](#9-auth-flow)).
-- [x] Device and identity private keys never leave the client; the server holds only public keys and opaque wrapped-key blobs ([section 7.1](#71-user-master-key-umk--envelope-model), [7.3](#73-multi-device-umk-sharing-x25519), [7.5](#75-server-visibility)).
+- [x] Device and identity private keys never leave the client; the server holds only public keys and opaque wrapped-key blobs ([section 7.1](#71-user-master-key-umk---envelope-model), [7.3](#73-multi-device-umk-sharing-x25519), [7.5](#75-server-visibility)).
 - [x] Server stores only ciphertext for entry content, metadata, and blobs ([section 7.5](#75-server-visibility)).
-- [x] Per-entry content keys with an item-bound AAD, and a separate key-wrap AAD, so a wrap cannot be replayed as content or vice versa ([section 7.2](#72-content-encryption--the-per-entry-cek-envelope)).
+- [x] Per-entry content keys with an item-bound AAD, and a separate key-wrap AAD, so a wrap cannot be replayed as content or vice versa ([section 7.2](#72-content-encryption---the-per-entry-cek-envelope)).
 - [x] Blob downloads are member-scoped, and a miss returns 404 not 403 so a key's existence is not confirmed ([section 5.4](#54-blob-routes), `docs/permissions.md`).
 - [ ] Space Key revocation is best-effort: a departed member keeps what they already decrypted until the owner is next online to rekey ([section 7.4](#74-space-key-distribution-and-rekey)).
 - [x] Presigned upload/download URLs are short-lived ([section 5.4](#54-blob-routes)).
@@ -1986,7 +2021,11 @@ points to its home; the mechanism and any values live there, not here.
 - [x] Security response headers set on every response via middleware (`src/middleware.py`): `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: geolocation=(), camera=(), microphone=()`, and `Strict-Transport-Security: max-age=31536000; includeSubDomains` on HTTPS responses. A default `Content-Security-Policy` is set here too for JSON routes (value not repeated).
 - [x] All SQL goes through SQLAlchemy parameterized queries.
 - [x] `X-Device-Id` is checked against the caller's unrevoked devices before it is trusted ([section 5](#5-api-design) conventions).
-- [x] Key-material writes need the UMK proof once an account has one ([section 7.1](#71-user-master-key-umk--envelope-model)).
+- [x] Key-material writes need the UMK proof once an account has one ([section 7.1](#71-user-master-key-umk---envelope-model)).
 - [x] Socket credentials travel in the first message, never the URL, and a socket closes when its token expires ([section 5.8](#58-websocket-event-protocol)).
 - [ ] Revoking a device does not end its Supabase session; the device is refused by this service, but its token lives until it expires ([section 5.1](#51-auth-routes)).
 - [x] Asymmetric JWKS verification, so Supabase-side key rotation needs no redeploy; shared HS256 accepted only for legacy projects ([section 9](#9-auth-flow), [section 5.0](#50-versioning)).
+
+Related: who may call each route is in the root `docs/permissions.md`, client internals
+in `orange-copy-paste-clipboard-app-rust/docs/architecture.md`, and the host and deploy
+pipeline in [`DEPLOY.md`](DEPLOY.md).

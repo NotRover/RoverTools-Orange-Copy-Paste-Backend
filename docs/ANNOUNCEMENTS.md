@@ -1,5 +1,9 @@
 # Announcements
 
+**Owns:** sending an announcement - what the operator types, and what a user then sees.
+**Not here:** the table, routes and socket event (`architecture.md` section 16), and host
+access for running the commands (`DEPLOY.md`).
+
 How to send a message to users from the server. Nothing sends one automatically
 today - the machinery is in place and waiting for a reason to use it.
 
@@ -28,9 +32,8 @@ local, and `DELETE` on the server does not take it back.
 surface answers `503`, which is the intended posture for an environment that
 should not be posting announcements.
 
-Every call below wants that key in `X-Admin-Key`. Keep it out of shell history
-that other people can read - it is the key to every admin route, not just this
-one.
+Every call below wants that key in `X-Admin-Key`. It opens every admin route,
+so keep it out of shell history that other people can read.
 
 ```bash
 export ADMIN_KEY='<the value from the service environment>'
@@ -83,9 +86,8 @@ space and sync events, which is usually not what you want.
 ### `ttl_ms`
 
 Use it whenever the message is about a moment. A notice about Saturday's
-maintenance is worse than useless the following week, and a device that has been
-closed for a fortnight would otherwise be handed a stack of windows that have
-all long since passed.
+maintenance is useless the following week. Without a TTL, a device closed for two
+weeks opens to a stack of notices about windows that have already passed.
 
 ```bash
 # Gone after 3 days.
