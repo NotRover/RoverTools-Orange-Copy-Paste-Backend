@@ -45,13 +45,15 @@ jobs:
           enable-cache: true
 
       - name: Install Python and dependencies
-        run: uv sync --frozen
+        # pytest lives in the `dev` extra; ruff and ty are not project dependencies,
+        # so they run as uv tools below.
+        run: uv sync --frozen --extra dev
 
       - name: Lint
-        run: uv run ruff check src tests
+        run: uvx ruff check src tests
 
       - name: Types
-        run: uv run ty check src
+        run: uvx ty check src
 
       - name: Tests
         run: uv run pytest -q
