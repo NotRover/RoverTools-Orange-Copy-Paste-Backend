@@ -37,7 +37,11 @@ async def put_settings(
     redis: Redis = Depends(get_redis),
     current: tuple[str, str] = Depends(get_current_user_id),
 ):
-    """Store the encrypted settings blob, resolving concurrent writes by last-write-wins.
+    """Store the encrypted settings blob.
+
+    Without `base_updated_at`, last-write-wins by `updated_at`. With it, writes only
+    over the stored blob the client merged from. A refused write answers
+    `winner="server"` with the stored blob.
 
     Requires: Bearer token + X-Device-Id header.
     Emits `settings:updated` to the user channel when the client write wins.
