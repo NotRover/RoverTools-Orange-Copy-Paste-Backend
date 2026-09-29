@@ -3,14 +3,14 @@
 The cloud-sync API for the Orange Copy Paste desktop app. It is a stateless relay and store
 for end-to-end encrypted data: FastAPI + Supabase (Postgres + GoTrue Auth) + Redis + S3/R2,
 Python 3.14+, managed with **uv**. It lives in its own repo
-(`RoverTools-Orange-Copy-Paste-Backend`), mounted as a submodule of the RoverTools
-workspace. The workspace root `CLAUDE.md` applies here too; it holds the copy rules, git
+(`RoverTools-Orange-Copy-Paste-Backend`), cloned inside the app repo's folder, which
+ignores it (not a submodule). The workspace root `CLAUDE.md` applies here too; it holds the copy rules, git
 rules and doc ownership.
 
 **Every doc and every user-facing string here follows the workspace writing guide, with no
 exceptions:**
 [`docs/writing-docs.md`](https://github.com/NotRover/RoverTools-Orange-Copy-Paste-App/blob/main/docs/writing-docs.md)
-in the app repo (`../docs/writing-docs.md` when checked out as a submodule). That covers
+in the app repo (`../docs/writing-docs.md` when cloned inside it). That covers
 the README, everything in `docs/`, the HTML pages and emails in `src/web/templates/`,
 announcement text, and error messages a person reads. Decide the kind of page before
 writing it, and run the guide's "Checklist before merging a doc change" before calling a change done. This repo
@@ -30,7 +30,7 @@ keep a todo list for tracking and a working-notes file for the reasoning instead
 the context window to hold it.
 
 - **File:** `.scratch/<YYYY-MM-DD>-<topic-slug>.md`, at the workspace root when this repo is
-  checked out as a submodule, else at this repo's root. Gitignored; never commit it. One
+  cloned inside the app repo, else at this repo's root. Gitignored; never commit it. One
   file per task, reused across sessions.
 - **Contents, terse:** goal and issue/PR link, plan checklist, decisions with a one-line
   reason, current state and next step, key files as `path:line`, which repo(s) each change
@@ -97,6 +97,5 @@ Always go through `uv run`, because `ruff` and `ty` are not on the venv PATH.
 
 Whether a change goes straight to `main` or gets a PR follows the workspace root
 `CLAUDE.md` (the Git & Repos section); a PR is a draft against `main`. Keep
-commits scoped to this repo. Never bundle a backend change with a parent-repo commit, except
-for a deliberate submodule-pointer bump. Never push or apply migrations without explicit
+commits scoped to this repo. Never bundle a backend change with a parent-repo commit. Never push or apply migrations without explicit
 approval.
