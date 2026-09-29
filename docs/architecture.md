@@ -193,8 +193,11 @@ Owns `sync_entries` (clipboard + notes) and per-device `sync_cursors`.
 
 ### 2.3 Settings (`src/settings/`)
 
-One encrypted blob per user (`user_settings`), last-write-wins by `updated_at`. On a
-client-wins write, publishes `settings:updated` so other devices pull.
+One encrypted blob per user (`user_settings`). A PUT that names the blob it was merged
+from (`base_updated_at`) is written only over that blob; a PUT without it is
+last-write-wins by `updated_at`. The write rules are in
+[section 5.3](#53-settings-routes). On a client-wins write, publishes `settings:updated`
+so other devices pull.
 
 ### 2.4 Blobs (`src/blobs/`)
 
@@ -951,9 +954,36 @@ removed still push the tombstone for what they shared.
 
 ```
 GET  /api/v1/settings           Returns: { encrypted_blob, updated_at }  (404 if none)
-PUT  /api/v1/settings           Body: { encrypted_blob, updated_at }
+PUT  /api/v1/settings           Body: { encrypted_blob, updated_at, base_updated_at? }
      Returns: { updated_at, winner: 'client'|'server', encrypted_blob }
+     winner 'client'  the body was stored. The reply echoes it, and settings:updated
+                      is published to user:{id}.
+     winner 'server'  nothing was written and nothing is published. The reply carries
+                      the STORED encrypted_blob and updated_at.
+     When the body is stored:
+       no blob stored yet             always, whatever base_updated_at holds
+       base_updated_at absent or null stored updated_at <= body updated_at
+       base_updated_at set            stored updated_at == base_updated_at
+                                      AND body updated_at > stored updated_at
+     base_updated_at  the updated_at of the stored blob the body was merged from, or 0
+                      when the GET answered 404.
+     The condition is the upsert's own WHERE (INSERT ... ON CONFLICT DO UPDATE ...
+     WHERE), so the check and the write are one statement under the row lock.
 ```
+
+**Why `base_updated_at`.** A client syncs settings in one round: GET, merge, PUT. When
+two devices' rounds overlap, both merge from the same blob. Under last-write-wins the
+later PUT then replaces a blob it never saw, and the other device's change is lost. With
+`base_updated_at` that PUT fails its condition instead, and the `winner: 'server'` reply
+hands it the blob that won, to merge into and PUT again. Of two PUTs that carry the same
+`base_updated_at`, exactly one is stored.
+
+- **The field is optional on purpose.** A client that does not send it keeps
+  last-write-wins, lost-update window included. The one change for it: of two racing
+  PUTs, an older one that lands second is answered `winner: 'server'` instead of
+  overwriting the newer blob.
+- **Stored `updated_at` only moves forward.** A matching base with a body `updated_at` at
+  or below the stored one is refused, so a buggy client cannot move the version back.
 
 ### 5.4 Blob Routes
 
