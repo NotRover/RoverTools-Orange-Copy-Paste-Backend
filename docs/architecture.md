@@ -1479,7 +1479,7 @@ How each one behaves:
 
 ### 6.4 Offline Operation
 
-Local `history.bin` / `notes.bin` are the source of truth. The sync client pulls on
+The local database (`app.db`) is the source of truth. The sync client pulls on
 startup/reconnect, queues pushes while offline, and applies WS events as they arrive.
 
 ---
