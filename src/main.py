@@ -9,7 +9,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from src import background, realtime
-from src.admin.router import admin_router, probe_router
+from src.admin.router import admin_router, discovery_router, probe_router
 from src.auth.router import router as auth_router
 from src.blobs.router import router as blobs_router
 from src.config import settings
@@ -42,7 +42,8 @@ OPENAPI_TAGS = [
     {"name": "realtime", "description": "WebSocket `/ws` fan-out of sync/presence/sharing events. Not part of the "
      "OpenAPI HTTP schema; see the API reference doc for the event contract."},
     {"name": "ops", "description": "Unversioned infrastructure probes: `/internal/healthz` (public) and "
-     "`/internal/metrics` (Prometheus, admin key)."},
+     "`/internal/metrics` (Prometheus, admin key), plus the public discovery route "
+     "`/.well-known/orange-copy-paste.json`."},
     {"name": "admin", "description": "Versioned management API under `/internal/v1` (requires `X-Admin-Key`): "
      "stats and user administration."},
 ]
@@ -132,4 +133,5 @@ app.include_router(web_router)
 
 # ── Internal: unversioned probes + versioned admin API ──────────────────────────
 app.include_router(probe_router)
+app.include_router(discovery_router)
 app.include_router(admin_router)

@@ -12,6 +12,19 @@ class HealthResponse(BaseModel):
     redis: Literal["ok", "error"]
 
 
+class DiscoveryResponse(BaseModel):
+    """What a desktop app needs to talk to this deployment, read from its base URL.
+
+    Every value is public. An empty string means the deployment does not set it.
+    """
+
+    api_version: str
+    service_version: str
+    supabase_url: str
+    supabase_anon_key: str
+    reset_page_url: str
+
+
 class UserAdminSummary(BaseModel):
     id: uuid.UUID
     display_name: str

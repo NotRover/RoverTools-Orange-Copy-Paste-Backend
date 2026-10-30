@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     # asymmetric by default and leave this blank.
     supabase_jwt_secret: str = ""
     supabase_jwt_audience: str = "authenticated"
+    # Publishable anon key (Settings -> API Keys). A public value: the backend does
+    # not use it, it only hands it to the desktop app through the discovery route.
+    # Unrelated to the two secrets around it, which are never returned.
+    supabase_anon_key: str = ""
     # Server-only key for admin ban/delete via the Supabase Admin API (Settings →
     # API Keys): a secret key (`sb_secret_…`) or the legacy `service_role` key,
     # which Supabase deprecates at the end of 2026. Never ship to clients.

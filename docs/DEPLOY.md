@@ -604,7 +604,7 @@ never signs one. R2 stores encrypted blobs. Neither moved when the backend left 
 
 ### 7a. Supabase
 
-Create a project, then collect these four values.
+Create a project, then collect these values.
 
 > **Dashboard note:** Supabase reorganised these screens in 2025. API keys now live under
 > **Settings -> API Keys** (also in the **Connect** dialog), and JWT configuration under
@@ -616,6 +616,7 @@ Create a project, then collect these four values.
 | Connection string (URI) | Settings -> Database | `DATABASE_URL` |
 | Project URL | Settings -> API Keys | `SUPABASE_URL` |
 | Secret key (`sb_secret_...`) | Settings -> API Keys | `SUPABASE_SERVICE_ROLE_KEY` |
+| Publishable (anon) key | Settings -> API Keys | `SUPABASE_ANON_KEY` *(optional, public)* |
 | Legacy JWT secret | Settings -> JWT Keys | `SUPABASE_JWT_SECRET` *(usually blank - see below)* |
 
 **Direct host vs pooler.** Supabase's direct host (`db.<ref>.supabase.co`) resolves to
@@ -993,7 +994,8 @@ from `.env.example`:
 - `REDIS_URL` = `redis://:<password>@redis:6379/0`; `REDIS_PASSWORD` also set for the redis
   service's `--requirepass`.
 - `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, (`SUPABASE_JWT_SECRET` only for a pre-2025-10
-  project), `SUPABASE_SERVICE_ROLE_KEY`.
+  project), `SUPABASE_SERVICE_ROLE_KEY`, and optionally `SUPABASE_ANON_KEY` (public; the
+  desktop app reads it from `/.well-known/orange-copy-paste.json`).
 - `S3_ENDPOINT_URL`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`.
 - `BREVO_API_KEY`, `EMAIL_FROM` (or the SMTP set).
 - `ADMIN_API_KEY`.

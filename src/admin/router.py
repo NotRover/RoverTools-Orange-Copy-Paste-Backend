@@ -8,6 +8,11 @@ Two routers with deliberately different versioning (see ``src/version.py``):
   These paths are hardcoded by load balancers and metric scrapers, so they stay
   stable across API version bumps.
 
+* ``discovery_router`` - **unversioned** public discovery route:
+    - ``GET /.well-known/orange-copy-paste.json``  API version and the public
+      Supabase settings a self-hosted desktop app needs (no auth)
+  The app fetches it from the server URL alone, before it knows any version.
+
 * ``admin_router`` — **versioned** management API under ``/internal/v1``:
     - ``GET  /internal/v1/stats``            JSON aggregate
     - ``GET  /internal/v1/admin/users``      list users
@@ -36,7 +41,7 @@ import logging
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
 from limits import parse
@@ -49,6 +54,7 @@ from src.admin import service
 from src.announcements import router as announcements_router
 from src.announcements.schemas import AnnouncementCreateResponse
 from src.admin.schemas import (
+    DiscoveryResponse,
     EmailConfigResponse,
     EmailTestRequest,
     EmailTestResponse,
@@ -65,12 +71,14 @@ from src.config import settings
 from src.database import get_db
 from src.dependencies import get_redis
 from src.limiter import client_ip, limiter
-from src.version import INTERNAL_VERSIONED_PREFIX
+from src.version import API_VERSION, INTERNAL_VERSIONED_PREFIX, SERVICE_VERSION
 
 logger = logging.getLogger(__name__)
 
 # Unversioned infrastructure probes.
 probe_router = APIRouter(prefix="/internal", tags=["ops"])
+# Unversioned public discovery. Not under /internal, which Caddy blocks.
+discovery_router = APIRouter(tags=["ops"])
 # Versioned admin/management surface.
 admin_router = APIRouter(prefix=INTERNAL_VERSIONED_PREFIX, tags=["admin"])
 
@@ -159,6 +167,28 @@ async def healthz(db: AsyncSession = Depends(get_db), redis: Redis = Depends(get
         status="ok" if healthy else "degraded",
         db="ok" if db_ok else "error",
         redis="ok" if redis_ok else "error",
+    )
+
+
+# -- Discovery (public, no auth) --------------------------------------------------
+
+
+@discovery_router.get("/.well-known/orange-copy-paste.json", response_model=DiscoveryResponse)
+async def discovery(response: Response) -> DiscoveryResponse:
+    """Public settings a desktop app reads from a server URL.
+
+    No auth, and no database or Redis call, so it answers while those are down.
+    Every value is public: the Supabase URL and its publishable anon key, never the
+    JWT secret or the service-role key. An empty string means not configured.
+    Sent with ``Cache-Control: no-store`` so a proxy never serves a stale key.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    return DiscoveryResponse(
+        api_version=API_VERSION,
+        service_version=SERVICE_VERSION,
+        supabase_url=settings.supabase_url,
+        supabase_anon_key=settings.supabase_anon_key,
+        reset_page_url=settings.reset_page_url,
     )
 
 

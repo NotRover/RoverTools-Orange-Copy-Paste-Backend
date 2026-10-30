@@ -4,6 +4,8 @@ import uuid
 
 from httpx import AsyncClient
 
+from src.config import settings
+from src.version import API_VERSION, SERVICE_VERSION
 from tests.conftest import make_token
 
 
@@ -186,3 +188,28 @@ async def test_healthz(client: AsyncClient):
     body = resp.json()
     assert body["db"] == "ok"
     assert body["redis"] == "ok"
+
+
+# -- Discovery -------------------------------------------------------------------
+
+
+async def test_discovery_returns_public_settings(client: AsyncClient, monkeypatch):
+    monkeypatch.setattr(settings, "supabase_url", "https://example-ref.supabase.co")
+    monkeypatch.setattr(settings, "supabase_anon_key", "anon-public-key")
+    monkeypatch.setattr(settings, "reset_page_url", "https://example.test/reset")
+    monkeypatch.setattr(settings, "supabase_service_role_key", "service-role-secret-value")
+
+    resp = await client.get("/.well-known/orange-copy-paste.json")
+
+    assert resp.status_code == 200
+    assert resp.headers["X-API-Version"] == API_VERSION
+    assert resp.headers["Cache-Control"] == "no-store"
+    assert resp.json() == {
+        "api_version": API_VERSION,
+        "service_version": SERVICE_VERSION,
+        "supabase_url": "https://example-ref.supabase.co",
+        "supabase_anon_key": "anon-public-key",
+        "reset_page_url": "https://example.test/reset",
+    }
+    assert settings.supabase_jwt_secret not in resp.text
+    assert "service-role-secret-value" not in resp.text

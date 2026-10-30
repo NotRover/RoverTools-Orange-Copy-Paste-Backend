@@ -770,7 +770,10 @@ Source of truth: `src/version.py` (`API_VERSION`, `SERVICE_VERSION`).
   migration window.
 - **Infra probes are intentionally unversioned**: `/internal/healthz` and
   `/internal/metrics`. Load balancers and Prometheus hardcode these paths and must
-  not track a version on each bump.
+  not track a version on each bump. The discovery route
+  `/.well-known/orange-copy-paste.json` is unversioned for the same reason: the app
+  fetches it before it knows which version the server speaks
+  ([section 5.10](#510-discovery-route-unversioned-no-auth)).
 - **`SERVICE_VERSION`** (semver, e.g. `2.0.0`) is the deployable build version and
   the OpenAPI `version`; it changes freely per release without implying a contract break.
 - Every HTTP response carries an **`X-API-Version`** header (= `API_VERSION`).
@@ -1378,6 +1381,21 @@ GET /reset?code=<code>    302  - forwards to the reset page on the static site
 Both are excluded from OpenAPI. `/join` answers 200 for any well-formed code and
 sets its own Content-Security-Policy; `/reset` forwards whatever query it is given
 and reads nothing out of it. See [section 2.8](#28-web-pages-srcweb).
+
+### 5.10 Discovery Route (unversioned, no auth)
+
+```
+GET /.well-known/orange-copy-paste.json
+Returns: { api_version, service_version, supabase_url, supabase_anon_key, reset_page_url }
+```
+
+A desktop app pointed at a self-hosted server reads its settings from this route, given
+only the server URL. Every value is public: `supabase_anon_key` is the publishable key
+(`SUPABASE_ANON_KEY`), and the JWT secret and service-role key are never returned. A
+value the deployment does not set comes back as an empty string, which the app treats
+as not provided. The route touches neither Postgres nor Redis, so it answers while they
+are down. The response carries `Cache-Control: no-store`, so a proxy never serves a
+stale key. Tagged `ops`, `response_model=DiscoveryResponse`.
 
 ---
 
